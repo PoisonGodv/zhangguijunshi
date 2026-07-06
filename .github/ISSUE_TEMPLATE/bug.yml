@@ -1,0 +1,99 @@
+name: Bug 报告
+description: 报告「掌柜军师」后端的缺陷或异常行为
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈!请尽量填全以下信息,便于快速定位。
+
+        - 提交前请先在 [已有 issue](../../issues?q=is%3Aissue+label%3Abug) 中检索是否重复。
+        - 涉及**线上 / 资金 / 串户 / 数据损坏**的,请在「严重程度」如实标注,并第一时间同步负责人。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 现象描述
+      description: 一句话概括你遇到的问题。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 按顺序列出可稳定复现的操作;附 curl / 请求体 / 路由路径(如 /v1/wxshop/xxx)更佳。
+      placeholder: |
+        1. ZG_ENV=dev 启动服务
+        2. 请求 GET /v1/boss/...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 含错误信息 / 堆栈 / HTTP 状态码。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: endpoint
+    attributes:
+      label: 受影响端
+      description: 三端 BFF 路由前缀 / 运维端点。可多选。
+      multiple: true
+      options:
+        - /v1/wxshop(消费者 / 小程序)
+        - /v1/boss(掌柜 / 商户后台)
+        - /v1/admin(平台后台)
+        - /healthz /readyz /metrics(运维端点)
+        - 其他 / 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: env
+    attributes:
+      label: 环境
+      options:
+        - dev
+        - staging
+        - prod
+        - 本地 / 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: 严重程度
+      options:
+        - S0 资金 / 数据损坏 / 串户 / 全站不可用
+        - S1 核心流程阻塞
+        - S2 体验问题 / 可绕过
+        - S3 细枝末节
+    validations:
+      required: true
+
+  - type: input
+    id: tenant
+    attributes:
+      label: 租户 / 链路信息
+      description: 若怀疑串户或需定位,请提供 tenant_id / merchant_id / store_id 与 trace_id。
+      placeholder: "tenant_id=  merchant_id=  trace_id="
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图
+      description: 贴出关键日志(注意脱敏,勿粘贴真实密钥 / JWT / 手机号 / 密码)。

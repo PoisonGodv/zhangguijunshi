@@ -1,0 +1,64 @@
+# Staging configuration.
+# Same field shape as config.dev.yaml (mirrors backend/pkg/config/types.go
+# mapstructure tags). Sensitive / deployment-specific values use ${VAR}
+# placeholders resolved from environment variables (prefix ZG_) at runtime —
+# no real secrets are committed.
+app:
+  name: zhanggui-junshi-backend
+  env: staging
+  version: 0.1.0-staging
+
+http:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: "15s"
+  write_timeout: "15s"
+  shutdown_timeout: "30s"
+
+postgres:
+  host: ${ZG_POSTGRES_HOST}
+  port: 5432
+  user: ${ZG_POSTGRES_USER}
+  password: ${ZG_POSTGRES_PASSWORD}
+  database: ${ZG_POSTGRES_DATABASE}
+  ssl_mode: ${ZG_POSTGRES_SSL_MODE}
+  max_conns: 20
+  min_conns: 5
+  max_conn_lifetime: "30m"
+  max_conn_idle_time: "5m"
+
+redis:
+  host: ${ZG_REDIS_HOST}
+  port: 6379
+  password: ${ZG_REDIS_PASSWORD}
+  db: 0
+  pool_size: 20
+
+log:
+  level: info
+  encoding: json
+  output_paths:
+    - stdout
+
+jwt:
+  secret: ${ZG_JWT_SECRET}
+  access_ttl: "30m"
+  refresh_ttl: "720h"
+  issuer: zhanggui-junshi
+
+otel:
+  enable: true
+  endpoint: ${ZG_OTEL_ENDPOINT}
+  service_name: zhanggui-junshi-backend
+  sample_ratio: 0.1
+  insecure: false
+
+cos:
+  secret_id: ${ZG_COS_SECRET_ID}
+  secret_key: ${ZG_COS_SECRET_KEY}
+  region: ${ZG_COS_REGION}
+  bucket: ${ZG_COS_BUCKET}
+  endpoint: ${ZG_COS_ENDPOINT}
+
+multitenancy:
+  strict: true

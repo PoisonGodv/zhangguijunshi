@@ -1,0 +1,59 @@
+name: 需求
+description: 提一个新功能或改进
+title: "[feat] "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景与目标
+      description: 解决什么问题?服务对象是谁(消费者 / 掌柜 / 平台运营)?带来什么价值?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望方案
+      description: 倾向的实现方式 / 交互 / 接口契约。可附草图或示例请求响应。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 备选方案
+      description: 考虑过的其他做法及放弃原因。
+
+  - type: dropdown
+    id: endpoint
+    attributes:
+      label: 涉及端
+      description: 三端 BFF 或通用基础设施。可多选。
+      multiple: true
+      options:
+        - /v1/wxshop(消费者 / 小程序)
+        - /v1/boss(掌柜 / 商户后台)
+        - /v1/admin(平台后台)
+        - 通用 / 基础设施(配置 / 多租户 / DB / 可观测)
+
+  - type: checkboxes
+    id: multitenant
+    attributes:
+      label: 多租户影响确认
+      description: tenant_id 必须从 JWT claims / ctx 取,仓储唯一入口是 pkg/multitenancy 的 EnforceTenant / TenantID。
+      options:
+        - label: 本功能涉及仓储读写或新增 SQL,我会确保 tenant_id 经 pkg/multitenancy 强制注入(无 tenant 即报 ErrNoTenant)
+        - label: 本功能不涉及跨租户读写
+
+  - type: textarea
+    id: observability
+    attributes:
+      label: 可观测与告警
+      description: 是否需要新增 metrics / 日志字段(`trace_id` / `tenant_id` / `merchant_id` / `store_id` / `user_id`)/ trace span?告警阈值如何设定?
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: 影响范围 / 风险
+      description: 是否改动 DB schema / 迁移、配置 key(前缀 `ZG_`)、对外 API 契约?回滚成本?是否存在破坏性变更?

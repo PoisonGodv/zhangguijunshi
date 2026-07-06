@@ -1,0 +1,72 @@
+# Local / CI development dependencies for the zhanggui-junshi backend.
+#
+# Usage:
+#   docker compose -f infra/compose/docker-compose.yml up -d
+#   docker compose -f infra/compose/docker-compose.yml down
+#
+# NOTE: This machine has no Docker — this file is produced as a deliverable
+# and is NOT executed during M0-S1 (per CONTRACT.md hard constraints).
+#
+# Ports are aligned with /.env.example:
+#   postgres :5432   redis :6379   minio :9000 (S3 API) / :9001 (console)
+services:
+  postgres:
+    image: pgvector/pgvector:pg16 # bundles PostgreSQL 16 + pgvector extension
+    container_name: zg-postgres
+    environment:
+      POSTGRES_USER: zg
+      POSTGRES_PASSWORD: zg
+      POSTGRES_DB: zhanggui
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro # runs init.sql on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zg -d zhanggui"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: zg-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest # S3-compatible stand-in for Tencent COS
+    container_name: zg-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # web console
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

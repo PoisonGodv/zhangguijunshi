@@ -1,0 +1,63 @@
+# Development configuration (local + CI default).
+# Field names mirror the `mapstructure` tags in backend/pkg/config/types.go.
+# Layering (low → high priority): defaults → this file → env vars (prefix ZG_).
+# Durations are human-readable strings (e.g. "30s", "720h"); parsed by viper.
+app:
+  name: zhanggui-junshi-backend
+  env: dev
+  version: 0.1.0-dev
+
+http:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: "15s"
+  write_timeout: "15s"
+  shutdown_timeout: "30s"
+
+postgres:
+  host: localhost
+  port: 5432
+  user: zg
+  password: zg
+  database: zhanggui
+  ssl_mode: disable
+  max_conns: 10
+  min_conns: 2
+  max_conn_lifetime: "30m"
+  max_conn_idle_time: "5m"
+
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 0
+  pool_size: 10
+
+log:
+  level: debug
+  encoding: console
+  output_paths:
+    - stdout
+
+jwt:
+  secret: "dev-only-jwt-secret-not-for-production"
+  access_ttl: "30m"
+  refresh_ttl: "720h"
+  issuer: zhanggui-junshi
+
+otel:
+  enable: false
+  endpoint: localhost:4318
+  service_name: zhanggui-junshi-backend
+  sample_ratio: 1.0
+  insecure: true
+
+cos:
+  secret_id: ""
+  secret_key: ""
+  region: ap-guangzhou
+  bucket: zhanggui-dev-1300000000
+  endpoint: ""
+
+multitenancy:
+  strict: true

@@ -1,0 +1,114 @@
+# Continuous Integration for zhanggui-junshi.
+#
+# Repo layout: single Go module lives in backend/
+#   (module github.com/zhangguijunshi/backend, go 1.25). Every Go command must
+#   run from backend/, so the lint/test/build jobs set working-directory: backend.
+#   gitleaks scans the whole repo from the repo root.
+#
+# Pipeline shape: lint + test + gitleaks run in parallel on every push to main
+# and on every pull request. build is gated on lint + test so a red lint or red
+# test never produces a misleading green build.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One CI run per branch/ref at a time; newer pushes cancel superseded runs.
+concurrency:
+  group: ci
+  cancel-in-progress: true
+
+# Least-privilege token for the whole workflow.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  lint:
+    name: Lint (golangci-lint v2)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      # .golangci.yml uses the v2 schema (version: "2"). Pin to a v2.x release
+      # so the config parses; older v1 linters reject the v2 schema outright.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2
+          working-directory: backend
+          args: --timeout=5m ./...
+
+  test:
+    name: Test (go vet + race)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      # Two steps instead of `vet && test`: identical gating (a failed vet
+      # stops the test step) but cleaner failure attribution in the UI.
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: go build
+        run: go build ./...
+
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      # Full history so gitleaks can scan every commit, not just the diff.
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

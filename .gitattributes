@@ -1,0 +1,50 @@
+# Normalize line endings and mark binary assets.
+# See https://git-scm.com/docs/gitattributes
+
+# Default: treat as text, normalize to LF on commit, checkout as-is (eol=lf).
+* text=auto eol=lf
+
+# Source — always text, LF.
+*.go     text eol=lf
+*.sh     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.toml   text eol=lf
+*.sql    text eol=lf
+*.json   text eol=lf
+*.mod    text eol=lf
+*.sum    text eol=lf
+*.md     text eol=lf
+*.env    text eol=lf
+
+# Makefiles must keep literal tab indentation.
+Makefile text eol=lf
+*.mk     text eol=lf
+
+# Binary assets — never normalize, never diff.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.icns binary
+*.pdf  binary
+*.zip  binary
+*.tar  binary
+*.gz   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.eot   binary
+*.otf   binary
+*.mp3   binary
+*.mp4   binary
+*.pem   binary
+*.key   binary
+
+# Linguist hints (GitHub language stats).
+*.go  linguist-language=Go
+*.sql linguist-language=SQL
+
+# Generated go.sum — hide from GitHub stats noise.
+go.sum linguist-generated=true

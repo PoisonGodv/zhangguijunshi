@@ -1,0 +1,18 @@
+# CODEOWNERS for zhanggui-junshi.
+#
+# GitHub uses these rules to auto-request reviews on pull requests.
+# Syntax:  <path-pattern>  <owner1> <owner2> ...
+# Owners may be GitHub team slugs (@org/team) or usernames (@user).
+# Multiple owners are allowed; the LAST matching pattern wins, and GitHub
+# requests review from all owners on the last matching line.
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# ---------------------------------------------------------------------------
+# TODO(team): replace the placeholder team below with the real owners of this
+# codebase (e.g. split frontend/backend/infra by directory). Until then
+# @zhanggui/backend is a stand-in so auto-review is wired up from day one.
+# ---------------------------------------------------------------------------
+
+# Default owner for every file not matched by a more specific rule below.
+*                       @zhanggui/backend
