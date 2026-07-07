@@ -17,6 +17,8 @@ type Config struct {
 	Redis        RedisConfig        `mapstructure:"redis"`
 	Log          LogConfig          `mapstructure:"log"`
 	JWT          JWTConfig          `mapstructure:"jwt"`
+	WX           WXConfig           `mapstructure:"wx"`
+	AI           AIConfig           `mapstructure:"ai"`
 	OTel         OTelConfig         `mapstructure:"otel"`
 	COS          COSConfig          `mapstructure:"cos"`
 	Multitenancy MultitenancyConfig `mapstructure:"multitenancy"`
@@ -64,10 +66,48 @@ type LogConfig struct {
 }
 
 type JWTConfig struct {
-	Secret     string        `mapstructure:"secret"`
-	AccessTTL  time.Duration `mapstructure:"access_ttl"`
-	RefreshTTL time.Duration `mapstructure:"refresh_ttl"`
-	Issuer     string        `mapstructure:"issuer"`
+	Secret     string        `mapstructure:"secret"`      // legacy/dev convenience; ES256 keys come from KeyFile
+	KeyFile    string        `mapstructure:"key_file"`    // path to ECDSA P-256 private key PEM; empty -> DevKey
+	KeyID      string        `mapstructure:"key_id"`      // kid header for key rotation
+	AccessTTL  time.Duration `mapstructure:"access_ttl"`  // access-token lifetime
+	RefreshTTL time.Duration `mapstructure:"refresh_ttl"` // refresh-token lifetime (opaque, store-backed)
+	Issuer     string        `mapstructure:"issuer"`      // iss claim
+}
+
+// WXConfig holds the WeChat Mini Program credentials used by code2session.
+// In production each merchant's mini-program has its own AppID/Secret; the
+// multi-tenant mapping (tenant_id -> AppID) is resolved at the auth layer. For
+// M0-S2 POC a single default pair is sufficient (tech plan §6.2.1 / §A.1.1).
+type WXConfig struct {
+	AppID  string `mapstructure:"app_id"`
+	Secret string `mapstructure:"secret"`
+	// Code2SessionURL overrides the jscode2session endpoint (mainly for tests
+	// / local POC against a fake server). Empty -> official endpoint.
+	Code2SessionURL string `mapstructure:"code2session_url"`
+	// Timeout for upstream WeChat calls.
+	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+// AIProviderConfig describes one OpenAI-compatible LLM provider (tech plan
+// §7.8.1). Qwen/DeepSeek/Doubao all expose /chat/completions and differ only
+// in BaseURL, APIKey and model name.
+type AIProviderConfig struct {
+	BaseURL string `mapstructure:"base_url"`
+	APIKey  string `mapstructure:"api_key"`
+	Model   string `mapstructure:"model"`
+}
+
+// AIConfig configures the AI gateway (tech plan §7.8).
+type AIConfig struct {
+	// DefaultProvider selects which provider name under Providers is active.
+	DefaultProvider string `mapstructure:"default_provider"`
+	// Providers maps a short name (qwen/deepseek/doubao) to its config.
+	Providers map[string]AIProviderConfig `mapstructure:"providers"`
+	// RequestTimeout bounds every upstream LLM call.
+	RequestTimeout time.Duration `mapstructure:"request_timeout"`
+	// MonthlyBudgetCNY is the per-tenant monthly AI cost ceiling; exceeding it
+	// forces a full fallback to rules+cache (tech plan §7.8.4, plan book 6.7).
+	MonthlyBudgetCNY float64 `mapstructure:"monthly_budget_cny"`
 }
 
 type OTelConfig struct {
@@ -89,4 +129,9 @@ type COSConfig struct {
 // MultitenancyConfig governs the row-level isolation guard (ARCH-01).
 type MultitenancyConfig struct {
 	Strict bool `mapstructure:"strict"` // hard-enforce tenant on every repo call
+	// DevMockHeader enables the DEV-ONLY MockTenant middleware (X-Mock-Tenant
+	// header) so the isolation guard can be exercised through HTTP before/aside
+	// from real JWT auth. MUST be false in staging/prod. Default false; dev
+	// config sets it true.
+	DevMockHeader bool `mapstructure:"dev_mock_header"`
 }

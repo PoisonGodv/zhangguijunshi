@@ -47,6 +47,16 @@ release/
 secrets/
 **/config.local.yaml
 
+# ---- Terraform ----
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+# Real var-files carry secrets; only *.tfvars.example is committed.
+*.tfvars
+!*.tfvars.example
+
 # ---- IDE / editor ----
 .idea/
 .vscode/

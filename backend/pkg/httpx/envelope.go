@@ -4,6 +4,8 @@
 package httpx
 
 import (
+	"errors"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/zhangguijunshi/backend/pkg/errcode"
@@ -36,4 +38,17 @@ func Fail(c *gin.Context, e errcode.Err) {
 		Data:    nil,
 		TraceID: traceid.TraceID(c.Request.Context()),
 	})
+}
+
+// FailError writes a failure envelope for an arbitrary error. If err (or any
+// error in its chain) is an errcode.Err, that sentinel's code/HTTP is used;
+// otherwise ErrInternal is emitted. This lets handlers forward domain errors
+// verbatim without type-switching.
+func FailError(c *gin.Context, err error) {
+	var e errcode.Err
+	if errors.As(err, &e) {
+		Fail(c, e)
+		return
+	}
+	Fail(c, errcode.ErrInternal)
 }

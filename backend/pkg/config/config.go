@@ -14,14 +14,29 @@
 package config
 
 import (
-	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/viper"
 )
+
+// findConfigFile locates the first existing "config.<env>.{yaml,yml}" inside
+// dir and returns its bytes. found is false when no file exists, which Load
+// treats as "no yaml layer" (pure defaults + env).
+func findConfigFile(dir, env string) ([]byte, bool) {
+	for _, name := range []string{"config." + env + ".yaml", "config." + env + ".yml"} {
+		path := filepath.Join(dir, name)
+		b, err := os.ReadFile(path)
+		if err == nil {
+			return b, true
+		}
+	}
+	return nil, false
+}
 
 // envPrefix is the environment-variable prefix for source 3 (see package doc).
 const envPrefix = "ZG"
@@ -75,19 +90,16 @@ func Load(opts ...Option) (*Config, error) {
 	SetDefaults(v)
 	v.SetDefault("app.env", lc.env)
 
-	// Layer 2: optional yaml. ConfigName "config.<env>" + discovery finds
-	// "config.<env>.yaml" in configDir (the dot in the name is preserved
-	// verbatim by viper's path search).
-	v.SetConfigName("config." + lc.env)
-	v.SetConfigType("yaml")
-	v.AddConfigPath(lc.configDir)
-
-	if err := v.ReadInConfig(); err != nil {
-		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
-			return nil, fmt.Errorf("config: read config.%s.yaml in %s: %w", lc.env, lc.configDir, err)
+	// Layer 2: optional yaml with ${VAR} env expansion. We locate
+	// "config.<env>.{yaml,yml}" ourselves, ExpandEnv its bytes (so staging/prod
+	// files can reference SSM/env-injected values), then hand the expanded text
+	// to viper. A missing file is NOT an error — pure defaults+env still work.
+	if raw, found := findConfigFile(lc.configDir, lc.env); found {
+		expanded := os.ExpandEnv(string(raw))
+		v.SetConfigType("yaml")
+		if err := v.ReadConfig(strings.NewReader(expanded)); err != nil {
+			return nil, fmt.Errorf("config: parse config.%s.yaml: %w", lc.env, err)
 		}
-		// Missing file is fine: fall back to defaults + env.
 	}
 
 	// Layer 3: environment variables. EnvPrefix ZG + "." → "_" gives the
@@ -143,10 +155,17 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("log.encoding", "json")
 	v.SetDefault("log.output_paths", []string{"stdout"})
 
-	// JWT
+	// JWT. KeyFile empty -> wiring derives a DevKey; never default a real key.
 	v.SetDefault("jwt.access_ttl", 15*time.Minute)
 	v.SetDefault("jwt.refresh_ttl", 720*time.Hour)
 	v.SetDefault("jwt.issuer", "zhanggui-junshi")
+
+	// WeChat mini-program: no credentials by default (POC supplies via env).
+	v.SetDefault("wx.timeout", 5*time.Second)
+
+	// AI gateway defaults (tech plan §7.8). Default monthly budget = ¥2/tenant.
+	v.SetDefault("ai.request_timeout", 8*time.Second)
+	v.SetDefault("ai.monthly_budget_cny", 2.0)
 
 	// OpenTelemetry
 	v.SetDefault("otel.enable", false)
@@ -155,8 +174,9 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("otel.sample_ratio", 0.0)
 	v.SetDefault("otel.insecure", true)
 
-	// Multitenancy: fail-safe strict.
+	// Multitenancy: fail-safe strict; dev mock header OFF by default (opt-in).
 	v.SetDefault("multitenancy.strict", true)
+	v.SetDefault("multitenancy.dev_mock_header", false)
 }
 
 // withDurationHook returns a viper DecoderConfigOption that wires a decode-hook

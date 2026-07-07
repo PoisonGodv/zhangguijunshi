@@ -1,0 +1,37 @@
+###############################################################################
+# Example var-file for the STAGING environment. Copy to staging.tfvars, fill the
+# placeholders, and NEVER commit the filled copy (.gitignore covers *.tfvars).
+#
+#   terraform init -backend-config="bucket=<state-bucket>" \
+#                  -backend-config="prefix=terraform/staging" \
+#                  -backend-config="region=ap-guangzhou"
+#   terraform plan  -var-file=staging.tfvars
+#   terraform apply -var-file=staging.tfvars
+###############################################################################
+
+tencent_secret_id  = "REPLACE_FROM_SSM"
+tencent_secret_key = "REPLACE_FROM_SSM"
+region             = "ap-guangzhou"
+env                = "staging"
+
+vpc_cidr          = "10.4.0.0/16"
+subnet_cidr       = "10.4.1.0/24"
+availability_zone = "ap-guangzhou-3"
+
+# CVM
+image_id          = "img-22trbn9x" # 需核实
+cvm_instance_type = "SA2.MEDIUM4"  # 需核实
+cvm_count         = 2
+
+# TLS cert bound to the CLB (managed in SSL Certificates Service).
+tls_certificate_id = "REPLACE_CERT_ID"
+
+# TDSQL-C
+tdsqlc_engine_version = "5.7"
+tdsqlc_password       = "REPLACE_STRONG_PASSWORD"
+
+# Redis
+redis_password = "REPLACE_STRONG_PASSWORD"
+
+# COS
+cos_bucket_suffix = "1300000000" # must be globally unique

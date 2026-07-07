@@ -40,10 +40,28 @@ log:
     - stdout
 
 jwt:
-  secret: "dev-only-jwt-secret-not-for-production"
+  # ES256 key: leave key_file empty to derive a deterministic dev key (logged on
+  # boot). Set key_file to a PEM path only when testing real key loading.
+  key_file: ""
+  key_id: "zgjs-dev"
   access_ttl: "30m"
   refresh_ttl: "720h"
   issuer: zhanggui-junshi
+
+# WeChat mini-program. code2session_url empty -> official endpoint. Point at a
+# local fake server to exercise login end-to-end without real credentials.
+wx:
+  app_id: ""
+  secret: ""
+  code2session_url: ""
+  timeout: "5s"
+
+# AI gateway (POC). Providers configured via env in staging; defaults below.
+ai:
+  default_provider: ""
+  request_timeout: "8s"
+  monthly_budget_cny: 2.0
+  providers: {}
 
 otel:
   enable: false
@@ -61,3 +79,6 @@ cos:
 
 multitenancy:
   strict: true
+  # DEV ONLY: lets curl exercise the isolation guard via X-Mock-Tenant on the
+  # boss/admin surfaces (which have no login flow yet). False in staging/prod.
+  dev_mock_header: true

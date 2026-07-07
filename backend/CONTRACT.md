@@ -108,3 +108,51 @@ github.com/stretchr/testify              # 断言
 - **无 Postgres/Redis**：单测一律 mock，禁止需要 live 连接。
 - 已有目录树（不要 mkdir 已存在的）：见 `find zhangguijunshi -type d`。
 - 技术方案文件路径：`~/Selfproj/掌柜军师-技术方案/05_数据库与存储.md`（A1）、`01_工程地基与DevOps.md`（A2/A5）、`02_后端架构总纲.md`（A3/A4）。**只读你需要的那一章**，不要把多章塞进上下文（会降低输出稳定性）。
+
+---
+
+## 7. M0-S2 增量契约（ARCH-02 / WX-02 / AI-01 / INFRA-07，2026-07-07）
+
+M0-S2 在 M0-S1 地基上落地四块，全部沿用「可选依赖 + 接口 + 内存实现兜底 + mock 测试」原则：本机无 Redis/无 wx appid/无 LLM key/无腾讯云账号时，`go build ./... && go test -race ./...` 仍全绿。
+
+### 7.1 新增依赖（go.mod）
+
+| 依赖 | 用途 | 备注 |
+|---|---|---|
+| `github.com/golang-jwt/jwt/v5` | ES256 签发/验签 | 白名单内 |
+| `github.com/redis/go-redis/v9` | refresh token / jti 黑名单 / AI 预算 | 白名单内 |
+| `github.com/alicebob/miniredis/v2` | Redis 实现 SessionStore/Budget 的单测 | **test-only** |
+
+> POC 刻意未引入 `sashabaranov/go-openai`（AI 网关用纯 net/http 直连 OpenAI 兼容端点）与 `silenceper/wechat`（code2session 一个 GET，自写更轻）。需要时由主线程评估再加。
+
+### 7.2 包所有权与契约
+
+- **`pkg/jwt`**（ARCH-02）：ES256 自签。`Claims` 对齐技术方案 §6.2.4（scene/tenant_id/store_id/role/openid/ver/jti）。`Signer.Sign`/`Verifier.Verify`/`Manager`。密钥管理：`DevKey(seed)` **确定性派生** P-256 私钥（注：go 1.25 `ecdsa.GenerateKey` 文档明确其输出不依赖于读取的字节，故不能用它做确定性 key——改直接派生标量 D 再 `ScalarBaseMult`）；staging/prod 用 `LoadPrivateKeyFile`。`SessionStore` 接口（`IssueRefresh/GetRefresh/RevokeRefresh/BlockJTI/IsBlocked`）+ `MemorySessionStore`（stdlib，惰性过期+后台 sweep）+ `RedisSessionStore`（`redis.Cmdable`）。refresh token 为 opaque，access token 走 ES256。
+- **`pkg/redisx`**：`New(ctx, cfg.Redis)` 返回惰性 `*Client`（内嵌 `*redis.Client`，满足 `redis.Cmdable`），`Ping` 决定可用性；镜像 `pkg/db` 的「缺失降级」语义。
+- **`pkg/wxsdk`**（WX-02）：纯 net/http 封装 `jscode2session`（`Code2Session(ctx, appID, secret, code)`→`{OpenID,SessionKey,UnionID}`），`WithBaseURL` 便于 httptest。`Code2SessionError.IsWellKnownInvalid()` 区分调用方错误(40029/40163…)与上游故障。
+- **`internal/auth`**：`AuthService` 编排 login/refresh/logout；`ConsumerRepo` 接口 + `MemoryConsumerRepo`。**session_key 永不下发前端**（缓存于服务端 Consumer 记录；真实 DB 落地后迁 `wx_sessions` 表）。`Code2Sessioner` 接口便于注入 stub。
+- **`interfaces/http/middleware/auth.go`**：`Auth(verifier, blocker)` 中间件——Bearer→验签→查 jti 黑名单→注入 `multitenancy.Context`（**tenant 只从 JWT claims 取**）。`MockTenant` 保留为 dev-only，由 `multitenancy.dev_mock_header` 开关。
+- **`interfaces/http/handler/auth.go`**：`/v1/wxshop/auth/{login,refresh,me,logout}`。`httpx.FailError` 把 service 返回的 `errcode.Err` 透明映射。
+- **`internal/aiengine/gateway`**（AI-01）：`Provider` 接口 + `OpenAIProvider` + `NewQwen/NewDeepSeek/NewDoubao`（baseURL/key/model，均标注「需核实」）。`Pricing` 表 + `Budget`（memory/redis，月¥2/户熔断 `ErrBudgetExceeded`）。`Gateway.Chat`（tier 路由+预算+计费）+ `ChatWithFallback`（lite→V3 降级链）。**Dify 按 §7.5 决策不引入**（`DifyStub` 承载架构理由）。`cmd/llmbench` 成本压测 CLI（需真实 key，不入 CI）。
+- **`infra/terraform`**（INFRA-07）：腾讯云 VPC+CVM+CLB+COS+TDSQL-C(CynosDB)+Redis+CLS 的 staging 栈。密钥全走变量（`*.tfvars` 已入 .gitignore，仅提交 `*.tfvars.example`）。本机无 terraform 二进制，README 文档化 `init/validate/plan` 验证门。
+
+### 7.3 配置变更（types.go / config.go）
+
+- `JWTConfig` 增 `KeyFile`/`KeyID`（`Secret` 保留但 ES256 不依赖它）。
+- 新增 `WXConfig`（app_id/secret/code2session_url/timeout）、`AIConfig`（providers map/request_timeout/monthly_budget_cny）。
+- `MultitenancyConfig` 增 `DevMockHeader`（默认 false；`config.dev.yaml` 置 true 保住 curl 演示）。
+- **已修 staging `${VAR}` 占位缺口**：`config.Load` Layer 2 改为「自行定位 `config.<env>.{yaml,yml}` → `os.ExpandEnv` → `v.ReadConfig`」。
+
+### 7.4 DoD（M0-S2）
+
+- `go build ./... && go vet ./... && gofmt -l .`（空）`&& go test -race ./...` 全绿。✅
+- 真实二进制冒烟（`go run ./cmd/api` + curl）：`/v1/boss/whoami`+`X-Mock-Tenant`→200（dev mock 保留）；`/v1/wxshop/auth/me` 无 token→40101（JWT 强制）；login 无 tenant→40001。✅
+- 串户证明（HTTP 层）：tenant-50021 的 token 携 `X-Mock-Tenant:9999` 访问 `/auth/me`→仍返回 50021（tenant 只来自 JWT）。✅
+- Terraform：`infra/terraform` 结构完整；`terraform init/validate/plan` 为首次 apply 前的验证门（本机无二进制）。⚠️ 待有 terraform 的机器上跑通。
+
+### 7.5 显式延后（不在 M0-S2 范围）
+
+- **BE-A-01 商家注册/登录**（boss 手机号+验证码、admin 账号密码+TOTP）：boss/admin 目前走 dev MockTenant；真实登录随商家域落地。
+- **Dify 编排**：§7.5 决策「0→1 不引入」，作远期实验场。
+- **真实 LLM 成本压测**：`cmd/llmbench` 已就位，需真实 key 跑（凭据由运营提供）。
+- **`internal/tenant` 仍空**（`.gitkeep` 已清，目录保留）：商家域/计费域落地时填充。

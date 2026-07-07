@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,9 +18,13 @@ import (
 	"go.uber.org/zap"
 
 	httpserver "github.com/zhangguijunshi/backend/interfaces/http"
+	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
+	"github.com/zhangguijunshi/backend/pkg/jwt"
 	"github.com/zhangguijunshi/backend/pkg/logger"
+	"github.com/zhangguijunshi/backend/pkg/redisx"
+	"github.com/zhangguijunshi/backend/pkg/wxsdk"
 )
 
 func main() {
@@ -69,9 +74,42 @@ func run() error {
 		}
 	}
 
+	// Auth stack (tech plan §6.2): ES256 JWT manager + a SessionStore (Redis
+	// when available, else in-memory for local dev) + the consumer auth service.
+	// All degrade gracefully — a dev box with no Redis still issues real tokens.
+	jwtMgr, err := buildJWTManager(cfg, log)
+	if err != nil {
+		return fmt.Errorf("init jwt: %w", err)
+	}
+	store := buildSessionStore(context.Background(), cfg, log)
+
+	var authSvc *auth.AuthService
+	if jwtMgr != nil {
+		wxOpts := []wxsdk.Option{}
+		if cfg.WX.Code2SessionURL != "" {
+			wxOpts = append(wxOpts, wxsdk.WithBaseURL(cfg.WX.Code2SessionURL))
+		}
+		if cfg.WX.Timeout > 0 {
+			wxOpts = append(wxOpts, wxsdk.WithTimeout(cfg.WX.Timeout))
+		}
+		authSvc = auth.New(auth.Config{
+			AppID:      cfg.WX.AppID,
+			Secret:     cfg.WX.Secret,
+			AccessTTL:  cfg.JWT.AccessTTL,
+			RefreshTTL: cfg.JWT.RefreshTTL,
+		}, wxsdk.New(wxOpts...), jwtMgr, store, auth.NewMemoryConsumerRepo())
+	}
+
 	srv := &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
-		Handler:      httpserver.New(httpserver.Deps{Cfg: cfg, DB: database}),
+		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
+		Handler: httpserver.New(httpserver.Deps{
+			Cfg:     cfg,
+			DB:      database,
+			JWT:     jwtMgr,
+			Store:   store,
+			AuthSvc: authSvc,
+			DevMock: cfg.Multitenancy.DevMockHeader,
+		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,
 	}
@@ -96,6 +134,9 @@ func run() error {
 	if database != nil {
 		database.Close()
 	}
+	if store != nil {
+		_ = store.Close()
+	}
 	log.Info("shutdown complete")
 	return nil
 }
@@ -105,4 +146,59 @@ func envOr(key, dflt string) string {
 		return v
 	}
 	return dflt
+}
+
+// buildJWTManager constructs the ES256 signer/verifier. It loads a PEM private
+// key from cfg.JWT.KeyFile when set; otherwise it derives a deterministic dev
+// key (logged loudly) so a dev server still issues verifiable tokens with no
+// configuration.
+func buildJWTManager(cfg *config.Config, log *zap.Logger) (*jwt.Manager, error) {
+	var priv *ecdsa.PrivateKey
+	if cfg.JWT.KeyFile != "" {
+		p, err := jwt.LoadPrivateKeyFile(cfg.JWT.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+		priv = p
+		log.Info("jwt key loaded from file", zap.String("key_file", cfg.JWT.KeyFile))
+	} else {
+		p, err := jwt.DevKey(jwt.DevSeed)
+		if err != nil {
+			return nil, err
+		}
+		priv = p
+		log.Warn("using derived dev JWT key — DO NOT USE IN PRODUCTION",
+			zap.String("kid", cfg.JWT.KeyID),
+			zap.String("hint", "set jwt.key_file to a PEM ECDSA P-256 private key in staging/prod"),
+		)
+	}
+	return jwt.New(jwt.Config{
+		PrivateKey: priv,
+		KeyID:      cfg.JWT.KeyID,
+		Issuer:     cfg.JWT.Issuer,
+		AccessTTL:  cfg.JWT.AccessTTL,
+	})
+}
+
+// buildSessionStore returns a Redis-backed SessionStore when Redis is reachable,
+// otherwise an in-memory store. Both satisfy jwt.SessionStore.
+func buildSessionStore(ctx context.Context, cfg *config.Config, log *zap.Logger) jwt.SessionStore {
+	if cfg.Redis.Host == "" {
+		return jwt.NewMemorySessionStore()
+	}
+	rdb, err := redisx.New(ctx, cfg.Redis)
+	if err != nil {
+		log.Warn("redis client init failed; using memory session store", zap.Error(err))
+		return jwt.NewMemorySessionStore()
+	}
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := rdb.Ping(pctx); err != nil {
+		log.Warn("redis ping failed; using memory session store",
+			zap.String("addr", rdb.Addr()), zap.Error(err))
+		_ = rdb.Close()
+		return jwt.NewMemorySessionStore()
+	}
+	log.Info("redis connected; using redis session store", zap.String("addr", rdb.Addr()))
+	return jwt.NewRedisSessionStore(rdb.Client)
 }
