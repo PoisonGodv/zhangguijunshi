@@ -19,6 +19,8 @@ import (
 
 	httpserver "github.com/zhangguijunshi/backend/interfaces/http"
 	"github.com/zhangguijunshi/backend/internal/auth"
+	"github.com/zhangguijunshi/backend/internal/billing"
+	"github.com/zhangguijunshi/backend/internal/catalog"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/jwt"
@@ -100,6 +102,13 @@ func run() error {
 		}, wxsdk.New(wxOpts...), jwtMgr, store, auth.NewMemoryConsumerRepo())
 	}
 
+	// M1-S1 domain services (CONTRACT §8). Repositories are in-memory until
+	// PostgreSQL is wired (the services depend only on the repo interfaces, so a
+	// pgx implementation drops in later without touching the HTTP layer).
+	catalogRepo := catalog.NewMemoryProductRepo()
+	catalogSvc := catalog.NewService(catalogRepo)
+	billingSvc := billing.New(billing.NewMemoryOrderRepo(), catalogPricer{catalogSvc})
+
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
 		Handler: httpserver.New(httpserver.Deps{
@@ -108,6 +117,8 @@ func run() error {
 			JWT:     jwtMgr,
 			Store:   store,
 			AuthSvc: authSvc,
+			Catalog: catalogSvc,
+			Billing: billingSvc,
 			DevMock: cfg.Multitenancy.DevMockHeader,
 		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
@@ -146,6 +157,33 @@ func envOr(key, dflt string) string {
 		return v
 	}
 	return dflt
+}
+
+// catalogPricer adapts *catalog.Service to billing.ProductPricer (CONTRACT §8.3
+// anti-corruption layer): billing never imports catalog, so this thin adapter
+// translates the priced view at the composition root.
+type catalogPricer struct{ svc *catalog.Service }
+
+func (p catalogPricer) GetByID(ctx context.Context, tenantID, id int64) (*billing.PricedProduct, error) {
+	prod, err := p.svc.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Defence-in-depth: the service already scopes to the ctx tenant, but the
+	// billing contract requires the returned product to belong to tenantID.
+	if prod.TenantID != tenantID {
+		return nil, catalog.ErrNotFound
+	}
+	return &billing.PricedProduct{
+		ID:         prod.ID,
+		TenantID:   prod.TenantID,
+		StoreID:    prod.StoreID,
+		Name:       prod.Name,
+		Unit:       prod.Unit,
+		PriceCents: prod.PriceCents,
+		CostCents:  prod.CostCents,
+		Status:     prod.Status,
+	}, nil
 }
 
 // buildJWTManager constructs the ES256 signer/verifier. It loads a PEM private

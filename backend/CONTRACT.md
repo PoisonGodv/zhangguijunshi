@@ -156,3 +156,170 @@ M0-S2 在 M0-S1 地基上落地四块，全部沿用「可选依赖 + 接口 + �
 - **Dify 编排**：§7.5 决策「0→1 不引入」，作远期实验场。
 - **真实 LLM 成本压测**：`cmd/llmbench` 已就位，需真实 key 跑（凭据由运营提供）。
 - **`internal/tenant` 仍空**（`.gitkeep` 已清，目录保留）：商家域/计费域落地时填充。
+
+---
+
+## 8. M1-S1 增量契约（DB-02 / BE-A-02 / BE-A-05 / BE-A-06，2026-07-20）
+
+M1-S1 把「商品 + 订单 + 当日流水」这条 MVP 核心链路打通（WBS §M1-S1）。沿用铁律：「接口 + 内存实现兜底 + mock 测试」，本机无 PG 时 `go build ./... && go test -race ./...` 仍全绿。**仓储接口已定死，实现可换（内存↔pgx）而不动 service/handler。**
+
+### 8.1 范围与裁剪（对照 ch05）
+
+- **纳入**：`internal/catalog`（商品 CRUD）、`internal/billing`（开单 + 当日流水汇总）。
+- **裁剪**：`payment_ledger`、`reconciliation_diffs`、`product_pending` **不纳入 M1-S1**（支付对账属 M4，多源采集属 M1-S3）。`inventory_movements` 表建了但服务层暂不落流水（库存域 M1-S1 后接 BE-A-04）。
+- **分区降级**：ch05 里 `orders`/`order_items`/`inventory_movements` 设计为 `PARTITION BY RANGE`。M1-S1 为可迁移性建**普通表**（不带 `PARTITION BY`），月分区滚动脚本留待后续迁移（线上数据量未到分区阈值前普通表即够）。在迁移注释里标注此决策。
+
+### 8.2 迁移编号（DB-02）
+
+| 文件 | 内容 |
+|---|---|
+| `migrations/000002_catalog_inventory.up/.down.sql` | `products` + `inventory_batches` + `inventory_movements`（普通表非分区）。复用 000001 的 `trg_set_updated_at()`（**勿重复 CREATE FUNCTION**，可用 `CREATE OR REPLACE`）。 |
+| `migrations/000003_billing_order.up/.down.sql` | `orders` + `order_items`（普通表非分区）。 |
+
+DDL 逐字段对齐 ch05 §5.3.2/§5.3.3；金额一律 `BIGINT` 分；`orders`/`order_items`/`inventory_movements` **禁软删**（强审计）。`down.sql` 逆序 drop（先子后父）。触发器：`products`/`inventory_batches`/`orders` 挂 `trg_set_updated_at`；`order_items`/`inventory_movements` 无 `updated_at`，不挂。
+
+### 8.3 领域类型与仓储接口（**已固定，agent 必须一字不差实现签名**）
+
+#### `internal/catalog`
+
+```go
+type Product struct {
+    ID, TenantID, StoreID       int64
+    Barcode, Name, Category, Unit string
+    CostCents, PriceCents       int64
+    ImageURL                    string
+    ShelfLifeDays               int   // 0 = 未设置
+    Tags                        []string
+    Status                      string // "active" | "archived"
+    CreatedAt, UpdatedAt        time.Time
+}
+
+var ErrNotFound = errors.New("catalog: product not found")
+
+type ProductFilter struct {
+    StoreID  int64    // >0 时按店过滤
+    Query    string   // 名称/条码模糊
+    Category string
+    Limit    int      // <=0 用默认 50
+    Offset   int
+}
+
+type ProductRepo interface {
+    Create(ctx context.Context, p *Product) (*Product, error)
+    Update(ctx context.Context, p *Product) (*Product, error)          // 全字段更新(按 ID+tenant)
+    GetByID(ctx context.Context, tenantID, id int64) (*Product, error) // ErrNotFound
+    GetByBarcode(ctx context.Context, tenantID, storeID int64, barcode string) (*Product, error) // ErrNotFound
+    List(ctx context.Context, tenantID int64, f ProductFilter) ([]*Product, error)
+}
+
+// Service 方法(全部先 EnforceTenant,再用 ctx 里的 StoreID 兜底):
+//   Create(ctx, in CreateInput) (*Product, error)        // 校验 name/unit 非空、price>=cost>=0; 默认 Status=active/Unit=个
+//   UpdatePrice(ctx, id, costCents, priceCents int64) (*Product, error) // 价格校验
+//   GetByID(ctx, id int64) (*Product, error)
+//   GetByBarcode(ctx, barcode string) (*Product, error)
+//   List(ctx, f ProductFilter) ([]*Product, error)
+```
+
+#### `internal/billing`
+
+```go
+type OrderItem struct {
+    ProductID      int64
+    NameSnapshot   string
+    Unit           string
+    Qty            int64
+    PriceCents     int64 // 成交单价(快照)
+    CostCents      int64 // 成本快照(归因利润)
+}
+type Order struct {
+    ID, TenantID, StoreID, MemberID int64 // MemberID 可 0(散客)
+    OrderNo                         string
+    Channel                         string // in_store|wxshop|wework|delivery
+    Status                          string // pending|paid|refunded|voided
+    TotalCents, PaidCents, DiscountCents int64
+    PaymentMethod                   string
+    OperatorID                      int64
+    Items                           []OrderItem
+    PaidAt                          *time.Time
+    CreatedAt, UpdatedAt            time.Time
+}
+
+var ErrNotFound = errors.New("billing: order not found")
+
+type OrderRepo interface {
+    Create(ctx context.Context, o *Order) (*Order, error)              // 连 Items 一起落
+    GetByID(ctx context.Context, tenantID, id int64) (*Order, error)   // ErrNotFound
+    ListByDate(ctx context.Context, tenantID, storeID int64, day time.Time) ([]*Order, error) // day 任一时刻,按自然日
+}
+
+#### `internal/billing`（注意：**禁止 import `internal/catalog`**，用本包镜像类型做防腐）
+
+```go
+// PricedProduct 是 billing 对商品视图的最小镜像(防腐层),与 catalog.Product 字段同构,
+// 由主线程在接线时做适配转换;billing 单测用 fake pricer 返回它。
+type PricedProduct struct {
+    ID, TenantID, StoreID int64
+    Name, Unit            string
+    PriceCents, CostCents int64
+    Status                string
+}
+
+type ProductPricer interface {
+    GetByID(ctx context.Context, tenantID, id int64) (*PricedProduct, error)
+}
+```
+
+type CreateOrderItem struct{ ProductID, Qty int64 }
+type CreateOrderInput struct {
+    StoreID       int64
+    MemberID      int64
+    Channel       string // 空默认 in_store
+    PaymentMethod string // 空默认 cash
+    Items         []CreateOrderItem
+}
+
+// Service:
+//   CreateOrder(ctx, in CreateOrderInput) (*Order, error)
+//     — 逐项查 ProductPricer 取 name/unit/price/cost 快照; total=Σqty*price; paid=total; discount=0
+//     — 校验: items 非空、qty>0、商品必须属于本 tenant(跨租户商品→ErrForbidden)
+//     — OrderNo 由注入的 OrderNoFunc 生成; Status=paid; PaidAt=now
+//   GetOrder(ctx, id int64) (*Order, error)
+//   DailySummary(ctx, storeID int64, day time.Time) (*DailySummary, error)
+type DailySummary struct {
+    TenantID, StoreID    int64
+    Date                 string // YYYY-MM-DD
+    OrderCount           int
+    GrossCents           int64 // Σ total
+    NetCents             int64 // Σ paid
+    CostCents            int64 // Σ 各项 qty*cost
+    ProfitCents          int64 // Net - Cost
+    TopProducts          []TopProduct // 按销量 desc, 上限 5
+}
+type TopProduct struct{ ProductID int64; Name string; Qty int64; GrossCents int64 }
+```
+
+### 8.4 包所有权（文件集互斥）
+
+| Agent | 只准写这些文件 |
+|---|---|
+| **M1-migrations** | `migrations/000002_catalog_inventory.up.sql` + `.down.sql` + `migrations/000003_billing_order.up.sql` + `.down.sql` |
+| **M1-catalog** | `internal/catalog/{catalog.go, memory_repo.go, service.go, service_test.go}` |
+| **M1-billing** | `internal/billing/{billing.go, memory_repo.go, service.go, service_test.go}` |
+
+> 主线程负责：`interfaces/http/handler/{catalog.go,billing.go}`、`interfaces/http/router.go`、`cmd/api/main.go`、`internal/billing` 与 `catalog` 的接线（`billing.ProductPricer = catalog.Service`）。**agent 不写这些路径。**
+
+### 8.5 硬约束（M1-S1 全员）
+
+1. **每个 repo 方法第一行 `tenantID, err := multitenancy.EnforceTenant(ctx)`**（或 `guard.Wrap`）；service 同样先取 tenant。**禁止从请求体/参数信任 tenant_id**——tenant 永远来自 ctx（JWT/Mock）。
+2. 内存实现须**并发安全**（`sync.RWMutex`）+ **返回防御性拷贝**（仿 `auth.MemoryConsumerRepo`），并**强制 tenant 隔离**：`GetByID(tenantID, id)` 对别的 tenant 的 id 返回 `ErrNotFound`（串户测试矩阵必覆盖）。
+3. 金额一律 `int64` 分，禁浮点。
+4. 不引入白名单外依赖；不连真实 DB/Redis。
+5. service 对 `billing` 只依赖 `ProductPricer` 接口（_test 里用 fake pricer_），**不 import catalog 具体类型做断言**——类型只用于字段搬运。
+6. `OrderNoFunc` 注入（便于测试确定性）：`func(tenantID int64, now time.Time) string`；默认实现形如 `ZG<tenant><yyyymmdd><seq>`。
+
+### 8.6 DoD（M1-S1）
+
+- `go build ./... && go vet ./... && gofmt -l .`（空）`&& go test -race ./...` 全绿。
+- catalog/billing service 单测覆盖：CRUD 闭环、串户拒绝（tenant A 读不到 tenant B 的商品/订单）、价格校验（price<cost 拒绝）、当日流水汇总数值正确（毛利=净收-成本）。
+- 迁移文件 golang-migrate 命名合法、up/down 对称。
+- HTTP 冒烟（主线程）：dev mock 下 `POST /v1/boss/catalog/products` 建品 → `POST /v1/boss/billing/orders` 开单 → `GET /v1/boss/billing/summary/today` 出汇总；带别的 `X-Mock-Tenant` 读不到前述数据（串户证明）。

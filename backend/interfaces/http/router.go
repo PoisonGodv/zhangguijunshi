@@ -21,6 +21,8 @@ import (
 	"github.com/zhangguijunshi/backend/interfaces/http/handler"
 	"github.com/zhangguijunshi/backend/interfaces/http/middleware"
 	"github.com/zhangguijunshi/backend/internal/auth"
+	"github.com/zhangguijunshi/backend/internal/billing"
+	"github.com/zhangguijunshi/backend/internal/catalog"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
@@ -40,6 +42,9 @@ type Deps struct {
 	JWT     *jwt.Manager
 	Store   jwt.SessionStore
 	AuthSvc *auth.AuthService
+	// M1-S1 domain services (nil in the minimal test fixture).
+	Catalog *catalog.Service
+	Billing *billing.Service
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -77,7 +82,33 @@ func New(deps Deps) *gin.Engine {
 		g.Use(bossAdminAuthMW(deps))
 		g.GET("/whoami", whoami)
 	}
+	wireBoss(r, deps)
 	return r
+}
+
+// wireBoss mounts the merchant (boss) BFF domain routes for M1-S1: the product
+// catalogue and the billing (checkout + daily flow) surfaces. All routes sit
+// behind the boss auth middleware; tenant/store are resolved from the verified
+// context (JWT in prod, X-Mock-* in dev), never from the request body.
+func wireBoss(r *gin.Engine, deps Deps) {
+	boss := r.Group("/v1/boss")
+	boss.Use(bossAdminAuthMW(deps))
+
+	if deps.Catalog != nil {
+		h := handler.NewCatalogHandler(deps.Catalog)
+		boss.POST("/catalog/products", h.CreateProduct)
+		boss.GET("/catalog/products", h.ListProducts)
+		boss.GET("/catalog/products/barcode/:barcode", h.GetProductByBarcode)
+		boss.GET("/catalog/products/:id", h.GetProduct)
+		boss.PATCH("/catalog/products/:id/price", h.UpdateProductPrice)
+	}
+	if deps.Billing != nil {
+		h := handler.NewBillingHandler(deps.Billing)
+		boss.POST("/billing/orders", h.CreateOrder)
+		boss.GET("/billing/orders/:id", h.GetOrder)
+		boss.GET("/billing/summary/today", h.DailySummaryToday)
+		boss.GET("/billing/summary/:date", h.DailySummary)
+	}
 }
 
 // wireWxshop mounts the consumer BFF: public auth endpoints + an authed group
