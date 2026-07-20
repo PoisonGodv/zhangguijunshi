@@ -24,6 +24,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
 	"github.com/zhangguijunshi/backend/internal/inventory"
+	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
@@ -50,6 +51,8 @@ type Deps struct {
 	// M1-S2 domain services (nil in the minimal test fixture).
 	Inventory  *inventory.Service
 	Membership *membership.Service
+	// M2-S1 domain services (nil in the minimal test fixture).
+	Marketing *marketing.Service
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -127,6 +130,16 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.GET("/membership/members/:id", h.GetMember)
 		boss.POST("/membership/members/:id/code", h.IssueCode)
 		boss.POST("/membership/redeem", h.Redeem)
+	}
+	if deps.Marketing != nil {
+		h := handler.NewMarketingHandler(deps.Marketing)
+		boss.POST("/marketing/coupons", h.CreateCoupon)
+		boss.GET("/marketing/coupons", h.ListCoupons)
+		boss.GET("/marketing/coupons/:id", h.GetCoupon)
+		boss.PATCH("/marketing/coupons/:id/status", h.UpdateStatus)
+		boss.POST("/marketing/coupons/issue", h.Issue)
+		boss.POST("/marketing/coupons/redeem", h.Redeem)
+		boss.GET("/marketing/members/:id/coupons", h.ListMemberCoupons)
 	}
 }
 

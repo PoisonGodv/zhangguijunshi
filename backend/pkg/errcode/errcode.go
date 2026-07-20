@@ -19,18 +19,22 @@ func (e Err) Error() string { return e.Message }
 
 // Sentinel errors. Format: HTTP×100 + business subcode (see tech plan §6.5.2).
 var (
-	OK              = Err{0, "ok", http.StatusOK}
-	ErrParam        = Err{40001, "参数错误", http.StatusBadRequest}
-	ErrTokenInvalid = Err{40101, "登录已失效，请重新登录", http.StatusUnauthorized}
-	ErrForbidden    = Err{40301, "无权操作该资源", http.StatusForbidden}
-	ErrTenantCross  = Err{40302, "跨租户访问被拒", http.StatusForbidden}
-	ErrIdempotent   = Err{40901, "重复请求已处理", http.StatusConflict}
-	ErrRateLimit    = Err{42901, "操作过于频繁，请稍后再试", http.StatusTooManyRequests}
-	ErrAccountLock  = Err{42301, "账号已锁定，15 分钟后重试", http.StatusLocked}
-	ErrMarginGuard  = Err{60001, "折扣低于毛利护栏，已拦截", http.StatusOK}
-	ErrFreqCircuit  = Err{60002, "群发频次已达上限", http.StatusOK}
-	ErrBalanceOver  = Err{60003, "储值余额超过单店上限", http.StatusOK}
-	ErrBalanceShort = Err{60004, "储值余额不足", http.StatusOK}
-	ErrInternal     = Err{50001, "服务器内部错误", http.StatusInternalServerError}
-	ErrUpstream     = Err{50201, "上游服务异常", http.StatusBadGateway}
+	OK                = Err{0, "ok", http.StatusOK}
+	ErrParam          = Err{40001, "参数错误", http.StatusBadRequest}
+	ErrTokenInvalid   = Err{40101, "登录已失效，请重新登录", http.StatusUnauthorized}
+	ErrForbidden      = Err{40301, "无权操作该资源", http.StatusForbidden}
+	ErrTenantCross    = Err{40302, "跨租户访问被拒", http.StatusForbidden}
+	ErrIdempotent     = Err{40901, "重复请求已处理", http.StatusConflict}
+	ErrRateLimit      = Err{42901, "操作过于频繁，请稍后再试", http.StatusTooManyRequests}
+	ErrAccountLock    = Err{42301, "账号已锁定，15 分钟后重试", http.StatusLocked}
+	ErrMarginGuard    = Err{60001, "折扣低于毛利护栏，已拦截", http.StatusOK}
+	ErrFreqCircuit    = Err{60002, "群发频次已达上限", http.StatusOK}
+	ErrBalanceOver    = Err{60003, "储值余额超过单店上限", http.StatusOK}
+	ErrBalanceShort   = Err{60004, "储值余额不足", http.StatusOK}
+	ErrCouponQuota    = Err{60005, "券已发完", http.StatusOK}
+	ErrCouponInactive = Err{60006, "券未上线或不在有效期", http.StatusOK}
+	ErrCouponExpired  = Err{60007, "券已过期", http.StatusOK}
+	ErrCouponUsed     = Err{60008, "券已核销", http.StatusOK}
+	ErrInternal       = Err{50001, "服务器内部错误", http.StatusInternalServerError}
+	ErrUpstream       = Err{50201, "上游服务异常", http.StatusBadGateway}
 )

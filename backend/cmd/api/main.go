@@ -22,6 +22,8 @@ import (
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
 	"github.com/zhangguijunshi/backend/internal/inventory"
+	"github.com/zhangguijunshi/backend/internal/margin"
+	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
@@ -121,6 +123,21 @@ func run() error {
 	)
 	membershipSvc := membership.New(membership.NewMemoryMemberRepo(), membership.NewMemoryMemberCoder(nil))
 
+	// M2-S1 domain services (CONTRACT §10). Marketing depends on the
+	// membership (member existence) and margin (gross-margin rail) anti-
+	// corruption ports, adapted here at the composition root. The margin guard
+	// fetches the tenant's products from catalog and rejects any coupon that
+	// would drop a product below the floor; an empty catalog yields no
+	// validation (best-effort).
+	marketingSvc := marketing.New(
+		marketing.NewMemoryCouponRepo(),
+		marketing.WithMemberLookuper(membershipLookuper{membershipSvc}),
+		marketing.WithMarginGuard(catalogMarginGuard{
+			guard:      margin.Guard{MarginFloorPct: defaultMarginFloorPct},
+			catalogSvc: catalogSvc,
+		}),
+	)
+
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
 		Handler: httpserver.New(httpserver.Deps{
@@ -133,6 +150,7 @@ func run() error {
 			Billing:    billingSvc,
 			Inventory:  inventorySvc,
 			Membership: membershipSvc,
+			Marketing:  marketingSvc,
 			DevMock:    cfg.Multitenancy.DevMockHeader,
 		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
@@ -229,6 +247,63 @@ type inventoryStockConsumer struct{ svc *inventory.Service }
 func (c inventoryStockConsumer) ConsumeFIFO(ctx context.Context, storeID, productID, qty, refOrderID int64) error {
 	_, err := c.svc.ConsumeFIFO(ctx, storeID, productID, qty, refOrderID)
 	return err
+}
+
+// defaultMarginFloorPct is the gross-margin floor (10%) the marketing margin
+// guard enforces on coupon issuance. Configurable via config in a later
+// milestone; a constant keeps M2-S1 self-contained.
+const defaultMarginFloorPct = 10
+
+// membershipLookuper adapts *membership.Service to marketing.MemberLookuper
+// (CONTRACT §10.3 anti-corruption): marketing never imports membership, so this
+// thin adapter answers "does this member exist in this tenant" at the
+// composition root. A cross-tenant or unknown member reads as not-exists.
+type membershipLookuper struct{ svc *membership.Service }
+
+func (l membershipLookuper) Exists(ctx context.Context, tenantID, memberID int64) (bool, error) {
+	m, err := l.svc.GetMember(ctx, memberID)
+	if err != nil {
+		if errors.Is(err, membership.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if m.TenantID != tenantID {
+		return false, nil
+	}
+	return true, nil
+}
+
+// catalogMarginGuard adapts margin.Guard + *catalog.Service to
+// marketing.MarginGuard (CONTRACT §10.3 anti-corruption). It fetches the
+// tenant's products, adapts the coupon params to a margin.CouponRule, and
+// delegates to the pure margin.ValidateCoupon. Best-effort: a catalog read
+// failure skips the check (the coupon is allowed) rather than blocking issuance.
+type catalogMarginGuard struct {
+	guard      margin.Guard
+	catalogSvc *catalog.Service
+}
+
+func (g catalogMarginGuard) ValidateCoupon(ctx context.Context, c *marketing.Coupon) error {
+	prods, err := g.catalogSvc.List(ctx, catalog.ProductFilter{Limit: 500})
+	if err != nil {
+		return nil
+	}
+	products := make([]margin.ProductView, 0, len(prods))
+	for _, p := range prods {
+		products = append(products, margin.ProductView{
+			ID:         p.ID,
+			CostCents:  p.CostCents,
+			PriceCents: p.PriceCents,
+		})
+	}
+	rule := margin.CouponRule{
+		Type:             c.Type,
+		ThresholdCents:   c.Params.ThresholdCents,
+		OffCents:         c.Params.OffCents,
+		DiscountPermille: c.Params.DiscountPermille,
+	}
+	return margin.ValidateCoupon(g.guard, rule, products)
 }
 
 // buildJWTManager constructs the ES256 signer/verifier. It loads a PEM private

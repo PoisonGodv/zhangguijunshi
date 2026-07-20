@@ -521,3 +521,299 @@ func ComputeTags(v TagProductView, rule TagRule, now time.Time) []string
 - dataquality 单测：ReverseDailySales 聚合正确、ComputeTags 临期/滞销/高毛利规则正确（注入 now）。
 - 迁移 golang-migrate 命名合法、up/down 对称。
 - HTTP 冒烟（主线程）：dev mock 下「建品→入库→开单扣库存→会员入会→签发会员码→核销累积分→当日流水」全链路；串户证明（别的 X-Mock-Tenant 读不到批次/会员、核销别人的码→拒绝）。
+
+---
+
+## 10. M2-S1 增量契约（BE-B-02 券域 / BE-B-04 频次熔断 / BE-B-05 内容过滤 / AI-02-seed 毛利护栏，2026-07-20）
+
+M2-S1 落地营销域发券闭环 + 三道合规护栏（频次熔断 / 内容过滤 / 毛利护栏），为 M3 AI 一键执行（BE-B-11 ActionExecutor）铺数据与安全轨。沿用全部铁律：「接口 + 内存实现兜底 + mock 测试」「tenant 只从 ctx 取，首行 EnforceTenant」「金额 int64 分」「不连真实 DB/Redis」「内存实现并发安全 + 防御性拷贝 + 跨租户 ErrNotFound」。
+
+### 10.1 范围与裁剪（对照 ch04 §4.2 / §4.3 / §4.5）
+
+- **纳入**：`internal/marketing`（券模板 CRUD + 会员券发券/核销 + source/strategy_id 归因）、`internal/compliance/freqcircuit`（企微群发/1v1/订阅消息/短信 四通道频次熔断，内存计数器）、`internal/compliance/contentfilter`（DFA 敏感词 + 广告法绝对化替换，纯函数）、`internal/margin`（毛利护栏纯函数，AI-02 seed）。
+- **裁剪**：`groupbuys`/`groupbuy_participants`（拼团，BE-B-03）不纳入（依赖小程序码，留 M2-S2）；`wework_living_codes`/`community_groups`/`reach_tasks`（企微活码/社群/触达任务，BE-B-06/07）不纳入（依赖企微 SDK，留 M2-S2）；`ActionExecutor`（BE-B-11）不纳入（依赖 AI-05 五段式，留 M3-S1）；营销策略表 `ai_strategies`/`strategy_items`（DB-04）不纳入（留 M3-S1）。
+- **分区降级**：ch05 无分区设计，coupons/member_coupons 均普通表。
+- **频次熔断内存化**：Counter 接口对齐 Redis INCR/DECR/EXPIRE 语义，内存实现（map + sync.Mutex + 惰性过期）；生产换 Redis 实现不改 service（同 pkg/db/pkg/redisx 缺失降级范式）。
+- **毛利护栏纯函数化**：`internal/margin` 不 import 任何领域包（同 dataquality 范式），主线程适配 marketing.Coupon → margin.CouponRule。marketing 通过可选 `MarginGuard` 接口注入，nil 时不校验（手动发券可选，AI 发券 M3 必走）。
+
+### 10.2 迁移编号（DB-03 部分）
+
+| 文件 | 内容 |
+|---|---|
+| `migrations/000005_marketing.up/.down.sql` | `coupons`（券模板，软删除）+ `member_coupons`（会员券实例，禁软删审计）。复用 000001 的 `trg_set_updated_at()`（`CREATE OR REPLACE` 或直接挂 trigger）。 |
+
+DDL 逐字段对齐 ch05 §5.3.5。`coupons` 挂 `trg_set_updated_at` 且有 `deleted_at`；`member_coupons` 为审计实例无 `updated_at` 不挂触发器、禁软删。金额一律 `BIGINT` 分；`params` 用 `JSONB`。`down.sql` 逆序 drop（先 member_coupons 后 coupons）。`groupbuys`/`groupbuy_participants` 本次**不建**（留 M2-S2）。
+
+### 10.3 领域类型与仓储接口（**已固定，agent 必须一字不差实现签名**）
+
+#### `internal/marketing`（BE-B-02）
+
+```go
+type Coupon struct {
+    ID, TenantID, StoreID int64
+    Name                  string
+    Type                  string // full_reduction|discount|cash|gift
+    Params                CouponParams
+    ValidFrom, ValidTo    time.Time
+    TotalQuota            int64 // 0 = 无限发行
+    Issued                int64
+    Status                string // draft|active|paused|ended
+    CreatedBy             int64
+    CreatedAt, UpdatedAt  time.Time
+}
+
+// CouponParams 是券模板的弹性参数(JSONB 解析后)。字段按 Type 取用:
+//   full_reduction: ThresholdCents + OffCents (满 threshold 减 off)
+//   discount:       DiscountPermille (‰, 850=85%=8.5折)
+//   cash:           OffCents (代金直减, 无门槛)
+//   gift:           GiftProductID (赠品, M2 不校验赠品成本)
+type CouponParams struct {
+    ThresholdCents   int64 `json:"threshold_cents,omitempty"`
+    OffCents         int64 `json:"off_cents,omitempty"`
+    DiscountPermille int64 `json:"discount_permille,omitempty"` // 0-1000
+    GiftProductID    int64 `json:"gift_product_id,omitempty"`
+}
+
+var ErrNotFound       = errors.New("marketing: coupon not found")
+var ErrQuotaExhausted = errors.New("marketing: coupon quota exhausted")
+var ErrCouponInactive = errors.New("marketing: coupon not active")
+var ErrCouponExpired  = errors.New("marketing: member coupon expired")
+var ErrCouponUsed     = errors.New("marketing: member coupon already used")
+
+type CouponFilter struct {
+    StoreID int64
+    Status  string // 空不过滤
+    Type    string // 空不过滤
+    Limit   int    // <=0 默认 50
+    Offset  int
+}
+
+type MemberCoupon struct {
+    ID, TenantID, MemberID, CouponID int64
+    Status     string // unused|used|expired|revoked
+    Source     string // ai_strategy|manual|groupbuy|newmember
+    StrategyID int64  // 归因(0=非AI来源)
+    IssuedAt   time.Time
+    UsedAt     *time.Time
+    ExpireAt   *time.Time // nil=用 coupon.ValidTo
+    RefOrderID int64
+}
+
+type CouponRepo interface {
+    CreateCoupon(ctx context.Context, c *Coupon) (*Coupon, error)
+    GetCoupon(ctx context.Context, tenantID, id int64) (*Coupon, error)                  // ErrNotFound/跨租户
+    GetByName(ctx context.Context, tenantID int64, name string) (*Coupon, error)         // ErrNotFound/跨租户
+    UpdateCoupon(ctx context.Context, c *Coupon) (*Coupon, error)                        // 按 ID+tenant 更新 status/issued
+    ListCoupons(ctx context.Context, tenantID int64, f CouponFilter) ([]*Coupon, error)
+    // IssueToMember 原子: 校验 coupon active+在有效期+未超发(TotalQuota=0 无限) → issued++ → 建 member_coupon(unused)。
+    // source/strategyID 落归因; expireAt nil 时用 coupon.ValidTo。任一不满足返回对应哨兵错误, 状态不变。
+    IssueToMember(ctx context.Context, tenantID, memberID, couponID int64, source string, strategyID int64, expireAt *time.Time, now time.Time) (*MemberCoupon, error)
+    GetMemberCoupon(ctx context.Context, tenantID, id int64) (*MemberCoupon, error) // ErrNotFound/跨租户
+    ListMemberCoupons(ctx context.Context, tenantID, memberID int64, status string) ([]*MemberCoupon, error) // status 空不过滤
+    // RedeemAtomic 原子: unused→used + 设 UsedAt/RefOrderID; 非 unused→ErrCouponUsed; ExpireAt 已过→ErrCouponExpired
+    RedeemAtomic(ctx context.Context, tenantID, id, refOrderID int64, now time.Time) (*MemberCoupon, error)
+}
+
+// MemberLookuper 防腐: marketing 不 import membership(同 inventory.ProductLookuper 范式)。
+type MemberLookuper interface {
+    Exists(ctx context.Context, tenantID, memberID int64) (bool, error)
+}
+
+// MarginGuard 可选: 发券前毛利护栏(AI 发券必走, 手动发券可选)。nil 时不校验。
+type MarginGuard interface {
+    ValidateCoupon(ctx context.Context, c *Coupon) error
+}
+
+type CreateCouponInput struct {
+    StoreID    int64
+    Name       string
+    Type       string
+    Params     CouponParams
+    ValidFrom  time.Time
+    ValidTo    time.Time
+    TotalQuota int64
+    CreatedBy  int64
+}
+type IssueInput struct {
+    MemberID   int64
+    CouponID   int64
+    Source     string // 空=manual
+    StrategyID int64
+    ExpireAt   *time.Time // nil=用 coupon.ValidTo
+}
+type RedeemInput struct {
+    MemberCouponID int64
+    RefOrderID     int64
+}
+// Service:
+//   CreateCoupon(ctx, in CreateCouponInput) (*Coupon, error)   // name 非空+租户内唯一; type ∈ 四类; valid_from<valid_to; 默认 status=draft
+//   UpdateStatus(ctx, id int64, status string) (*Coupon, error) // draft→active; active↔paused; *→ended; 非法迁移→ErrParam
+//   GetCoupon(ctx, id int64) (*Coupon, error)
+//   ListCoupons(ctx, f CouponFilter) ([]*Coupon, error)
+//   Issue(ctx, in IssueInput) (*MemberCoupon, error)           // 校验 member 存在(via MemberLookuper)+coupon active+quota+有效期; 可选 MarginGuard
+//   Redeem(ctx, in RedeemInput) (*MemberCoupon, error)         // 核销 unused→used(经 RedeemAtomic)
+//   ListMemberCoupons(ctx, memberID int64, status string) ([]*MemberCoupon, error)
+```
+
+> **接线说明**：marketing 的 MemberLookuper / MarginGuard 由主线程在 `cmd/api/main.go` 适配（membership → MemberLookuper，margin.Guard → MarginGuard）。marketing **不 import** membership/margin/catalog。
+
+#### `internal/margin`（AI-02 seed — 毛利护栏纯函数）
+
+```go
+// 纯函数包, 不 import 任何领域包(同 dataquality 范式)。主线程适配 marketing.Coupon → margin.CouponRule。
+type Guard struct {
+    MarginFloorPct int64 // 最低毛利率(%, 10=10%); 0=不校验
+}
+
+type CouponRule struct {
+    Type             string // full_reduction|discount|cash|gift
+    ThresholdCents   int64
+    OffCents         int64
+    DiscountPermille int64 // 0-1000
+}
+
+type ProductView struct {
+    ID                    int64
+    CostCents, PriceCents int64
+}
+
+var ErrBelowMarginFloor = errors.New("margin: below floor")
+
+// ValidateCoupon 校验: 对 products 中每个商品应用 rule 后, 实付金额的毛利率是否 >= floor。
+// 实付计算(price=PriceCents, cost=CostCents):
+//   full_reduction: price>=ThresholdCents → price-OffCents; 否则 price(不触发满减)
+//   discount:       price * DiscountPermille / 1000
+//   cash:           max(price-OffCents, 0)
+//   gift:           price(赠品成本 M2 不计)
+// 毛利率 = (实付 - cost) / 实付 * 100; 实付<=0 时若 cost>0 → ErrBelowMarginFloor。
+// 任一商品不达标 → ErrBelowMarginFloor; products 为空 → nil(无可校验商品, 调用方负责)。
+func ValidateCoupon(g Guard, rule CouponRule, products []ProductView) error
+
+// ValidatePriceAdj 校验改价后毛利率: newPrice>0 且 (newPrice-cost)*100/newPrice >= floor。
+func ValidatePriceAdj(g Guard, costCents, newPriceCents int64) error
+```
+
+#### `internal/compliance/freqcircuit`（BE-B-04）
+
+```go
+type Channel string
+const (
+    ChannelWeworkGroup  Channel = "wework_group"
+    ChannelWeworkOneV   Channel = "wework_1v1"
+    ChannelSubscribeMsg Channel = "subscribe_msg"
+    ChannelSMS          Channel = "sms"
+)
+
+type Period string
+const (
+    PeriodDaily   Period = "daily"
+    PeriodWeekly  Period = "weekly"
+    PeriodMonthly Period = "monthly"
+)
+
+// Limit 是某通道的频次上限。Monthly=0 表示按"当月天数"动态算(计划书口径)。
+type Limit struct {
+    Daily, Weekly, Monthly int64
+}
+
+// Counter 抽象 Redis INCR/DECR/EXPIRE 语义, 内存实现 + 未来 Redis 实现都满足。
+type Counter interface {
+    // Incr 原子 +1 并返回 incr 后的值; 若 key 不存在或已过期则建并设 expireAt(首次)。
+    Incr(ctx context.Context, key string, expireAt time.Time) (int64, error)
+    // Decr 原子 -1(回退被拒的计数), 不低于 0。
+    Decr(ctx context.Context, key string) error
+    // Get 返回当前计数(不增); 过期/不存在 → 0。
+    Get(ctx context.Context, key string) (int64, error)
+}
+
+var ErrFreqExceeded = errors.New("freqcircuit: frequency exceeded")
+
+type Service struct {
+    counter Counter
+    now     func() time.Time
+    limits  map[Channel]Limit
+}
+
+type Option func(*Service)
+func WithCounter(c Counter) Option      // 默认 MemoryCounter
+func WithNowFunc(f func() time.Time) Option
+func WithLimits(m map[Channel]Limit) Option // 覆盖默认 limits
+
+// New 构造 Service。默认 limits(对齐 ch04 §4.3.3):
+//   WeworkGroup/WeworkOneV: {Daily:1, Weekly:7, Monthly:0(=当月天数)}
+//   SubscribeMsg/SMS:       {0,0,0}(不限, Allow 恒 true)
+func New(opts ...Option) *Service
+
+// Allow 检查 ch 在当前 ctx tenant 的三档频次。流程: 逐档 Incr → 若超限则 Decr 全部已 Incr 的回退 → 返回 (false, reason)。
+// reason 形如 "freq_daily"/"freq_weekly"/"freq_monthly"; 全通过 → (true, "")。
+// 无 limit 的通道恒 (true, "")。key 格式: t:{tid}:freq:{ch}:{period}。
+func (s *Service) Allow(ctx context.Context, ch Channel) (allowed bool, reason string, err error)
+
+// Remaining 返回 ch 当前三档剩余配额(不 Incr); 无 limit 通道返回 -1(无限)。
+func (s *Service) Remaining(ctx context.Context, ch Channel) (daily, weekly, monthly int64, err error)
+```
+
+> Counter 的内存实现 `MemoryCounter`（map + sync.Mutex + 惰性过期）须随包交付，供 dev/test 直接用；生产 Redis 实现留待有 Redis 后（接口已对齐）。
+
+#### `internal/compliance/contentfilter`（BE-B-05）
+
+```go
+// 纯函数包(核心 Do 无副作用, 可单测)。DFA 敏感词树 + 广告法绝对化词库。
+type Filter struct {
+    // 未导出: dfa *DFA, absolutism []string, replacement string
+}
+
+type Result struct {
+    Text     string   // 过滤/替换后的文本(命中敏感词时为空)
+    Passed   bool     // true=可发, false=命中敏感词被拦截
+    HitWords []string // 命中的敏感词(DFA)
+    Replaced []string // 被替换的绝对化词(广告法)
+}
+
+type Option func(*Filter)
+func WithSensitiveWords(words []string) Option  // 覆盖默认敏感词库
+func WithAbsolutismWords(words []string) Option // 覆盖默认绝对化词库
+func WithReplacement(r string) Option           // 默认 "*"
+
+// New 构造 Filter, 内建默认敏感词+绝对化词库(最小可用集, 主线程可覆盖)。
+func New(opts ...Option) *Filter
+
+// Do 执行: DFA 命中敏感词 → Passed=false + Text=""; 绝对化词 → 替换为 Replacement(默认"*")。
+// 两者独立: 命中敏感词直接拦截(不再做绝对化替换); 未命中敏感词才做绝对化替换。
+func (f *Filter) Do(text string) Result
+```
+
+> 默认词库为最小可用集（如绝对化词含「最/第一/国家级/顶级/唯一/极致」等，敏感词含最小演示集）；主线程/配置可覆盖。DFA 实现 rune 级匹配，支持中文。
+
+### 10.4 包所有权（文件集互斥）
+
+| Agent | 只准写这些文件 |
+|---|---|
+| **M2-migrations** | `migrations/000005_marketing.up.sql` + `.down.sql` |
+| **M2-marketing** | `internal/marketing/{marketing.go, memory_repo.go, service.go, service_test.go}` |
+| **M2-margin** | `internal/margin/{margin.go, margin_test.go}` |
+| **M2-freqcircuit** | `internal/compliance/freqcircuit/{freqcircuit.go, memory_counter.go, service.go, service_test.go}` |
+| **M2-contentfilter** | `internal/compliance/contentfilter/{contentfilter.go, dfa.go, contentfilter_test.go}` |
+
+> 主线程负责（agent 不写）：`interfaces/http/handler/marketing.go`、`interfaces/http/router.go`、`cmd/api/main.go` 接线（membership→MemberLookuper 适配、margin.Guard→MarginGuard 适配、freqcircuit/contentfilter 暂不挂路由——留 M2-S2 reach/send）、`interfaces/http/m2s1_test.go`、`pkg/errcode/errcode.go`（如需新增码）。
+
+### 10.5 硬约束（M2-S1 全员）
+
+1. 每个 repo/service 方法首行 `tenantID, err := multitenancy.EnforceTenant(ctx)`；tenant **永不**从请求体/参数取。
+2. 内存实现 `sync.RWMutex`/`sync.Mutex` + 防御性拷贝 + 跨租户 `ErrNotFound`（串户测试矩阵必覆盖：tenant A 读/发/核 tenant B 的券→ErrNotFound/拒绝）。
+3. 金额 int64 分，禁浮点；折扣用千分比(‰)整数。
+4. 券发行**不得超发**（issued < TotalQuota 或 TotalQuota=0）；会员券核销**不得重复**（unused→used 原子，非 unused→ErrCouponUsed）。
+5. 防腐：`marketing` 不 import `membership`/`margin`/`catalog`（用 `MemberLookuper`/`MarginGuard` 接口）；`margin` 不 import 任何领域包；`freqcircuit`/`contentfilter` 不 import 任何领域包。所有跨域依赖走窄接口，主线程在 main.go 适配。
+6. 不引入白名单外依赖；不连真实 DB/Redis；测试用 fake 接口 + 注入 clock/counter。
+7. 纯函数包（`margin`、`contentfilter` 的 `Do`、`freqcircuit` 的逻辑）无副作用、可单测；`contentfilter` 的 DFA 匹配须 rune 级（支持中文）。
+8. 每个 `package xx` 上方 `// Package xx ...` 文档注释；`gofmt` 干净。
+
+### 10.6 DoD（M2-S1）
+
+- `go build ./... && go vet ./... && gofmt -l .`（空）`&& go test -race ./...` 全绿。
+- marketing service 单测：建券(四类)→状态迁移(draft→active)→发券(active+quota+有效期校验)→超发拒绝→核销(unused→used)→重复核销拒绝→过期券核销拒绝→归因(strategy_id/source)正确→串户拒绝。
+- margin 单测：满减/折扣/代金/赠品四类毛利率计算正确、低于护栏拒绝、改价校验、空 products 不报错。
+- freqcircuit 单测：三档计数正确、超额硬拒+回退计数、monthly=当月天数、无 limit 通道恒通过、跨租户 key 隔离。
+- contentfilter 单测：DFA 敏感词命中拦截、绝对化词替换、中文匹配、默认词库可覆盖。
+- 迁移 golang-migrate 命名合法、up/down 对称。
+- HTTP 冒烟（主线程）：dev mock 下「建券→上线→手动发券给会员→核销」全链路；串户证明（别的 X-Mock-Tenant 读不到券、核销别人的会员券→拒绝）；毛利护栏可选演示（margin 注入后低毛利券被拒）。
