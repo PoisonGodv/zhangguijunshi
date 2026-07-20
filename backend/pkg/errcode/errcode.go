@@ -30,6 +30,7 @@ var (
 	ErrMarginGuard  = Err{60001, "折扣低于毛利护栏，已拦截", http.StatusOK}
 	ErrFreqCircuit  = Err{60002, "群发频次已达上限", http.StatusOK}
 	ErrBalanceOver  = Err{60003, "储值余额超过单店上限", http.StatusOK}
+	ErrBalanceShort = Err{60004, "储值余额不足", http.StatusOK}
 	ErrInternal     = Err{50001, "服务器内部错误", http.StatusInternalServerError}
 	ErrUpstream     = Err{50201, "上游服务异常", http.StatusBadGateway}
 )

@@ -21,6 +21,8 @@ import (
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
+	"github.com/zhangguijunshi/backend/internal/inventory"
+	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/jwt"
@@ -107,19 +109,31 @@ func run() error {
 	// pgx implementation drops in later without touching the HTTP layer).
 	catalogRepo := catalog.NewMemoryProductRepo()
 	catalogSvc := catalog.NewService(catalogRepo)
-	billingSvc := billing.New(billing.NewMemoryOrderRepo(), catalogPricer{catalogSvc})
+
+	// M1-S2 domain services (CONTRACT §9). Inventory enforces product-tenant
+	// ownership through the catalog adapter; billing consumes stock FIFO after a
+	// committed sale; membership issues/validates dynamic member codes.
+	inventorySvc := inventory.New(inventory.NewMemoryBatchRepo(), catalogProductLookuper{catalogSvc})
+	billingSvc := billing.New(
+		billing.NewMemoryOrderRepo(),
+		catalogPricer{catalogSvc},
+		billing.WithStockConsumer(inventoryStockConsumer{inventorySvc}),
+	)
+	membershipSvc := membership.New(membership.NewMemoryMemberRepo(), membership.NewMemoryMemberCoder(nil))
 
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
 		Handler: httpserver.New(httpserver.Deps{
-			Cfg:     cfg,
-			DB:      database,
-			JWT:     jwtMgr,
-			Store:   store,
-			AuthSvc: authSvc,
-			Catalog: catalogSvc,
-			Billing: billingSvc,
-			DevMock: cfg.Multitenancy.DevMockHeader,
+			Cfg:        cfg,
+			DB:         database,
+			JWT:        jwtMgr,
+			Store:      store,
+			AuthSvc:    authSvc,
+			Catalog:    catalogSvc,
+			Billing:    billingSvc,
+			Inventory:  inventorySvc,
+			Membership: membershipSvc,
+			DevMock:    cfg.Multitenancy.DevMockHeader,
 		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,
@@ -184,6 +198,37 @@ func (p catalogPricer) GetByID(ctx context.Context, tenantID, id int64) (*billin
 		CostCents:  prod.CostCents,
 		Status:     prod.Status,
 	}, nil
+}
+
+// catalogProductLookuper adapts *catalog.Service to inventory.ProductLookuper
+// (CONTRACT §9.3 anti-corruption): inventory never imports catalog, so this thin
+// adapter answers "does this product belong to the ctx tenant" at the
+// composition root. A cross-tenant or unknown product reads as not-exists.
+type catalogProductLookuper struct{ svc *catalog.Service }
+
+func (l catalogProductLookuper) Exists(ctx context.Context, tenantID, productID int64) (bool, error) {
+	prod, err := l.svc.GetByID(ctx, productID)
+	if err != nil {
+		if errors.Is(err, catalog.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if prod.TenantID != tenantID {
+		return false, nil
+	}
+	return true, nil
+}
+
+// inventoryStockConsumer adapts *inventory.Service to billing.StockConsumer
+// (CONTRACT §9.3 anti-corruption): billing never imports inventory, so this
+// thin adapter forwards FIFO deduction at the composition root. Errors are
+// mapped to a plain error (billing treats any failure as a reconciliation gap).
+type inventoryStockConsumer struct{ svc *inventory.Service }
+
+func (c inventoryStockConsumer) ConsumeFIFO(ctx context.Context, storeID, productID, qty, refOrderID int64) error {
+	_, err := c.svc.ConsumeFIFO(ctx, storeID, productID, qty, refOrderID)
+	return err
 }
 
 // buildJWTManager constructs the ES256 signer/verifier. It loads a PEM private

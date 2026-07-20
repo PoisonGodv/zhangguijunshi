@@ -323,3 +323,201 @@ type TopProduct struct{ ProductID int64; Name string; Qty int64; GrossCents int6
 - catalog/billing service 单测覆盖：CRUD 闭环、串户拒绝（tenant A 读不到 tenant B 的商品/订单）、价格校验（price<cost 拒绝）、当日流水汇总数值正确（毛利=净收-成本）。
 - 迁移文件 golang-migrate 命名合法、up/down 对称。
 - HTTP 冒烟（主线程）：dev mock 下 `POST /v1/boss/catalog/products` 建品 → `POST /v1/boss/billing/orders` 开单 → `GET /v1/boss/billing/summary/today` 出汇总；带别的 `X-Mock-Tenant` 读不到前述数据（串户证明）。
+
+---
+
+## 9. M1-S2 增量契约（BE-A-04 库存 / BE-B-01 会员 / BE-A-07 会员码核销 / BE-A-08·09 数据质量 jobs，2026-07-20）
+
+M1-S2 把 MVP 闭环补全：库存批次 + 会员档案 + 动态会员码核销 + 两个数据质量 cron。沿用全部铁律：「接口 + 内存实现兜底 + mock 测试」「tenant 只从 ctx 取，首行 EnforceTenant」「金额 int64 分」「不连真实 DB/Redis」「内存实现并发安全 + 防御性拷贝 + 跨租户 ErrNotFound」。
+
+### 9.1 范围与裁剪（对照 ch05）
+
+- **纳入**：`internal/inventory`（批次入库/出库/FIFO 消耗 + inventory_movements 落流水）、`internal/membership`（会员档案 + 储值账户 + 积分 + 动态会员码核销）、`internal/dataquality`（BE-A-08 销售反推 / BE-A-09 标签标记，纯函数 job，主线程配 cron）。
+- **裁剪**：`coupons`/`member_coupons`（券核销）**不纳入**（属营销域 M2）；`payment_ledger`/`sub_merchants`（支付/反二清真实资金）**不纳入**（M4）。会员「扣储值」只动账面余额 + 落 `member_balance_log`，不接真实资金清结算。
+- **分区降级**：ch05 里 `member_balance_log` 设计为 `PARTITION BY RANGE`，本次建**普通表**（同 §8.1 决策），注释标注。
+- **0.5s 闭环**：本里程碑单进程内存 repo 天然满足；不做 Redis 锁/分布式优化（有真实流量再上 `t:{tid}:lock:*`）。
+
+### 9.2 迁移编号（DB-03）
+
+| 文件 | 内容 |
+|---|---|
+| `migrations/000004_membership.up/.down.sql` | `members` + `member_balance_accounts` + `member_balance_log`（普通表）+ `member_points_log`。复用 000001 的 `trg_set_updated_at()`（**勿重复 CREATE FUNCTION**，`CREATE OR REPLACE` 或直接挂 trigger）。 |
+
+DDL 逐字段对齐 ch05 §5.3.4。`members`/`member_balance_accounts` 挂 `trg_set_updated_at`；`member_balance_log`/`member_points_log` 为审计流水无 `updated_at` 不挂、禁软删。金额一律 `BIGINT` 分。`down.sql` 逆序 drop（先子后父：log → account → member）。`inventory_batches`/`inventory_movements` 已在 000002 建好，**本次不重复建**。
+
+### 9.3 领域类型与仓储接口（**已固定，agent 必须一字不差实现签名**）
+
+#### `internal/inventory`（BE-A-04）
+
+```go
+// 批次
+type Batch struct {
+    ID, TenantID, StoreID, ProductID int64
+    Quantity       int64     // 当前余量
+    InPriceCents   int64
+    ExpiryDate     *time.Time // nil = 未设保质期
+    ExpiryWarnDate *time.Time
+    Status         string // active|nearing|expired|cleared
+    CreatedAt, UpdatedAt time.Time
+}
+// 流水(强审计,禁软删)
+type Movement struct {
+    ID, TenantID, StoreID, ProductID int64
+    BatchID       int64  // 0 = 无关联批次
+    Type          string // purchase_in|sale_out|stocktake_adj|return_in|loss|transfer
+    Quantity      int64  // 正入负出
+    RefOrderID    int64  // 0 = 无关联订单
+    OperatorID    int64
+    Note          string
+    CreatedAt     time.Time
+}
+var ErrNotFound = errors.New("inventory: batch/product not found")
+var ErrInsufficientStock = errors.New("inventory: insufficient stock")
+
+type BatchRepo interface {
+    CreateBatch(ctx context.Context, b *Batch) (*Batch, error)
+    GetBatch(ctx context.Context, tenantID, id int64) (*Batch, error)                 // ErrNotFound/跨租户
+    UpdateBatch(ctx context.Context, b *Batch) (*Batch, error)                        // 按 ID+tenant 更新余量/状态
+    ListActiveBatchesFIFO(ctx context.Context, tenantID, storeID, productID int64) ([]*Batch, error) // status=active 且 quantity>0, 按 CreatedAt 升序(FIFO)
+    AppendMovement(ctx context.Context, m *Movement) (*Movement, error)
+    ListMovements(ctx context.Context, tenantID int64, f MovementFilter) ([]*Movement, error)
+}
+type MovementFilter struct {
+    StoreID, ProductID int64
+    Type               string
+    Day                *time.Time // 非 nil 时按自然日过滤
+    Limit, Offset      int
+}
+// Service:
+//   PurchaseIn(ctx, in PurchaseInInput) (*Batch, error)         // 校验 product 属于本 tenant(经 ProductLookuper)+qty>0; 建批次+purchase_in 流水
+//   ConsumeFIFO(ctx, storeID, productID, qty int64, refOrderID int64) ([]*Batch, error) // 按 FIFO 扣减+逐项 sale_out 流水; 不足→ErrInsufficientStock(已扣的回滚)
+//   Stock(ctx, storeID, productID int64) (int64, error)          // 本 tenant 该商品 active 批次余量合计
+//   ListMovements(ctx, f MovementFilter) ([]*Movement, error)
+type PurchaseInInput struct {
+    StoreID, ProductID, Quantity, InPriceCents int64
+    ExpiryDate *time.Time
+    Note       string
+}
+// ProductLookuper 是 inventory 对商品视图的最小依赖(防腐,不 import catalog):
+type ProductLookuper interface {
+    Exists(ctx context.Context, tenantID, productID int64) (bool, error)
+}
+```
+
+> **接线说明**：billing 的 FIFO 扣库存由主线程在 `cmd/api/main.go` 通过 billing 的 `Option`（如 `WithStockConsumer(inventorySvc)`）注入；**billing 不 import inventory**，用 billing 本包定义的 `StockConsumer` 接口（`ConsumeFIFO(ctx, storeID, productID, qty, refOrderID) error`）。M1-S2 主线程接线时给 billing 加这个可选 Option；注入后 CreateOrder 在开单前对每个商品调 ConsumeFIFO，任一失败则整单拒绝（不落单）。**本契约不改 §8.3 已定的 billing 签名**，仅新增可选 Option。
+
+#### `internal/membership`（BE-B-01 + BE-A-07）
+
+```go
+type Member struct {
+    ID, TenantID, StoreID  int64
+    PhoneHash, WxOpenID    string  // 至少一个非空
+    Name, Level            string  // level: normal|vip|blackcard
+    Points                 int64
+    TotalSpentCents        int64
+    LastVisitAt            *time.Time
+    Status                 string  // active|blocked
+    CreatedAt, UpdatedAt   time.Time
+}
+type BalanceAccount struct {
+    ID, TenantID, MemberID int64
+    BalanceCents, GiftCents int64
+    CreatedAt, UpdatedAt    time.Time
+}
+var ErrNotFound = errors.New("membership: member not found")
+var ErrInsufficientBalance = errors.New("membership: insufficient balance")
+var ErrMemberBlocked = errors.New("membership: member blocked")
+var ErrCodeInvalid = errors.New("membership: member code invalid or expired")
+
+type MemberRepo interface {
+    CreateMember(ctx context.Context, m *Member) (*Member, error)
+    GetMember(ctx context.Context, tenantID, id int64) (*Member, error)              // ErrNotFound/跨租户
+    UpdateMember(ctx context.Context, m *Member) (*Member, error)
+    UpsertAccount(ctx context.Context, a *BalanceAccount) (*BalanceAccount, error)
+    GetAccount(ctx context.Context, tenantID, memberID int64) (*BalanceAccount, error) // 无则 ErrNotFound
+    AppendPointsLog(ctx context.Context, tenantID, memberID int64, typ string, delta, pointsAfter, refOrderID int64) error
+    AppendBalanceLog(ctx context.Context, tenantID, memberID, accountID int64, typ string, amountCents, balanceAfter, refOrderID int64) error
+}
+// MemberCoder 动态会员码(防腐,不依赖具体签发实现):签发/解析短时效会员码。
+type MemberCoder interface {
+    Issue(ctx context.Context, tenantID, memberID int64, ttl time.Duration) (string, error)
+    Resolve(ctx context.Context, tenantID int64, code string) (memberID int64, err error) // 过期/伪造→ErrCodeInvalid
+}
+// Service:
+//   Join(ctx, in JoinInput) (*Member, error)                 // 校验 phone/openid 至少其一; 建会员+开户(余额0); 幂等(同 phone_hash 复用)
+//   GetMember(ctx, id int64) (*Member, error)
+//   IssueCode(ctx, memberID int64) (string, error)            // 会员存在且 active; ttl 60s
+//   Redeem(ctx, in RedeemInput) (*RedeemResult, error)        // BE-A-07 闭环
+type JoinInput struct{ StoreID int64; PhoneHash, WxOpenID, Name string }
+type RedeemInput struct {
+    StoreID, OperatorID, RefOrderID int64
+    Code             string
+    ConsumeCents     int64  // >0 时扣储值
+    EarnPoints       int64  // >0 时累积分
+}
+type RedeemResult struct {
+    MemberID, Points, BalanceCents int64
+    ConsumedCents                  int64
+}
+```
+
+> `Redeem` 流程：`Resolve(code)`→member 属于本 tenant 且 active→（ConsumeCents>0 时）扣账户余额+落 consume 流水，余额不足→`ErrInsufficientBalance`→（EarnPoints>0 时）累积分+落 earn 流水→更新 LastVisitAt。储值扣减与积分累计在内存实现里用单 repo 锁保证原子（生产 pgx 用事务）。**MemberCoder 的内存实现**：HMAC 签 `tenantID.memberID.expiryUnix` + 服务端 map 存 code→member 防重放，ttl 到期即 ErrCodeInvalid（注入 clock 便于测试）。
+
+#### `internal/dataquality`（BE-A-08 + BE-A-09）
+
+纯函数 job 包，**不 import catalog/billing/inventory 具体类型**，只依赖本包定义的窄接口（主线程适配）：
+
+```go
+// BE-A-08 库存反推日销售: 由当日 sale_out 流水汇总每商品销量(三源融合的库存源)。
+type SalesReverser interface {
+    ListSaleOut(ctx context.Context, tenantID, storeID int64, day time.Time) ([]SaleQty, error)
+}
+type SaleQty struct{ ProductID, Qty int64 }
+func ReverseDailySales(ctx context.Context, r SalesReverser, tenantID, storeID int64, day time.Time) ([]SaleQty, error)
+
+// BE-A-09 临期/滞销/高毛利 tag 标记: 输入商品视图+批次视图,输出每商品应打的 tag 集合。
+type TagProductView struct {
+    ProductID, ShelfLifeDays int
+    CostCents, PriceCents    int64
+    DaysSinceLastSale        int   // 滞销判定
+    EarliestExpiry           *time.Time // 最近到期批次(临期判定)
+}
+type TagRule struct {
+    NearingDays      int   // 距到期 <=N 天打「临期」
+    StaleDays        int   // >=N 天未售打「滞销」
+    HighMarginMinPct int   // (price-cost)/price*100 >=N 打「高毛利」
+}
+func ComputeTags(v TagProductView, rule TagRule, now time.Time) []string
+```
+
+> `ComputeTags` 为**纯函数**（无副作用、可单测）；`ReverseDailySales` 只做聚合。主线程负责适配真实 repo 并配 cron（`@daily` / 每小时），agent 不写 cron 调度器。
+
+### 9.4 包所有权（文件集互斥）
+
+| Agent | 只准写这些文件 |
+|---|---|
+| **M2-migrations** | `migrations/000004_membership.up.sql` + `.down.sql` |
+| **M2-inventory** | `internal/inventory/{inventory.go, memory_repo.go, service.go, service_test.go}` |
+| **M2-membership** | `internal/membership/{membership.go, memory_repo.go, coder.go, service.go, service_test.go}` |
+| **M2-dataquality** | `internal/dataquality/{dataquality.go, dataquality_test.go}` |
+
+> 主线程负责（agent 不写）：`interfaces/http/handler/{inventory.go,membership.go}`、`interfaces/http/router.go`、`cmd/api/main.go` 接线（含 billing 的 FIFO StockConsumer Option、catalog→inventory.ProductLookuper 适配、membership MemberCoder 接线）、`interfaces/http/m1s2_test.go`、数据质量 cron 挂载。
+
+### 9.5 硬约束（M1-S2 全员）
+
+1. 每个 repo/service 方法首行 `tenantID, err := multitenancy.EnforceTenant(ctx)`；tenant **永不**从请求体/参数取。
+2. 内存实现 `sync.RWMutex` + 防御性拷贝 + 跨租户 `ErrNotFound`（串户测试矩阵必覆盖：tenant A 读/扣 tenant B 的批次/会员→ErrNotFound/拒绝）。
+3. 金额 int64 分，禁浮点。
+4. 库存扣减**不得透支**（`quantity >= 0`，不足→ErrInsufficientStock 且回滚已扣）；储值**不得透支**（balance>=0，不足→ErrInsufficientBalance）。
+5. 防腐：`inventory` 不 import `catalog`（用 `ProductLookuper`）；`membership` 不 import `billing`；`dataquality` 不 import 任何领域包。所有跨域依赖走窄接口，主线程在 main.go 适配。
+6. 不引入白名单外依赖；不连真实 DB/Redis；测试用 fake 接口 + 注入 clock。
+7. 每个 `package xx` 上方 `// Package xx ...` 文档注释；`gofmt` 干净。
+
+### 9.6 DoD（M1-S2）
+
+- `go build ./... && go vet ./... && gofmt -l .`（空）`&& go test -race ./...` 全绿。
+- inventory service 单测：入库→FIFO 消耗顺序正确、批次余量扣减正确、不足拒绝且回滚、流水正确落、串户拒绝。
+- membership service 单测：入会开户、会员码签发/解析、过期码拒绝、核销扣储值+累积分+落流水、余额不足拒绝、串户拒绝。
+- dataquality 单测：ReverseDailySales 聚合正确、ComputeTags 临期/滞销/高毛利规则正确（注入 now）。
+- 迁移 golang-migrate 命名合法、up/down 对称。
+- HTTP 冒烟（主线程）：dev mock 下「建品→入库→开单扣库存→会员入会→签发会员码→核销累积分→当日流水」全链路；串户证明（别的 X-Mock-Tenant 读不到批次/会员、核销别人的码→拒绝）。

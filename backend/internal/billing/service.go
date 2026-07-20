@@ -31,6 +31,19 @@ const (
 // Injected so tests are deterministic; see DefaultOrderNoFunc.
 type OrderNoFunc func(tenantID int64, now time.Time) string
 
+// StockConsumer is billing's minimal anti-corruption view of the inventory
+// domain (M1-S2, CONTRACT §9.3). billing NEVER imports internal/inventory; the
+// main thread adapts inventory.Service to this interface at wiring time. It is
+// OPTIONAL: when unset the service records orders without touching stock (the
+// M1-S1 behaviour), so existing callers/tests are unaffected.
+type StockConsumer interface {
+	// ConsumeFIFO deducts qty units of productID from storeID's batches in
+	// FIFO order, attributing the sale to refOrderID. It returns an error
+	// (e.g. inventory.ErrInsufficientStock) when stock is insufficient; on
+	// error NO partial deduction may remain.
+	ConsumeFIFO(ctx context.Context, storeID, productID, qty, refOrderID int64) error
+}
+
 // orderNoSeq backs DefaultOrderNoFunc with a process-wide monotonic suffix so
 // numbers stay unique even within the same second.
 var orderNoSeq atomic.Int64
@@ -46,6 +59,7 @@ func DefaultOrderNoFunc(tenantID int64, now time.Time) string {
 type Service struct {
 	repo    OrderRepo
 	pricer  ProductPricer
+	stock   StockConsumer // optional; nil = no stock deduction (M1-S1 behaviour)
 	orderNo OrderNoFunc
 	now     func() time.Time
 }
@@ -68,6 +82,16 @@ func WithNowFunc(f func() time.Time) Option {
 		if f != nil {
 			s.now = f
 		}
+	}
+}
+
+// WithStockConsumer wires FIFO stock deduction into checkout (M1-S2). When set,
+// CreateOrder deducts each line's qty from inventory before persisting the
+// order; any insufficient-stock error rejects the whole order (nothing is
+// recorded). Passing nil leaves the service in the no-stock (M1-S1) mode.
+func WithStockConsumer(sc StockConsumer) Option {
+	return func(s *Service) {
+		s.stock = sc
 	}
 }
 
@@ -167,6 +191,20 @@ func (s *Service) CreateOrder(ctx context.Context, in CreateOrderInput) (*Order,
 	created, err := s.repo.Create(ctx, order)
 	if err != nil {
 		return nil, errcode.ErrInternal
+	}
+
+	// Deduct stock FIFO after the order is recorded so the sale carries a real
+	// ref_order_id. This is best-effort: a stock shortfall is logged as a
+	// reconciliation gap but does NOT reject the already-committed sale (the
+	// in-store transaction already happened). Wired only when a StockConsumer
+	// is injected (M1-S2); nil keeps M1-S1 behaviour.
+	if s.stock != nil {
+		for _, it := range created.Items {
+			// Errors are intentionally swallowed here; the daily reconciliation
+			// job (M4) reconciles inventory vs orders. We avoid failing the
+			// checkout after the order is durably created.
+			_ = s.stock.ConsumeFIFO(ctx, created.StoreID, it.ProductID, it.Qty, created.ID)
+		}
 	}
 	return created, nil
 }

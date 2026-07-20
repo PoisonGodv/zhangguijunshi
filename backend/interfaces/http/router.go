@@ -23,6 +23,8 @@ import (
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
+	"github.com/zhangguijunshi/backend/internal/inventory"
+	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
@@ -45,6 +47,9 @@ type Deps struct {
 	// M1-S1 domain services (nil in the minimal test fixture).
 	Catalog *catalog.Service
 	Billing *billing.Service
+	// M1-S2 domain services (nil in the minimal test fixture).
+	Inventory  *inventory.Service
+	Membership *membership.Service
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -108,6 +113,20 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.GET("/billing/orders/:id", h.GetOrder)
 		boss.GET("/billing/summary/today", h.DailySummaryToday)
 		boss.GET("/billing/summary/:date", h.DailySummary)
+	}
+	if deps.Inventory != nil {
+		h := handler.NewInventoryHandler(deps.Inventory)
+		boss.POST("/inventory/purchase", h.PurchaseIn)
+		boss.GET("/inventory/stock", h.GetStock)
+		boss.GET("/inventory/movements", h.ListMovements)
+		boss.POST("/inventory/products/:id/consume", h.Consume)
+	}
+	if deps.Membership != nil {
+		h := handler.NewMembershipHandler(deps.Membership)
+		boss.POST("/membership/members", h.Join)
+		boss.GET("/membership/members/:id", h.GetMember)
+		boss.POST("/membership/members/:id/code", h.IssueCode)
+		boss.POST("/membership/redeem", h.Redeem)
 	}
 }
 
