@@ -817,3 +817,418 @@ func (f *Filter) Do(text string) Result
 - contentfilter 单测：DFA 敏感词命中拦截、绝对化词替换、中文匹配、默认词库可覆盖。
 - 迁移 golang-migrate 命名合法、up/down 对称。
 - HTTP 冒烟（主线程）：dev mock 下「建券→上线→手动发券给会员→核销」全链路；串户证明（别的 X-Mock-Tenant 读不到券、核销别人的会员券→拒绝）；毛利护栏可选演示（margin 注入后低毛利券被拒）。
+
+---
+
+## 11. M2-S2 增量契约（BE-B-03 拼团 / BE-B-07 触达模板 / BE-B-08 订阅计数 / BE-B-09 新号限速 / BE-B-10 退订风控 / BE-B-06 社群活码，2026-07-27）
+
+在 M2-S1 之上落地「触达闭环」——把营销券、毛利护栏、频次熔断、内容过滤串成一条可发送、可拦截、可归因、可退订的 reach 链路，并补齐拼团裂变 + 社群/活码私域沉淀。为 M3-S1 ActionExecutor(SendGroupMsg/IssueCoupon 走 reach.Send) 提供唯一的对外发送口子。
+
+### 11.1 范围与裁剪（对照 ch04 §4.2.3 / §4.3 / §4.2.4 / ch05 §5.3.5-§5.3.6）
+
+**纳入**：
+- **BE-B-03 拼团+老带新**：groupbuys/groupbuy_participants 状态机，`JoinAtomic`（active+未满+未参团→插入 participant + joined++，满员→success）+ `FinalizeExpired`（active 且 end_at<now 且 joined<required→failed）。
+- **BE-B-07 8 类触达模板**：`new_welcome / birthday / recall_30 / recall_60 / recall_90 / repurchase / balance_low / points_expire`，纯函数渲染（会员名/店名/弹性 vars）。
+- **BE-B-08 订阅消息授权计数**：subscribe_auth `Grant`(granted++) / `Consume`(used<granted→used++ 原子)；subscribe_msg 通道发送前强制校验。
+- **BE-B-09 新号加好友限速**：wework_user_id 维度，age<7 天 50/天、7-30 天 80/天、30+ 天 200/天，超限硬拒 + Decr 回退。
+- **BE-B-10 退订入口 + 风控滑动窗口**：退订记录阻断后续发送（已退订→blocked）；租户级 blocked 率/突发发送滑动窗口超阈值→记录 RiskEvent（**告警不硬拒**，真实告警通道延后）。
+- **BE-B-06 社群+活码数据模型**：community_groups(sop_stage 四阶段 recruit→activate→convert→refer) + wework_living_codes(活码分流 nearest_store/round_robin)。
+- **reach.Send 编排**（核心枢纽）：render→contentfilter→freqcircuit→unsubscribe→subscribe quota→sender，任一拦截写 ReachTask(blocked+reason)，全程留痕归因 strategy_id。
+
+**显式延后（不在 M2-S2，写进 §11.1 供后人知）**：
+- WX-06 企微真实 API（活码创建/客户群群发 `add_msg_templates`）——**无服务商资质，做 Sender 接口 + 内存 stub**（Send 记录到 reach_tasks，status=sent，不真正触达用户）。
+- 短信真实通道 —— stub 同上。
+- 拼团支付/退款闭环 —— 仅状态机（joined→paid 标记），不接 payment 域。
+- 风控告警真实通道（飞书/短信）—— 仅写 RiskEvent 内存记录。
+- pgx repo —— 全部继续内存实现（接口已对齐未来 pgx）。
+- jobs cron（FinalizeExpired/离线扫描）—— 提供 Service 方法，定时调度留 M3。
+
+### 11.2 迁移编号（DB-03 续）
+
+`migrations/000006_reach_community_groupbuy.{up,down}.sql`，7 张表，全部挂 tenant_id 行隔离，参照 §5.3 DDL（ch05 行 416-505）：
+- `groupbuys` / `groupbuy_participants`（参 ch05 §5.3.5，coupons 之后）
+- `wework_living_codes` / `community_groups`（§5.3.6）
+- `reach_tasks`（§5.3.6，blocked_reason 取值 freq_circuit|content_filter|unsubscribed|subscribe_quota|new_account_guard|risk）
+- `subscribe_auth`（§5.3.6，CHECK used_quota<=granted_quota）
+- `unsubscribe_records`（新增：id/tenant_id/member_id/channel/reason/unsubscribed_at，INDEX tenant_id+member_id+channel）。UNIQUE(tenant_id, member_id, channel) —— 一会员一通道一条退订态，退订后重新订阅 UPDATE。
+- groupbuys/community_groups 挂 `trg_set_updated_at`（同 §8/§10 范式）；reach_tasks/subscribe_auth/unsubscribe_records/wework_living_codes 无 updated_at 不挂触发器。down 反序 DROP。
+
+### 11.3 领域类型与仓储接口（**已固定，agent 必须一字不差实现签名**）
+
+#### 11.3.1 `internal/groupbuy`（BE-B-03）
+
+```go
+package groupbuy
+
+type Groupbuy struct {
+    ID, TenantID, StoreID, ProductID int64
+    Title                            string
+    Params                           GroupbuyParams
+    RequiredCount                    int        // 3-4 成团
+    Joined                           int
+    Status                           string     // active|success|failed|cancelled
+    StartAt, EndAt                   time.Time
+    CreatedAt, UpdatedAt             time.Time
+}
+type GroupbuyParams struct {
+    GroupSize  int   `json:"group_size,omitempty"`
+    PriceCents int64 `json:"price_cents,omitempty"`
+    ValidHours int   `json:"valid_hours,omitempty"`
+}
+type Participant struct {
+    ID, TenantID, GroupbuyID, MemberID int64
+    Status                             string // joined|paid|refunded
+    JoinedAt                           time.Time
+}
+const (
+    StatusActive    = "active"
+    StatusSuccess   = "success"
+    StatusFailed    = "failed"
+    StatusCancelled = "cancelled"
+    PStatusJoined   = "joined"
+    PStatusPaid     = "paid"
+    PStatusRefunded = "refunded"
+)
+var (
+    ErrNotFound      = errors.New("groupbuy: not found")
+    ErrGroupbuyFull  = errors.New("groupbuy: already full")
+    ErrGroupbuyClosed = errors.New("groupbuy: not active")
+    ErrAlreadyJoined = errors.New("groupbuy: member already joined")
+)
+
+type GroupbuyRepo interface {
+    Create(ctx, g *Groupbuy) (*Groupbuy, error)
+    GetByID(ctx, tenantID, id int64) (*Groupbuy, error)
+    ListActive(ctx, tenantID, storeID int64) ([]*Groupbuy, error)
+    UpdateStatus(ctx, tenantID, id int64, status string, now time.Time) (*Groupbuy, error)
+    // JoinAtomic: 校验 active+joined<required+未参团 → 插 participant(joined) + groupbuy.Joined++；
+    // 若 Join 后 Joined>=Required → groupbuy.Status=success。全成功或全回滚。
+    JoinAtomic(ctx, tenantID, groupbuyID, memberID int64, now time.Time) (*Participant, *Groupbuy, error)
+    GetParticipant(ctx, tenantID, groupbuyID, memberID int64) (*Participant, error)
+    ListParticipants(ctx, tenantID, groupbuyID int64) ([]*Participant, error)
+    // MarkPaid: participant joined→paid（拼团支付闭环留 payment 域，M2-S2 仅状态标记）
+    MarkPaid(ctx, tenantID, groupbuyID, memberID int64, now time.Time) (*Participant, error)
+}
+// MemberLookuper 防腐：groupbuy 不 import membership。主线程适配（同 marketing 范式）。
+type MemberLookuper interface { Exists(ctx, tenantID, memberID int64) (bool, error) }
+
+type Option func(*Service)
+func New(repo GroupbuyRepo, opts ...Option) *Service
+func WithMemberLookuper(MemberLookuper) Option
+func WithNowFunc(func() time.Time) Option
+
+type CreateInput struct {
+    StoreID, ProductID int64
+    Title              string
+    Params             GroupbuyParams
+    RequiredCount      int    // <=0 时取 Params.GroupSize 或默认 3
+    ValidHours         int    // 计算 EndAt = StartAt + ValidHoursh；<=0 默认 24
+}
+func (s *Service) Create(ctx, in CreateInput) (*Groupbuy, error)
+func (s *Service) Get(ctx, id int64) (*Groupbuy, error)
+func (s *Service) ListActive(ctx, storeID int64) ([]*Groupbuy, error)
+func (s *Service) Cancel(ctx, id int64) (*Groupbuy, error)        // active→cancelled
+func (s *Service) Join(ctx, groupbuyID, memberID int64) (*Participant, *Groupbuy, error)
+func (s *Service) ListParticipants(ctx, groupbuyID int64) ([]*Participant, error)
+// FinalizeExpired: 扫 active 且 EndAt<now 且 Joined<Required → failed；返回处理条数（jobs 钩子，cron 留 M3）
+func (s *Service) FinalizeExpired(ctx, now time.Time) (int, error)
+```
+
+#### 11.3.2 `internal/reach`（BE-B-07+08+10，**核心枢纽包**）
+
+```go
+package reach
+
+type ReachTask struct {
+    ID, TenantID, StoreID, StrategyID int64
+    Channel                           string // wework_group|wework_1v1|subscribe_msg|sms
+    TemplateCode                      string
+    TargetCount                       int
+    Status                            string // pending|sent|blocked|failed
+    BlockedReason                     string // 空=非拦截；freq_circuit|content_filter|unsubscribed|subscribe_quota|risk
+    ScheduledAt, SentAt               time.Time
+    CreatedAt                         time.Time
+}
+type SubscribeAuth struct {
+    ID, TenantID, MemberID int64
+    TemplateID             string
+    GrantedQuota, UsedQuota int
+    GrantedAt              time.Time
+}
+type UnsubscribeRecord struct {
+    ID, TenantID, MemberID int64
+    Channel, Reason        string
+    UnsubscribedAt         time.Time
+}
+const (
+    ChannelWeworkGroup = "wework_group"
+    ChannelWeworkOneV  = "wework_1v1"
+    ChannelSubscribeMsg = "subscribe_msg"
+    ChannelSMS          = "sms"
+    // 8 类触达模板
+    TplNewWelcome   = "new_welcome"
+    TplBirthday     = "birthday"
+    TplRecall30     = "recall_30"
+    TplRecall60     = "recall_60"
+    TplRecall90     = "recall_90"
+    TplRepurchase   = "repurchase"
+    TplBalanceLow   = "balance_low"
+    TplPointsExpire = "points_expire"
+    StatusPending = "pending"
+    StatusSent    = "sent"
+    StatusBlocked = "blocked"
+    StatusFailed  = "failed"
+    BlockFreqCircuit    = "freq_circuit"
+    BlockContentFilter  = "content_filter"
+    BlockUnsubscribed   = "unsubscribed"
+    BlockSubscribeQuota = "subscribe_quota"
+    BlockRisk           = "risk"
+)
+var (
+    ErrNotFound         = errors.New("reach: task not found")
+    ErrTemplateUnknown  = errors.New("reach: unknown template code")
+    ErrSubscribeExhausted = errors.New("reach: subscribe quota exhausted")
+)
+
+// Sender 是通道适配器（企微/订阅/短信真实实现延后；内存 stub 记录即返回 nil）
+type Sender interface {
+    Send(ctx context.Context, p *SendPayload) error
+}
+type SendPayload struct {
+    TenantID, MemberID int64
+    Channel            string
+    TemplateCode       string
+    Title, Body        string
+}
+
+// 三道防腐窄接口（reach 不直接 import compliance/freqcircuit/contentfilter）
+type FreqGate interface {
+    Allow(ctx context.Context, channel string) (allowed bool, reason string, err error)
+}
+type ContentFilter interface {
+    Do(text string) ContentResult
+}
+type ContentResult struct {
+    Text     string
+    Passed   bool
+    HitWords []string
+    Replaced []string
+}
+
+type ReachRepo interface {
+    CreateTask(ctx, t *ReachTask) (*ReachTask, error)
+    GetTask(ctx, tenantID, id int64) (*ReachTask, error)
+    ListTasks(ctx, tenantID, storeID int64, status string) ([]*ReachTask, error)
+    UpdateTaskStatus(ctx, tenantID, id int64, status, blockedReason string, sentAt time.Time) (*ReachTask, error)
+    // 订阅授权（原子）
+    GrantSubscribe(ctx, tenantID, memberID int64, tplID string, quota int, now time.Time) (*SubscribeAuth, error) // 已存在则 GrantedQuota+=quota
+    ConsumeSubscribe(ctx, tenantID, memberID int64, tplID string, now time.Time) (*SubscribeAuth, error)           // used<granted→used++；否则 ErrSubscribeExhausted
+    GetSubscribe(ctx, tenantID, memberID int64, tplID string) (*SubscribeAuth, error)
+    // 退订（一会员一通道一条；退订后重订阅 UPDATE 清态）
+    Unsubscribe(ctx, tenantID, memberID int64, channel, reason string, now time.Time) (*UnsubscribeRecord, error)
+    IsUnsubscribed(ctx, tenantID, memberID int64, channel string) (bool, error)
+    Resubscribe(ctx, tenantID, memberID int64, channel string) error
+}
+
+type Option func(*Service)
+func New(repo ReachRepo, opts ...Option) *Service
+func WithSender(Sender) Option
+func WithFreqGate(FreqGate) Option
+func WithContentFilter(ContentFilter) Option
+func WithNowFunc(func() time.Time) Option
+
+type RenderInput struct {
+    Code       string
+    MemberName string
+    StoreName  string
+    Vars       map[string]string // 弹性: birthday/recall_days/balance/points/product_name 等
+}
+type Rendered struct{ Code, Title, Body string }
+// Render 是纯函数：按 Code 选模板，填充 vars，返回标题+正文（口语化，正文≤120字）
+func (s *Service) Render(in RenderInput) (Rendered, error)
+// 即使无 Sender/FreqGate/ContentFilter 注入，Render 也可独立调用（零值守卫）
+
+type SendInput struct {
+    StoreID, MemberID, StrategyID int64
+    Channel, TemplateCode         string
+    Vars                          map[string]string
+}
+// Send 编排（**核心**，顺序固定，任一拦截写 blocked 并返回 ReachTask+nil error）：
+//   1. Render 模板（未知码→ErrTemplateUnknown，硬错非 blocked）
+//   2. ContentFilter.Do(body) → !Passed ⇒ blocked(content_filter)
+//   3. FreqGate.Allow(channel) → !allowed ⇒ blocked(freq_circuit)
+//   4. IsUnsubscribed(channel) ⇒ true ⇒ blocked(unsubscribed)
+//   5. channel==subscribe_msg ⇒ ConsumeSubscribe ⇒ ErrSubscribeExhausted ⇒ blocked(subscribe_quota)
+//   6. Sender.Send ⇒ 失败 status=failed；成功 status=sent
+//   首行 EnforceTenant；写 ReachTask 留痕（含 strategy_id 归因）；blocked 不消耗 subscribe 配额之外的计数。
+//   未注入的 guard（nil）跳过该步（dev 默认仅 Render+Sender）。
+func (s *Service) Send(ctx, in SendInput) (*ReachTask, error)
+
+func (s *Service) GrantSubscribe(ctx, memberID int64, tplID string, quota int) (*SubscribeAuth, error)
+func (s *Service) Unsubscribe(ctx, memberID int64, channel, reason string) (*UnsubscribeRecord, error)
+func (s *Service) Resubscribe(ctx, memberID int64, channel string) error
+func (s *Service) ListTasks(ctx, storeID int64, status string) ([]*ReachTask, error)
+func (s *Service) GetTask(ctx, id int64) (*ReachTask, error)
+```
+
+#### 11.3.3 `internal/compliance/newaccountguard`（BE-B-09）
+
+```go
+package newaccountguard
+// 复用 freqcircuit 的计数语义但零领域依赖：自定义 Counter 接口（签名同 freqcircuit.Counter），
+// 主线程注入 freqcircuit.MemoryCounter 实例（已实现该签名）。不 import freqcircuit。
+
+type Account struct {
+    WeworkUserID string
+    CreatedAt    time.Time // 账号创建时间，决定 daily cap
+}
+type AccountStore interface {
+    Get(ctx, tenantID int64, weworkUserID string) (*Account, error)
+}
+type Counter interface {
+    Incr(ctx, key string, expireAt time.Time) (int64, error)
+    Decr(ctx, key string) error
+    Get(ctx, key string) (int64, error)
+}
+var ErrAccountNotFound = errors.New("newaccountguard: account not found")
+
+type Option func(*Service)
+func New(store AccountStore, opts ...Option) *Service
+func WithCounter(Counter) Option     // 默认 NewMemoryCounter()（包内自带，同 freqcircuit 范式）
+func WithNowFunc(func() time.Time) Option
+
+// AllowAddFriend: age=daysSince(CreatedAt)；cap=50(age<7)/80(7-29)/200(>=30)；
+// key=t:{tid}:freq:add_friend:{weworkUserID}:daily；Incr 后超 cap→Decr 回退返回 (false,"new_account_cap")
+func (s *Service) AllowAddFriend(ctx, weworkUserID string) (allowed bool, reason string, err error)
+func (s *Service) DailyCapForAge(ageDays int) int // 暴露给测试/观测
+```
+
+#### 11.3.4 `internal/compliance/riskwindow`（BE-B-10 风控部分）
+
+```go
+package riskwindow
+// 租户级滑动窗口风控：1h 窗口内 blocked 次数 / 发送次数超阈值 → 记录 RiskEvent（告警不硬拒）。
+// 滑动窗口用「桶列表 + now 裁剪」内存实现（不依赖 Redis），可单测。
+
+type EventType string
+const (
+    EventHighBlockRate EventType = "high_block_rate" // blocked占比超阈值
+    EventBurstSend     EventType = "burst_send"      // 窗口内发送绝对值超阈值
+)
+type RiskEvent struct {
+    ID, TenantID int64
+    Type         EventType
+    Window       string  // "1h"
+    Threshold    int64
+    Observed     int64
+    CreatedAt    time.Time
+}
+type Option func(*Service)
+func New(opts ...Option) *Service
+func WithWindow(time.Duration) Option       // 默认 1h
+func WithBlockThreshold(int64) Option        // 默认 10（窗口内 blocked 次数）
+func WithSendThreshold(int64) Option         // 默认 200（窗口内发送次数）
+func WithNowFunc(func() time.Time) Option
+
+// RecordBlock 记一次拦截事件，返回是否触发 high_block_rate 告警 + 事件（无触发 event=nil）
+func (s *Service) RecordBlock(ctx, reason string) (alerted bool, event *RiskEvent, err error)
+// RecordSend 记一次发送，返回是否触发 burst_send 告警
+func (s *Service) RecordSend(ctx) (alerted bool, event *RiskEvent, err error)
+// RecentEvents 返回租户窗口内已记录事件（观测/测试用）
+func (s *Service) RecentEvents(ctx) ([]*RiskEvent, error)
+```
+
+#### 11.3.5 `internal/crm`（BE-B-06 社群+活码）
+
+```go
+package crm
+
+type CommunityGroup struct {
+    ID, TenantID, StoreID int64
+    WeworkChatID, Name    string
+    MemberCount           int
+    SOPStage              string // recruit|activate|convert|refer（空=未启动SOP）
+    CreatedAt, UpdatedAt  time.Time
+}
+type LivingCode struct {
+    ID, TenantID, StoreID int64
+    Code, Scene           string // add_friend|join_group
+    Config                LivingCodeConfig
+    CreatedAt             time.Time
+}
+type LivingCodeConfig struct {
+    AutoAssignRule string // nearest_store|round_robin
+    WelcomeMsg     string
+}
+const (
+    SOPRecruit  = "recruit"
+    SOPActivate = "activate"
+    SOPConvert  = "convert"
+    SOPRefer    = "refer"
+    SceneAddFriend = "add_friend"
+    SceneJoinGroup = "join_group"
+    RuleNearestStore = "nearest_store"
+    RuleRoundRobin   = "round_robin"
+)
+var ErrNotFound = errors.New("crm: not found")
+
+type Repo interface {
+    CreateGroup(ctx, g *CommunityGroup) (*CommunityGroup, error)
+    GetGroup(ctx, tenantID, id int64) (*CommunityGroup, error)
+    ListGroups(ctx, tenantID, storeID int64) ([]*CommunityGroup, error)
+    UpdateGroupSOP(ctx, tenantID, id int64, stage string, now time.Time) (*CommunityGroup, error)
+    AddGroupMembers(ctx, tenantID, id int64, delta int, now time.Time) (*CommunityGroup, error)
+    CreateCode(ctx, lc *LivingCode) (*LivingCode, error)
+    GetCode(ctx, tenantID int64, code string) (*LivingCode, error)
+    ListCodes(ctx, tenantID, storeID int64) ([]*LivingCode, error)
+}
+type Option func(*Service)
+func New(repo Repo, opts ...Option) *Service
+func WithNowFunc(func() time.Time) Option
+func WithStorePicker(StorePicker) Option // 活码分流选门店（nearest 需外部 LBS，M2-S2 注入内存 picker）
+
+// 活码分流：按 code 查 LivingCode，按 Config.AutoAssignRule 选 store_id
+type StorePicker interface {
+    Pick(ctx, tenantID int64, rule string) (storeID int64, err error)
+}
+// ResolveCode 返回分流到的 storeID + 欢迎语；round_robin 内置轮询，nearest 走 StorePicker（缺省回退首个门店）
+func (s *Service) ResolveCode(ctx, code string) (storeID int64, cfg LivingCodeConfig, err error)
+// AdvanceSOP: recruit→activate→convert→refer（refer 为终态，再推进报错）
+func (s *Service) AdvanceSOP(ctx, groupID int64) (*CommunityGroup, error)
+func (s *Service) CreateGroup / GetGroup / ListGroups / AddGroupMembers / CreateCode / ListCodes（薄封装 repo）
+```
+
+### 11.4 包所有权（文件集互斥）
+
+| Agent | 只准写这些文件 |
+|---|---|
+| **M2S2-migrations** | `migrations/000006_reach_community_groupbuy.up.sql` + `.down.sql` |
+| **M2S2-groupbuy** | `internal/groupbuy/{groupbuy.go, memory_repo.go, service.go, service_test.go}` |
+| **M2S2-reach** | `internal/reach/{reach.go, template.go, memory_repo.go, sender_memory.go, service.go, service_test.go}` |
+| **M2S2-newaccountguard** | `internal/compliance/newaccountguard/{newaccountguard.go, memory_counter.go, memory_store.go, service.go, service_test.go}` |
+| **M2S2-riskwindow** | `internal/compliance/riskwindow/{riskwindow.go, service.go, service_test.go}` |
+| **M2S2-crm** | `internal/crm/{crm.go, memory_repo.go, service.go, service_test.go}` |
+
+> 主线程负责（agent 不写）：`interfaces/http/handler/{reach.go, groupbuy.go, crm.go}`、`interfaces/http/router.go`（Deps 加 Reach/Groupbuy/CRM + 路由）、`cmd/api/main.go`（实例化 freqcircuit.New()+contentfilter.New()+reach/groupbuy/crm，适配 FreqGate/ContentFilter/Sender/MemberLookuper/StorePicker 窄接口）、`interfaces/http/m2s2_test.go`、`pkg/errcode/errcode.go`（新增 60009+ 码）。
+
+### 11.5 硬约束（M2-S2 全员）
+
+1. 每个 repo/service 方法首行 `tenantID, err := multitenancy.EnforceTenant(ctx)`；tenant **永不**从请求体/参数取。
+2. 内存实现 `sync.Mutex`/`sync.RWMutex` + 防御性拷贝 + 跨租户 `ErrNotFound`（串户矩阵必覆盖：tenant A 读/发/参团 tenant B 的资源→ErrNotFound/拒绝）。
+3. 金额 int64 分（groupbuy.PriceCents），禁浮点。
+4. **原子临界区**：groupbuy `JoinAtomic`（未满+未参团→插+joined++，满员→success，全成功或全回滚）；reach `ConsumeSubscribe`（used<granted→used++，CHECK 约束语义）；newaccountguard `AllowAddFriend`（超 cap→Decr 回退）。
+5. 防腐：`groupbuy`/`reach`/`crm` 不 import `membership`/`marketing`/`catalog`（走 MemberLookuper/Sender 等窄接口，主线程 main.go 适配）；`reach` 不直接 import `freqcircuit`/`contentfilter`（走 FreqGate/ContentFilter 窄接口）；`newaccountguard`/`riskwindow` 不 import 任何领域包。跨域依赖全走窄接口。
+6. reach.Send **顺序固定**（render→content→freq→unsub→subscribe quota→sender），blocked 写 ReachTask 留痕且返回 `(task, nil)`（非 error，让上层区分「拦截」与「系统错」）。
+7. 不引入白名单外依赖；不连真实 DB/Redis/企微；测试用 fake 接口 + 注入 clock/counter。
+8. 每个 `package xx` 上方 `// Package xx ...` 文档注释；`gofmt` 干净。
+
+### 11.6 DoD（M2-S2）
+
+- `go build ./... && go vet ./... && gofmt -l .`（空）`&& go test -race ./...` 全绿。
+- groupbuy 单测：建团→参团(joined++)→满员成团(success)→超员拒绝→重复参团拒绝→非 active 参团拒绝→FinalizeExpired(超时未满→failed)→串户拒绝。
+- reach 单测：8 模板渲染正确；Send 全链路(渲染→频次拦截→内容拦截→退订拦截→订阅计数拦截→发送成功)；订阅 Grant/Consume 原子(超额拒绝)；退订阻断+重订阅恢复；blocked 返回 task 非 error；串户拒绝。
+- newaccountguard 单测：三档 cap(50/80/200)正确、超限 Decr 回退、跨租户 key 隔离、AccountStore 缺失报 ErrAccountNotFound。
+- riskwindow 单测：滑动窗口裁剪过期桶、blocked/send 双阈值触发告警、告警不阻断后续（不硬拒）。
+- crm 单测：社群 SOP 推进(recruit→…→refer 终态报错)；活码分流(round_robin 轮询、nearest 回退)；串户拒绝。
+- 迁移 golang-migrate 命名合法、up/down 对称、CHECK/UNIQUE 约束齐全。
+- HTTP 冒烟（主线程）：dev mock 下「建团→参团→满员成团」；「发触达→频次熔断 blocked→换通道/退订 blocked」；订阅授权计数；串户证明（X-Mock-Tenant 隔离）。

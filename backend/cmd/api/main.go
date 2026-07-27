@@ -21,10 +21,15 @@ import (
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
+	"github.com/zhangguijunshi/backend/internal/compliance/contentfilter"
+	"github.com/zhangguijunshi/backend/internal/compliance/freqcircuit"
+	"github.com/zhangguijunshi/backend/internal/crm"
+	"github.com/zhangguijunshi/backend/internal/groupbuy"
 	"github.com/zhangguijunshi/backend/internal/inventory"
 	"github.com/zhangguijunshi/backend/internal/margin"
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
+	"github.com/zhangguijunshi/backend/internal/reach"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/jwt"
@@ -138,6 +143,25 @@ func run() error {
 		}),
 	)
 
+	// M2-S2 domain services (CONTRACT §11). Reach is the single outbound send
+	// channel: its three anti-corruption ports (Sender / FreqGate /
+	// ContentFilter) are adapted here. The frequency circuit and content filter
+	// were built in M2-S1 but left unwired — they now gate every reach.Send.
+	// Groupbuy reuses the membership lookuper; crm is standalone.
+	freqSvc := freqcircuit.New()
+	contentFilter := contentfilter.New()
+	reachSvc := reach.New(
+		reach.NewMemoryReachRepo(),
+		reach.WithSender(reach.NewMemorySender()),
+		reach.WithFreqGate(freqGateAdapter{freqSvc}),
+		reach.WithContentFilter(cfFilterAdapter{contentFilter}),
+	)
+	groupbuySvc := groupbuy.New(
+		groupbuy.NewMemoryGroupbuyRepo(),
+		groupbuy.WithMemberLookuper(membershipLookuper{membershipSvc}),
+	)
+	crmSvc := crm.New(crm.NewMemoryRepo())
+
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
 		Handler: httpserver.New(httpserver.Deps{
@@ -151,6 +175,9 @@ func run() error {
 			Inventory:  inventorySvc,
 			Membership: membershipSvc,
 			Marketing:  marketingSvc,
+			Reach:      reachSvc,
+			Groupbuy:   groupbuySvc,
+			CRM:        crmSvc,
 			DevMock:    cfg.Multitenancy.DevMockHeader,
 		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
@@ -304,6 +331,32 @@ func (g catalogMarginGuard) ValidateCoupon(ctx context.Context, c *marketing.Cou
 		DiscountPermille: c.Params.DiscountPermille,
 	}
 	return margin.ValidateCoupon(g.guard, rule, products)
+}
+
+// freqGateAdapter adapts *freqcircuit.Service to reach.FreqGate (CONTRACT §11.3.2
+// anti-corruption): reach never imports freqcircuit, so this thin adapter forwards
+// the three-period frequency check at the composition root. The string channel is
+// cast to freqcircuit.Channel — the two share the same spelling (wework_group /
+// wework_1v1 / subscribe_msg / sms).
+type freqGateAdapter struct{ svc *freqcircuit.Service }
+
+func (a freqGateAdapter) Allow(ctx context.Context, channel string) (bool, string, error) {
+	return a.svc.Allow(ctx, freqcircuit.Channel(channel))
+}
+
+// cfFilterAdapter adapts *contentfilter.Filter to reach.ContentFilter (CONTRACT
+// §11.3.2 anti-corruption): reach never imports contentfilter, so this thin
+// adapter translates the DFA + absolutism Result at the composition root.
+type cfFilterAdapter struct{ f *contentfilter.Filter }
+
+func (a cfFilterAdapter) Do(text string) reach.ContentResult {
+	r := a.f.Do(text)
+	return reach.ContentResult{
+		Text:     r.Text,
+		Passed:   r.Passed,
+		HitWords: r.HitWords,
+		Replaced: r.Replaced,
+	}
 }
 
 // buildJWTManager constructs the ES256 signer/verifier. It loads a PEM private

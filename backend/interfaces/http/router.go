@@ -23,9 +23,12 @@ import (
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
+	"github.com/zhangguijunshi/backend/internal/crm"
+	"github.com/zhangguijunshi/backend/internal/groupbuy"
 	"github.com/zhangguijunshi/backend/internal/inventory"
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
+	"github.com/zhangguijunshi/backend/internal/reach"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
@@ -53,6 +56,10 @@ type Deps struct {
 	Membership *membership.Service
 	// M2-S1 domain services (nil in the minimal test fixture).
 	Marketing *marketing.Service
+	// M2-S2 domain services (nil in the minimal test fixture).
+	Reach    *reach.Service
+	Groupbuy *groupbuy.Service
+	CRM      *crm.Service
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -140,6 +147,34 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.POST("/marketing/coupons/issue", h.Issue)
 		boss.POST("/marketing/coupons/redeem", h.Redeem)
 		boss.GET("/marketing/members/:id/coupons", h.ListMemberCoupons)
+	}
+	if deps.Reach != nil {
+		h := handler.NewReachHandler(deps.Reach)
+		boss.POST("/reach/send", h.Send)
+		boss.GET("/reach/tasks", h.ListTasks)
+		boss.GET("/reach/tasks/:id", h.GetTask)
+		boss.POST("/reach/subscribe-auth", h.GrantSubscribe)
+		boss.POST("/reach/unsubscribe", h.Unsubscribe)
+		boss.POST("/reach/resubscribe", h.Resubscribe)
+	}
+	if deps.Groupbuy != nil {
+		h := handler.NewGroupbuyHandler(deps.Groupbuy)
+		boss.POST("/groupbuys", h.Create)
+		boss.GET("/groupbuys/active", h.ListActive)
+		boss.GET("/groupbuys/:id", h.Get)
+		boss.POST("/groupbuys/:id/join", h.Join)
+		boss.GET("/groupbuys/:id/participants", h.ListParticipants)
+		boss.POST("/groupbuys/:id/cancel", h.Cancel)
+	}
+	if deps.CRM != nil {
+		h := handler.NewCRMHandler(deps.CRM)
+		boss.POST("/crm/groups", h.CreateGroup)
+		boss.GET("/crm/groups", h.ListGroups)
+		boss.GET("/crm/groups/:id", h.GetGroup)
+		boss.POST("/crm/groups/:id/sop/advance", h.AdvanceSOP)
+		boss.POST("/crm/groups/:id/members", h.AddGroupMembers)
+		boss.POST("/crm/living-codes", h.CreateCode)
+		boss.POST("/crm/living-codes/resolve", h.ResolveCode)
 	}
 }
 

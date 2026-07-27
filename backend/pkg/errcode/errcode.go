@@ -35,6 +35,17 @@ var (
 	ErrCouponInactive = Err{60006, "券未上线或不在有效期", http.StatusOK}
 	ErrCouponExpired  = Err{60007, "券已过期", http.StatusOK}
 	ErrCouponUsed     = Err{60008, "券已核销", http.StatusOK}
-	ErrInternal       = Err{50001, "服务器内部错误", http.StatusInternalServerError}
-	ErrUpstream       = Err{50201, "上游服务异常", http.StatusBadGateway}
+	// M2-S2 reach / groupbuy / crm business rejections (CONTRACT §11). HTTP 200 +
+	// 6xxx code so the client can branch on `code` (e.g. distinguish "blocked by
+	// frequency circuit" from "blocked by unsubscribe").
+	ErrContentFilter   = Err{60009, "内容命中敏感词，已拦截", http.StatusOK}
+	ErrSubscribeQuota  = Err{60010, "订阅消息授权次数已用尽", http.StatusOK}
+	ErrUnsubscribed    = Err{60011, "会员已退订该通道", http.StatusOK}
+	ErrTemplateUnknown = Err{60012, "触达模板不存在", http.StatusOK}
+	ErrGroupbuyFull    = Err{60013, "拼团已满", http.StatusOK}
+	ErrGroupbuyClosed  = Err{60014, "拼团已结束或不可参团", http.StatusOK}
+	ErrAlreadyJoined   = Err{60015, "该会员已参团", http.StatusOK}
+	ErrSOPTerminal     = Err{60016, "社群SOP已到终态", http.StatusOK}
+	ErrInternal        = Err{50001, "服务器内部错误", http.StatusInternalServerError}
+	ErrUpstream        = Err{50201, "上游服务异常", http.StatusBadGateway}
 )
