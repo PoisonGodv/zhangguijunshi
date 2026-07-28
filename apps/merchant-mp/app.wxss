@@ -1,0 +1,185 @@
+/* app.wxss — 全局样式 + 今日军师卡片/按钮 (暖色系,参考技术方案 §9.2 ui-tokens) */
+
+page {
+  background-color: #FFF9F5;
+  color: #1F1F1F;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+  font-size: 30rpx;
+  line-height: 1.45;
+}
+
+.container {
+  padding: 24rpx;
+  box-sizing: border-box;
+  min-height: 100vh;
+}
+
+/* === 顶部降级提示条 (advice.degrade 非空且非 cache_hit 时显示) === */
+.degrade-bar {
+  background: #FFF3D6;
+  color: #B26B00;
+  border: 1rpx solid #FFB627;
+  border-radius: 12rpx;
+  padding: 16rpx 20rpx;
+  font-size: 26rpx;
+  margin-bottom: 16rpx;
+}
+
+/* === 今日军师卡片 === */
+.advice-card,
+.detail-card {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  padding: 24rpx;
+  margin-bottom: 20rpx;
+  box-shadow: 0 2rpx 12rpx rgba(255, 107, 53, 0.08);
+}
+
+.advice-card:active {
+  opacity: 0.85;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12rpx;
+}
+
+.rank-badge {
+  width: 44rpx;
+  height: 44rpx;
+  border-radius: 50%;
+  background: #FF6B35;
+  color: #FFFFFF;
+  font-size: 28rpx;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 12rpx;
+  flex-shrink: 0;
+}
+
+.action-tag {
+  font-size: 22rpx;
+  padding: 4rpx 16rpx;
+  border-radius: 20rpx;
+  color: #FFFFFF;
+  background: #FF6B35;
+  margin-right: 12rpx;
+  flex-shrink: 0;
+}
+
+.tag-seckill { background: #FF4D4F; }
+.tag-wake { background: #FF6B35; }
+.tag-moments { background: #FFB627; color: #7A4A00; }
+.tag-price { background: #2ECC71; }
+.tag-group { background: #9B59B6; }
+.tag-recharge { background: #8C8C8C; }
+
+.margin-badge {
+  margin-left: auto;
+  font-size: 22rpx;
+  color: #2ECC71;
+  border: 1rpx solid #2ECC71;
+  border-radius: 16rpx;
+  padding: 2rpx 12rpx;
+  flex-shrink: 0;
+}
+
+.copy {
+  font-size: 36rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+  line-height: 1.35;
+  margin: 8rpx 0;
+  word-break: break-all;
+}
+
+.reason {
+  font-size: 26rpx;
+  color: #8C8C8C;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.effect {
+  font-size: 24rpx;
+  color: #B26B00;
+  background: #FFF9F0;
+  padding: 8rpx 14rpx;
+  border-radius: 8rpx;
+  margin-top: 12rpx;
+  display: inline-block;
+}
+
+/* === 详情页 section === */
+.section {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  padding: 20rpx 24rpx;
+  margin-bottom: 16rpx;
+}
+.section-title {
+  font-size: 24rpx;
+  color: #8C8C8C;
+  margin-bottom: 8rpx;
+}
+.section-body {
+  font-size: 30rpx;
+  color: #1F1F1F;
+  word-break: break-all;
+}
+
+.footer {
+  margin-top: 32rpx;
+  padding-bottom: 40rpx;
+}
+
+/* === 主按钮 === */
+.btn-primary {
+  background: #FF6B35;
+  color: #FFFFFF;
+  border-radius: 44rpx;
+  height: 88rpx;
+  line-height: 88rpx;
+  text-align: center;
+  font-size: 32rpx;
+  font-weight: 600;
+  border: none;
+}
+.btn-primary[disabled] {
+  background: #CCCCCC;
+  color: #FFFFFF;
+}
+.btn-primary::after { border: none; }
+
+/* === 空状态 / 加载态 === */
+.empty {
+  text-align: center;
+  padding: 200rpx 0;
+  color: #8C8C8C;
+}
+.empty-icon {
+  font-size: 80rpx;
+  margin-bottom: 16rpx;
+}
+.loading {
+  text-align: center;
+  padding: 80rpx 0;
+  color: #8C8C8C;
+}
+
+/* === 占位页 (billing / me) === */
+.placeholder-page {
+  text-align: center;
+  padding: 240rpx 40rpx;
+  color: #8C8C8C;
+}
+.placeholder-icon {
+  font-size: 96rpx;
+  margin-bottom: 24rpx;
+}
+.placeholder-text {
+  font-size: 30rpx;
+}

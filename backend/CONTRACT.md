@@ -1232,3 +1232,586 @@ func (s *Service) CreateGroup / GetGroup / ListGroups / AddGroupMembers / Create
 - crm 单测：社群 SOP 推进(recruit→…→refer 终态报错)；活码分流(round_robin 轮询、nearest 回退)；串户拒绝。
 - 迁移 golang-migrate 命名合法、up/down 对称、CHECK/UNIQUE 约束齐全。
 - HTTP 冒烟（主线程）：dev mock 下「建团→参团→满员成团」；「发触达→频次熔断 blocked→换通道/退订 blocked」；订阅授权计数；串户证明（X-Mock-Tenant 隔离）。
+
+---
+
+## 12. M3-S1 增量契约（AI-02/03/04/05 + BE-B-11 + DB-04 + FE-MP-03，2026-07-28）
+
+> M3-S1 是产品核心卖点「AI 今日营销军师：今日 3 件事 + 一键执行」。落地五段式管线 Signal→Rule→LLM→Converge→Schema + ActionExecutor。设计依据 ch07 §7.1-7.2（管线/规则）+ ch05 §5.3.8（strategies DDL）+ `~/Selfproj/zhanggui-ai-demo/`（Python 五段式范式）。**LLM 复用 `internal/aiengine/gateway`（已就绪 Chat/Budget），全程可降级**。金额 int64 cents / permille / integer pct，毛利护栏复用 `internal/margin`（纯函数）。
+
+### 12.1 范围与裁剪（对照 ch05 §5.3.8 / ch07 §7.1-7.2）
+
+**必做**：DB-04（strategies/strategy_items/strategy_attribution/strategy_feedback）；AI-02 规则引擎（struct+JSON，**非 DSL**）+ 5 业态 in-code 种子；AI-03 毛利护栏（复用 margin，三道校验）；AI-04 动作库（exec 6 handler）；AI-05 五段式管线；BE-B-11 ActionExecutor；FE-MP-03 商家小程序今日军师页。
+
+**显式延后**：AI-06 语义缓存 PGVector（M3-S2，本期 Cache 仅内存 L1 精确 hash）；AI-07 凌晨预生成 cron（M3-S2）；AI-08 gateway lite/V3/R1 分层路由（M3-S2，本期全 lite）；AI-10 归因回填 + AI-12 bandit（M3-S3，表建好但空）；AI-11 剧本库后台编辑（M3-S3，本期 in-code 种子）；tool-calling LLM 循环（M3-S2+，本期 gateway.Chat 单轮 json_object）；moments 朋友圈实发（M3-S2，handler 生成文案 Sender=nil 只 audit）；recharge_promo 执行（M4，handler 返回 ErrActionNotExecutable）。
+
+### 12.2 迁移编号（DB-04）
+
+`migrations/000007_ai_strategy.{up,down}.sql`（ch05 规划名 000008，实际按落地顺序用 000007；payment 域 M4 再用 000008）。建 4 表，逐字段对齐 ch05 §5.3.8 行 536–595 + 本契约的有意增补（strategy_items 加 `reason_type` 列 + execution_status CHECK 加 `blocked` 值，服务于 action_type 双层设计）：
+
+- `strategies`：id/uuid/tenant_id/store_id/for_date(unique w/ tenant+store)/signals(jsonb)/data_quality_score/generated_by(CHECK 4值)/llm_tier/total_cost_microcents/status(CHECK 4值)/created_at。无 updated_at（策略每日 upsert 覆盖，不挂 trg）。
+- `strategy_items`：id/tenant_id/strategy_id(FK)/rank(CHECK 1-3)/action_type(CHECK **6 值**)/reason_type(CHECK **7 值**，本期增补)/target(jsonb)/product_id(FK 可空)/params(jsonb)/copy/reason/expected_effect(jsonb)/margin_ok(boolean)/execution_status(CHECK `pending|executed|skipped|failed|blocked`，本期增补 blocked)/executed_at。UNIQUE(tenant_id,strategy_id,rank)。
+- `strategy_attribution`：id/tenant_id/strategy_item_id(FK)/metric(CHECK 5值)/value(double)/measured_at。UNIQUE(tenant_id,strategy_item_id,metric,measured_at)。本期建表空（M3-S3 回填）。
+- `strategy_feedback`：id/tenant_id/strategy_item_id(FK)/useful(boolean)/created_at。UNIQUE(tenant_id,strategy_item_id)。
+
+> `strategy_cache`/`marketing_cases`（pgvector）属 §5.3.9，本期**不建**（M3-S2）。down.sql 逆序 drop 4 表。
+
+### 12.3 领域类型与仓储接口（**已固定，agent 必须一字不差实现签名**）
+
+#### 12.3.0 全包共享常量 + 映射表（放 `rule` 包 `actions.go` 导出；exec import 取常量；strategy/output 用裸 string 不 import rule）
+
+```go
+// rule/actions.go —— ActionType 6 值执行通道（落 strategy_items.action_type，对齐 ch05 CHECK）
+const (
+    ActGroupSeckill  = "group_seckill"   // 群秒杀(临期/雨天/滞销捆绑)→发券+群发
+    ActCouponWake    = "coupon_wake"     // 券唤醒私聊(沉睡/节日/生日/高价值)→发券+1v1触达
+    ActMomentsPost   = "moments_post"    // 朋友圈(高毛利推送)→文案(M3-S1 audit 不实发)
+    ActPriceAdj      = "price_adj"       // 改价(高危,需二次确认)→catalog.UpdatePrice
+    ActGroupbuy      = "groupbuy"        // 拼团→groupbuy.Create
+    ActRechargePromo = "recharge_promo"  // 储值促销→stub(M4)
+)
+// ReasonType 7 值规则语义（落 strategy_items.reason_type，规则库「为什么」）
+const (
+    ReasonClearanceCoupon = "clearance_coupon" // 临期清仓
+    ReasonRainDelivery    = "rain_delivery"    // 雨天配送
+    ReasonBundleSlow      = "bundle_slow"      // 滞销捆绑
+    ReasonWakeDormant     = "wake_dormant"     // 沉睡唤醒
+    ReasonFestival        = "festival_discount"// 节日满减
+    ReasonBirthday        = "birthday_care"    // 生日关怀
+    ReasonHighValue       = "high_value_push"  // 高毛利推送
+)
+// ReasonToAction 冻结映射（rule 产 ActionType 用；exec 禁看 ReasonType）
+var ReasonToAction = map[string]string{
+    ReasonClearanceCoupon: ActGroupSeckill,
+    ReasonRainDelivery:    ActGroupSeckill,
+    ReasonBundleSlow:      ActGroupSeckill,
+    ReasonWakeDormant:     ActCouponWake,
+    ReasonFestival:        ActCouponWake,
+    ReasonBirthday:        ActCouponWake,
+    ReasonHighValue:       ActCouponWake, // M3-S1 固定映射；服装业态可走 moments_post 的二次映射留 M3-S3
+}
+// 状态常量（StatusXxx/ItemXxx/GenXxx）定义在 strategy 包（持久化域状态），见 §12.3.1。
+```
+
+#### 12.3.1 `internal/strategy`（A1，持久化域，零领域 import）
+
+```go
+package strategy
+
+import (
+    "context"
+    "encoding/json"
+    "errors"
+    "time"
+)
+
+// 状态常量（strategies.status / strategy_items.execution_status / strategies.generated_by）
+const (
+    StatusGenerated         = "generated"         // strategies.status
+    StatusPartiallyExecuted = "partially_executed"
+    StatusExecuted          = "executed"
+    StatusDismissed         = "dismissed"
+    ItemPending             = "pending"           // strategy_items.execution_status
+    ItemExecuted            = "executed"
+    ItemSkipped             = "skipped"
+    ItemFailed              = "failed"
+    ItemBlocked             = "blocked"           // 一键执行被合规拦截(本期增补)
+    GenCacheHit             = "cache_hit"         // strategies.generated_by
+    GenOfflinePregen        = "offline_pregen"    // M3-S2
+    GenLiveLLM              = "live_llm"
+    GenRuleOnly             = "rule_only"
+)
+
+type Strategy struct {
+    ID, TenantID, StoreID   int64
+    ForDate                 string          // YYYY-MM-DD
+    Signals                 json.RawMessage // 当日 signal.Bundle 快照（output 落库时 marshal 注入；strategy 包不 import signal）
+    DataQualityScore        int             // 0-100
+    GeneratedBy             string          // cache_hit|offline_pregen|live_llm|rule_only
+    LLMTier                 string          // rule_only 时空
+    TotalCostMicroCents     int64           // 本次 token 成本（1元=10000微分）
+    Status                  string          // generated|partially_executed|executed|dismissed
+    Items                   []StrategyItem
+    CreatedAt               time.Time
+}
+
+type StrategyItem struct {
+    ID, TenantID, StrategyID int64
+    Rank                     int            // 1-3
+    ActionType               string         // 6 值（ActXxx）
+    ReasonType               string         // 7 值语义（ReasonXxx）
+    Target                   map[string]any // 受众筛选（落 JSONB）
+    ProductID                int64          // 0=非商品绑定
+    Params                   map[string]any // 折扣/满减/文案（落 JSONB）
+    Copy                     string         // ≤40 字
+    Reason                   string         // 推荐理由（老板可读）
+    ExpectedEffect           map[string]any // 预期效果（落 JSONB）
+    MarginOK                 bool           // 毛利护栏校验
+    ExecutionStatus          string         // pending|executed|skipped|failed|blocked
+    ExecutedAt               *time.Time
+}
+
+type StrategyFeedback struct {
+    ID, TenantID, StrategyItemID int64
+    Useful                       bool
+    CreatedAt                    time.Time
+}
+
+type StrategyFilter struct {
+    StoreID int64
+    Date    string // 空不过滤
+    Status  string // 空不过滤
+    Limit   int    // <=0 默认 50
+    Offset  int
+}
+
+var (
+    ErrNotFound = errors.New("strategy: not found") // 跨租户/不存在统一返回此
+    ErrParam    = errors.New("strategy: invalid param")
+)
+
+type StrategyRepo interface {
+    // SaveAdvice 原子 upsert：按 (tenantID, storeID, forDate) 覆盖（同日重新生成覆盖草稿，不新增行）。
+    // 写 strategies + strategy_items（事务语义；内存实现单 mutex）。落库后 Strategy.ID/Items[].ID 回填。
+    SaveAdvice(ctx context.Context, s *Strategy) (*Strategy, error)
+    Get(ctx context.Context, tenantID, id int64) (*Strategy, error)              // ErrNotFound/跨租户
+    List(ctx context.Context, tenantID int64, f StrategyFilter) ([]*Strategy, error)
+    GetToday(ctx context.Context, tenantID, storeID int64, date string) (*Strategy, error) // ErrNotFound/跨租户
+    GetItem(ctx context.Context, tenantID, itemID int64) (*StrategyItem, error)            // ErrNotFound/跨租户
+    // UpdateItemStatus 一键执行后回写 execution_status + executed_at；非法迁移→ErrParam。
+    UpdateItemStatus(ctx context.Context, tenantID, itemID int64, status string, executedAt *time.Time, now time.Time) (*StrategyItem, error)
+    RecordFeedback(ctx context.Context, tenantID, strategyItemID int64, useful bool, now time.Time) (*StrategyFeedback, error) // UNIQUE 语义：同 item 重复反馈覆盖
+}
+
+type Option func(*Service)
+func New(repo StrategyRepo, opts ...Option) *Service
+func WithNowFunc(func() time.Time) Option
+
+// Service（首行 EnforceTenant；包装 repo，加业务校验）：
+//   SaveAdvice(ctx, s *Strategy) (*Strategy, error)
+//   Get(ctx, id int64) (*Strategy, error)
+//   GetToday(ctx, storeID int64, date string) (*Strategy, error)   // date 空取今天
+//   List(ctx, f StrategyFilter) ([]*Strategy, error)
+//   GetItem(ctx, itemID int64) (*StrategyItem, error)
+//   UpdateItemStatus(ctx, itemID int64, status string) (*StrategyItem, error)   // executedAt: status∈{executed,blocked,failed,skipped}→now；pending→nil
+//   RecordFeedback(ctx, itemID int64, useful bool) (*StrategyFeedback, error)
+```
+
+#### 12.3.2 `internal/aiengine/signal`（A2，types + collector + 防腐 Lookuper 端口）
+
+```go
+package signal
+
+import (
+    "context"
+    "time"
+)
+
+type Bundle struct {
+    TenantID     int64         `json:"tenant_id"`
+    StoreID      int64         `json:"store_id"`
+    BusinessType string        `json:"business_type"` // fruit|convenience|maternity|fresh|apparel
+    City         string        `json:"city"`
+    Date         time.Time     `json:"date"`
+    Weather      Weather       `json:"weather"`
+    Holiday      Holiday       `json:"holiday"`
+    Inventory    []InventorySig `json:"inventory"`
+    Members      MemberStats   `json:"members"`
+    DataQuality  int           `json:"data_quality"` // 0-100，仅 trace
+}
+type Weather struct {
+    Condition string  `json:"condition"` // rain|hot|cold|snow|normal
+    TempC     float64 `json:"temp_c"`     // 温度可 float（非金额）
+    Forecast  string  `json:"forecast"`
+}
+type Holiday struct {
+    Name       string `json:"name"`        // 端午|中秋|母亲节|无
+    DaysTo     int    `json:"days_to"`     // 距今天数，-1=无
+    IsFestival bool   `json:"is_festival"`
+}
+// InventorySig 金额一律 int64 cents（非 float）；库存数量/天数用 float64/int
+type InventorySig struct {
+    ProductID    int64   `json:"product_id"`
+    Name         string  `json:"name"`
+    CostCents    int64   `json:"cost_cents"`
+    PriceCents   int64   `json:"price_cents"`
+    Stock        float64 `json:"stock"`
+    DaysToExpiry int     `json:"days_to_expiry"` // -1=非临期
+    SlowMoving   bool    `json:"slow_moving"`
+    HighMargin   bool    `json:"high_margin"`
+}
+type MemberStats struct {
+    Total         int     `json:"total"`          // 会员总数（best-effort）
+    Sleep30       int     `json:"sleep_30"`       // 30 天未到店人数（M3-S1 best-effort，可为 0）
+    HighValue     []int64 `json:"high_value"`     // 高价值会员 ID（M3-S1 best-effort，可空）
+    BirthdayToday []int64 `json:"birthday_today"` // 当天生日（M3-S1 best-effort，可空）
+}
+type TxnSig struct {
+    RevenueCents int64 `json:"revenue_cents"` // 当日营收
+    OrderCount   int   `json:"order_count"`
+    NewMembers   int   `json:"new_members"`
+}
+
+// Lookuper 防腐端口（定义在 signal 包；主线程 main.go 适配 membership/inventory/billing/catalog/dataquality）。
+// M3-S1 best-effort：底层无法枚举时返回零值/空切片 + nil error（触发上层冷启动降级）。
+type Lookuper interface {
+    Inventory(ctx context.Context, tenantID, storeID int64) ([]InventorySig, error) // 临期/滞销/高毛利（catalog.List + inventory + dataquality.ComputeTags 推导）
+    Members(ctx context.Context, tenantID int64) (MemberStats, error)               // best-effort（M2 无 List，多为零值）
+    DailyTxn(ctx context.Context, tenantID, storeID int64, date string) (TxnSig, error)
+}
+
+// Collector 聚合信号（errgroup 并发拉三路，任一失败→空子集不阻断；weather/holiday 内存 mock）。
+type Collector interface {
+    Collect(ctx context.Context, tenantID, storeID int64) (*Bundle, error)
+}
+// New 接口实现：func NewCollector(businessType, city string, lk Lookuper, opts ...Option) *Service
+// （Service 实现 Collector；Collect 返回 *Bundle，永远非 nil——即使全空也返回零 Bundle 供冷启动判定）
+```
+
+#### 12.3.3 `internal/aiengine/rule`（A2，import signal + margin；**不 import strategy 域类型**，只 import strategy 取 ActionType/ReasonType 常量）
+
+```go
+package rule
+
+import (
+    "context"
+    "github.com/zhangguijunshi/backend/internal/aiengine/signal"
+    "github.com/zhangguijunshi/backend/internal/margin" // 纯函数 lib，直接 import（非领域包）
+)
+// ActionType/ReasonType 常量 + ReasonToAction 映射定义在本包 actions.go（见 §12.3.0）。
+// rule 不 import strategy（保持 Wave 1 与 A1 无跨依赖）；strategy/output 只存/传裸 string。
+
+type Routed struct {
+    TenantID int64        `json:"tenant_id"`
+    Items    []RoutedItem `json:"items"`
+}
+// RoutedItem 金额 int64 cents；ActionType 由 ReasonToAction 映射得出（不在 Rule 里手填）
+type RoutedItem struct {
+    RuleID         string     `json:"rule_id"`          // clearance_fruit_3d / cold_start_wake
+    ReasonType     string     `json:"reason_type"`      // 7 值（ReasonXxx）
+    ActionType     string     `json:"action_type"`      // 6 值（ActXxx，由 ReasonToAction 映射）
+    Target         string     `json:"target"`           // member_segment|product|group
+    ProductID      int64      `json:"product_id"`       // 0=非商品绑定
+    Product        string     `json:"product"`          // "-"=非商品绑定
+    CostCents      int64      `json:"cost_cents"`       // 0=满减类不绑商品
+    PriceCents     int64      `json:"price_cents"`
+    CostCeilCents  int64      `json:"cost_ceil_cents"`  // 护栏下限：cost*(100+floor)/100，0=不校验
+    MarginFloorPct int64      `json:"margin_floor_pct"` // 5=5%
+    Priority       int        `json:"priority"`
+    Reason         string     `json:"reason"`           // 老板可读理由
+    ParamRange     ParamRange `json:"param_range"`
+}
+// ParamRange：LLM 只能在区间内润色（全 int64，禁 float）
+type ParamRange struct {
+    DiscountMinPermille int64 `json:"discount_min_permille"` // 500=5 折
+    DiscountMaxPermille int64 `json:"discount_max_permille"` // 700=7 折
+    ThresholdCents      int64 `json:"threshold_cents"`       // 满 X
+    OffCents            int64 `json:"off_cents"`             // 减 Y
+    LimitQtyMax         int   `json:"limit_qty_max"`
+    ExpireHours         int   `json:"expire_hours"`
+}
+
+type Rule struct {
+    ID             string     `json:"id"`              // clearance_fruit_3d
+    Business       string     `json:"business"`        // fruit|*（* 全业态）
+    Priority       int        `json:"priority"`        // 越大越先
+    Enable         bool       `json:"enable"`
+    Conds          []Cond     `json:"conds"`           // AND
+    Action         Action     `json:"action"`
+    MarginFloorPct int64      `json:"margin_floor_pct"` // 5=5%，核心不可关闭
+}
+type Cond struct {
+    Field string `json:"field"` // weather.condition|holiday.days_to|inventory.days_to_expiry|inventory.slow_moving|inventory.high_margin|members.sleep_30|members.total
+    Op    string `json:"op"`    // eq|lt|gt|gte|lte|between|in|exists
+    Value any    `json:"value"` // between=[lo,hi]；in/exists=判列表/字段非空
+}
+type Action struct {
+    ReasonType string     `json:"reason_type"`   // 7 值（Rule 仅声明语义；ActionType 由映射表得出）
+    Target     string     `json:"target"`
+    ParamRange ParamRange `json:"param_range"`
+}
+
+// Engine：规则按 Priority 降序匹配；命中后过毛利护栏产出 RoutedItem。命中的 ActionType = strategy.ReasonToAction[ReasonType]。
+type Engine interface {
+    Route(ctx context.Context, b *signal.Bundle) (*Routed, error) // 永不返回 error（异常→空 Routed；命中 0 条由 Pipeline 注入冷启动）
+}
+// 构造：func NewEngine(rules []Rule, guard margin.Guard, opts ...Option) *service
+//   （service 实现 Engine；rules 已按 Priority 降序、过滤 Enable=false）
+// 种子：func DefaultSeeds() []Rule  // 5 业态 in-code 种子（fruit/convenience/maternity/fresh/apparel 各若干条，覆盖 7 个 ReasonType）
+
+// ApplyGuardrail（纯函数，rule/guardrail.go）：对单个 (inv, rule) 校验护栏产出 RoutedItem。
+//   推导 newPrice 下限 → margin.ValidatePriceAdj 二次确认 → 通过返回 (RoutedItem, true)；不达标 (zero, false)。
+//   cost/price<=0 → 直接 (zero, false)（无成本数据不给出价动作，防幻觉亏钱）。
+func ApplyGuardrail(inv signal.InventorySig, r Rule, guard margin.Guard) (RoutedItem, bool)
+```
+
+#### 12.3.4 `internal/aiengine/cache`（A2，L0 零依赖；本期内存 L1 精确 hash，PGVector 留 M3-S2）
+
+```go
+package cache
+
+import (
+    "context"
+    "github.com/zhangguijunshi/backend/internal/strategy" // Cache 存 *strategy.Strategy（落库后的当日策略）
+)
+
+// Cache L1 精确 hash：key = (tenantID, storeID, date)。本期内存；M3-S2 加 PGVector 语义缓存实现同接口。
+type Cache interface {
+    TryHit(ctx context.Context, tenantID, storeID int64, date string) (*strategy.Strategy, bool)
+    Put(ctx context.Context, tenantID, storeID int64, date string, s *strategy.Strategy) // 回写失败不阻断（调用方吞错）
+}
+// func NewMemoryCache() *MemoryCache // sync.RWMutex + map；TryHit 命中返回策略副本
+```
+
+#### 12.3.5 `internal/aiengine/agent`（A3，import rule + gateway；LLM 增强段，**永不返回 error**）
+
+```go
+package agent
+
+import (
+    "context"
+    "github.com/zhangguijunshi/backend/internal/aiengine/gateway"
+    "github.com/zhangguijunshi/backend/internal/aiengine/rule"
+)
+
+type Enhanced struct {
+    TenantID int64          `json:"tenant_id"`
+    Items    []EnhancedItem `json:"items"`
+}
+type EnhancedItem struct {
+    Routed        rule.RoutedItem `json:"routed"`
+    Copy          string          `json:"copy"`           // ≤40 字（模板兜底或 LLM 润色）
+    Params        map[string]any  `json:"params"`         // 折扣/满减/限份（已被护栏 clamp 到 ParamRange 内）
+    ExpectedEffect string         `json:"expected_effect"`// "核销35份 挽回损耗¥180"
+    MarginOK      bool            `json:"margin_ok"`       // route 段已保证 true；LLM 后再校验
+}
+
+// Stage 依赖 gateway.Gateway。EnhanceOrSkip 永远返回 *Enhanced（非 nil），永不返回 error：
+//   budget.Exceeded / ErrNoProvider / Chat err / JSON 解析失败 / 超时 → 全部降级为模板文案（copy 从 ActionType 模板表取，
+//   params 取 ParamRange 下限，MarginOK 保持 route 段的 true）。至少返回 Routed-only Enhanced。
+type Stage interface {
+    EnhanceOrSkip(ctx context.Context, tenantID int64, r *rule.Routed, degrade *string) *Enhanced
+    // degrade 是 Pipeline 维度的降级标记指针：若全程走模板，置 *degrade="llm" 或 "budget" 或 "no_provider"（仅当全程未命中一次 LLM 时）
+}
+// func New(gw *gateway.Gateway, opts ...Option) *service // gw 可为空 provider 网关（dev 无 key），EnhanceOrSkip 自动降级
+```
+
+#### 12.3.6 `internal/aiengine/converge`（A3，import agent；Top3 排序）
+
+```go
+package converge
+
+import (
+    "context"
+    "github.com/zhangguijunshi/backend/internal/aiengine/agent"
+)
+
+// PickTop3 按预期增量价值加权排序取前 3（RoutedItem.Priority 为主，ExpectedEffect 估算为辅）。
+// margin_ok=false 排尾不丢。不足 3 条按实际返回（≥1，冷启动保证）。异常→原序前 3。
+type Top3 interface {
+    PickTop3(ctx context.Context, e *agent.Enhanced) []*agent.EnhancedItem
+}
+// func NewTop3() *service
+```
+
+#### 12.3.7 `internal/aiengine/output`（A3，import agent + strategy + signal；编码 + 落库）
+
+```go
+package output
+
+import (
+    "context"
+    "github.com/zhangguijunshi/backend/internal/aiengine/agent"
+    "github.com/zhangguijunshi/backend/internal/aiengine/signal"
+    "github.com/zhangguijunshi/backend/internal/strategy"
+)
+
+// Advice = 已落库的当日策略 + 管线运行时降级标记（透传前端）
+type Advice struct {
+    Strategy *strategy.Strategy `json:"strategy"`
+    Degrade  string             `json:"degrade,omitempty"` // 空=live_llm；budget|llm|no_provider|cold_start|cache_hit
+}
+
+// Encoder 把 Top3 EnhancedItem 编码为 strategy.Strategy + 落库（via strategy.Service.SaveAdvice），返回 Advice。
+//   rank 1-3 分配；copy≤40 字 + contentfilter；margin_ok 强制 true；reason_type/action_type 落 item；
+//   signal.Bundle marshal 进 strategy.Signals 快照；GeneratedBy 由 degrade 推导（空→live_llm；cold_start/budget/...→rule_only）。
+type Encoder interface {
+    Encode(ctx context.Context, tenantID, storeID int64, top3 []*agent.EnhancedItem, bundle *signal.Bundle, degrade string) (*Advice, error)
+}
+// func NewEncoder(svc *strategy.Service, opts ...Option) *service
+```
+
+#### 12.3.8 `internal/aiengine` 根 `pipeline.go`（A3 独占 aiengine 包根；五段总控）
+
+```go
+package aiengine
+
+import (
+    "context"
+    "github.com/zhangguijunshi/backend/internal/aiengine/agent"
+    "github.com/zhangguijunshi/backend/internal/aiengine/cache"
+    "github.com/zhangguijunshi/backend/internal/aiengine/converge"
+    "github.com/zhangguijunshi/backend/internal/aiengine/output"
+    "github.com/zhangguijunshi/backend/internal/aiengine/rule"
+    "github.com/zhangguijunshi/backend/internal/aiengine/signal"
+)
+
+// Pipeline 五段总控。Run 是 handler 唯一调用面。
+//   顺序：0)L1 cache TryHit(命中→Degrade=cache_hit 直返) ①signal.Collect ②rule.Route(0条→冷启动注入,cold_start) ③agent.EnhanceOrSkip ④converge.Top3 ⑤output.Encode+落库+cache.Put
+//   全程 context.WithTimeout(8s)；段间 trace 打 log；任一段异常降级不报错（Encode 失败除外→返回 error）。
+func (p *Pipeline) Run(ctx context.Context) (*output.Advice, error)
+
+type Option func(*Pipeline)
+func NewPipeline(collector signal.Collector, router rule.Engine, stage agent.Stage, conv converge.Top3, enc output.Encoder, ch cache.Cache, opts ...Option) *Pipeline
+func WithBusinessType(string) Option // 默认 "fruit"（冷启动样板业态）
+```
+
+#### 12.3.9 `internal/aiengine/exec`（A4，独立子包；import strategy + margin + 自定义 4 端口；**不依赖 pipeline**）
+
+```go
+package exec
+
+import (
+    "context"
+    "github.com/zhangguijunshi/backend/internal/aiengine/rule" // 取 ActionType 常量做 dispatch
+    "github.com/zhangguijunshi/backend/internal/margin"
+    "github.com/zhangguijunshi/backend/internal/strategy"
+)
+
+// === 防腐端口（定义在 exec/ports.go；主线程 main.go 适配 marketing/reach/catalog/groupbuy）===
+
+// CouponRef 是发券结果（归因用）
+type CouponRef struct {
+    MemberCouponID int64
+    MemberID       int64
+}
+type CouponIssuer interface {
+    // Issue 适配 marketing.Service.Issue；source 固定 "ai_strategy"，strategyID 是归因主键。
+    Issue(ctx context.Context, memberID, couponID, strategyID int64, expireAt *time.Time) (*CouponRef, error)
+}
+
+// SendRef 复制 reach.ReachTask 的拦截语义（归因用——blocked 非 error）
+type SendRef struct {
+    TaskID        int64
+    Status        string // sent|blocked|failed
+    BlockedReason string // freq_circuit|content_filter|unsubscribed|subscribe_quota（status=blocked 时非空）
+}
+type MessageSender interface {
+    // Send 适配 reach.Service.Send；channel/template/vars 由 executor 按 ActionType 决定。
+    Send(ctx context.Context, storeID, memberID, strategyID int64, channel, tplCode string, vars map[string]string) (*SendRef, error)
+}
+
+type PriceUpdater interface {
+    // UpdatePrice 适配 catalog.Service.UpdatePrice（高危动作，executor 调用前已做 margin 预判 + Confirm 校验）。
+    UpdatePrice(ctx context.Context, productID, costCents, priceCents int64) error
+}
+
+type GroupbuyRef struct{ GroupbuyID int64 }
+type GroupbuyOpener interface {
+    // Launch 适配 groupbuy.Service.Create；strategyID 落 groupbuy 归因（M2-S2 groupbuy 无 strategy_id 字段则仅返回 ID）。
+    Launch(ctx context.Context, storeID, productID int64, title string, priceCents int64, requiredCount, validHours int, strategyID int64) (*GroupbuyRef, error)
+}
+
+// === 执行结果（blocked 归因靠这个结构）===
+type ExecResult struct {
+    StrategyItemID int64    `json:"strategy_item_id"`
+    Status         string   `json:"status"`          // executed|blocked|failed（对齐 strategy.ItemXxx + ItemBlocked）
+    Reason         string   `json:"reason,omitempty"`// margin_floor|freq_circuit|content_filter|unsubscribed|subscribe_quota|not_executable
+    TaskID         int64    `json:"task_id,omitempty"`   // reach.ReachTask.ID（触达类）
+    RefID          int64    `json:"ref_id,omitempty"`    // MemberCouponID / GroupbuyID（按 ActionType 语义）
+}
+
+// === Executor ===
+type Executor struct {
+    coupons  CouponIssuer
+    reacher  MessageSender
+    pricer   PriceUpdater
+    groupbuy GroupbuyOpener
+    guard    margin.Guard   // 执行前第三次护栏校验（与 rule/agent 同一 Guard config）
+    svc      *strategy.Service
+    now      func() time.Time
+}
+
+type ExecuteInput struct {
+    StrategyItemID int64
+    Confirm        bool // price_adj 高危动作需老板二次确认（前端传 true）
+}
+// Run 按 strategy_item_id 加载 item（从 repo，不信任调用方传参）→ 按 item.ActionType dispatch 到 6 handler：
+//   ActGroupSeckill: couponIssuer 发券 + messageSender 群发(wework_group, tpl 按 ReasonType 选)
+//   ActCouponWake:   couponIssuer 发券 + messageSender 1v1(wework_1v1, tpl=recall_30/birthday/repurchase 按 ReasonType)
+//   ActMomentsPost:  messageSender 生成文案 audit（M3-S1 Sender 走 reach.Send wework_group 占位 或 仅 audit）
+//   ActPriceAdj:     Confirm==false→Status=blocked(reason=confirm_required)；true→margin 预判→priceUpdater.UpdatePrice
+//   ActGroupbuy:     groupbuyOpener.Launch
+//   ActRechargePromo:Status=blocked(reason=not_executable)（M4 stub）
+// 归因：messageSender 返回 SendRef.Status!=sent → ExecResult.Status=blocked + Reason=BlockedReason + item 落 ItemBlocked（不标 executed）。
+// margin 预判破底 → Status=blocked + Reason=margin_floor。真实系统错 → Status=failed + 返回 error。
+// 首行 EnforceTenant；item 跨租户→ErrNotFound→HTTP 404。
+func (e *Executor) Run(ctx context.Context, in ExecuteInput) (*ExecResult, error)
+func NewExecutor(svc *strategy.Service, guard margin.Guard, coupons CouponIssuer, reacher MessageSender, pricer PriceUpdater, groupbuy GroupbuyOpener, opts ...Option) *Executor
+```
+
+### 12.4 包所有权（文件集互斥，每个 agent 拥有互斥的**包**）
+
+| Agent | 只准写这些文件 |
+|---|---|
+| **M3S1-strategy**（A1） | `migrations/000007_ai_strategy.up.sql` + `.down.sql`；`internal/strategy/{strategy.go, memory_repo.go, service.go, service_test.go}`；`internal/aiengine/cache/{cache.go, memory_cache.go, cache_test.go}`（cache 存 *strategy.Strategy，强耦合 strategy，故同归 A1） |
+| **M3S1-signal-rule**（A2） | `internal/aiengine/signal/{types.go, collector.go, service.go, service_test.go}`；`internal/aiengine/rule/{actions.go, rule.go, engine.go, guardrail.go, seeds.go, service.go, service_test.go}` |
+| **M3S1-pipeline**（A3） | `internal/aiengine/agent/{agent.go, stage.go, templates.go, service.go, service_test.go}`；`internal/aiengine/converge/{top3.go, service.go, service_test.go}`；`internal/aiengine/output/{types.go, encoder.go, service.go, service_test.go}`；`internal/aiengine/pipeline.go` + `pipeline_test.go`（A3 独占 aiengine 包根） |
+| **M3S1-exec**（A4） | `internal/aiengine/exec/{ports.go, executor.go, service.go, service_test.go}` |
+
+> 主线程负责（agent 不写）：`interfaces/http/handler/aiengine.go`、`interfaces/http/router.go`（Deps 加 Pipeline/Executor + 路由）、`cmd/api/main.go`（实例化全链 + 5 防腐适配器：signalLookuperAdapter/couponIssuerAdapter/msgSenderAdapter/priceUpdaterAdapter/groupbuyOpenerAdapter）、`interfaces/http/m3s1_test.go`、`pkg/errcode/errcode.go`（新增 60017+ 码）。
+
+> **波次依赖**（严格）：Wave 0（本 §12）→ Wave 1（A1‖A2，无跨 import）→ Wave 2（A3‖A4，依赖 Wave 1 的 signal/rule/strategy/cache 类型）→ Wave 3（主线程）。`rule` import `signal` 故二者同属 A2（agent 内部串行 signal→rule）；`exec` 独立子包故 A3/A4 可并行（避免与 pipeline.go 同属 aiengine 根）。
+
+### 12.5 硬约束（M3-S1 全员）
+
+1. 每个 repo/service 方法首行 `tenantID, err := multitenancy.EnforceTenant(ctx)`；tenant **永不**从请求体/参数取。
+2. 内存实现 `sync.Mutex`/`sync.RWMutex` + 防御性拷贝 + 跨租户 `ErrNotFound`（串户矩阵必覆盖）。
+3. **金额全程 int64 cents / permille / integer pct，禁浮点**（温度/库存数量/天数除外）。护栏一律走 `margin.ValidateCoupon`/`ValidatePriceAdj`，**禁止在 aiengine 包重写 float 护栏**。
+4. **三道毛利护栏同一来源**：rule.ApplyGuardrail（emit 时）/ agent（LLM 后 clamp）/ exec（执行前预判）共用同一 `margin.Guard{MarginFloorPct}`（config 注入，main.go 给 rule+exec 同一个值；marketing.Issue 内部 catalogMarginGuard 是最终权威，三道幂等 defense-in-depth）。
+5. 防腐：`signal` 不 import membership/inventory/billing/catalog（走 Lookuper 窄接口）；`exec` 不 import marketing/reach/catalog/groupbuy（走 4 端口窄接口）；`rule` 直接 import margin（纯函数 lib，非领域包）+ strategy（仅取常量）。`strategy` 零领域 import（Signals 用 json.RawMessage 不引 signal 类型）。
+6. **agent.EnhanceOrSkip 永不返回 error**（LLM 失败/无 provider/超时/坏 JSON 全降级模板）；`rule.Engine.Route` 永不返回 error（异常→空 Routed）。降级非失败：`output.Advice.Degrade` 标记 + HTTP 200。
+7. **exec blocked 归因**：MessageSender 返回 `SendRef.Status!=sent` → `ExecResult.Status=blocked` + `Reason=BlockedReason` + strategy_item 落 `ItemBlocked`（**不**标 executed）。margin 破底 → blocked+margin_floor。
+8. **strategy.SaveAdvice upsert by (tenantID,storeID,forDate)**：同日重新生成覆盖（不新增行，不重复 item）。内存 repo 并发安全（`-race` 全绿）。
+9. **action_type 双层不漂移**：rule 产 ActionType 用 `rule.ReasonToAction` 映射（常量定义在 rule 包 actions.go）；exec **只按 ActionType dispatch，禁看 ReasonType**。
+10. **gateway 无 provider（dev 无 key）**：agent 把 `gateway.ErrNoProvider` 等同 `gateway.ErrBudgetExceeded` → rule_only 降级（Degrade=no_provider/budget）。
+11. 不引入白名单外依赖；不连真实 DB/Redis/LLM（gateway 可构建空 provider 网关，测试用 fake gateway.Provider）；测试用 fake 接口 + 注入 clock。
+12. 每个 `package xx` 上方 `// Package xx ...` 文档注释；`gofmt` 干净；copy ≤40 字过 contentfilter（M2-S2 已落地，output 调用）。
+
+### 12.6 DoD（M3-S1）
+
+- `go build ./... && go vet ./... && gofmt -l .`（空）`&& go test -race ./...` 全绿（预计 ~28 包）。
+- strategy 单测：SaveAdvice upsert（同日覆盖不重复）+ 并发安全（`-race`）+ 状态机迁移合法 + 串户 ErrNotFound。
+- signal 单测：fake Lookuper 三路 → Bundle 字段映射正确；空 Lookuper → 零 Bundle（冷启动入口）。
+- rule 单测：5 业态种子各跑一条命中；毛利护栏用例（cost=1200 cents, price=2580 cents, floor=5% → discount 致 newPrice<1260 被压回下限）；ReasonToAction 映射正确；不达标候选被丢弃。
+- agent 单测：fake gateway.Provider 4 场景（好 JSON / 坏 JSON / ErrBudgetExceeded / ErrNoProvider）→ EnhanceOrSkip 永不 error、坏路径回退 Routed-only 模板。
+- converge 单测：5 个 EnhancedItem 取 Top3 + 同 priority 稳定排序 + margin_ok=false 排尾不丢。
+- output 单测：Encode 落 strategy repo（GeneratedBy 由 degrade 推导）+ ActionType/ReasonType 落 item + copy≤40 字 + Signals 快照 marshal。
+- exec 单测：6 ActionType dispatch；**blocked 归因**（fake MessageSender 返 blocked(freq_circuit) → ExecResult.Status=blocked + item 落 ItemBlocked）；margin 破底拦截；price_adj 未 Confirm → blocked(confirm_required)；recharge_promo → blocked(not_executable)。
+- pipeline 单测：8s 超时降级 + cache TryHit 短路 + signal 失败 rule_only + 冷启动（0 命中→cold_priority 注入 ≥1 条）。
+- 迁移 golang-migrate 命名合法、up/down 对称、CHECK/UNIQUE 齐全（含本期增补的 reason_type/execution_status CHECK）。
+- HTTP 冒烟（主线程 m3s1_test.go 8 场景）：①生成 happy ②毛利护栏拦截 ③预算熔断降级 ④LLM 坏 JSON 降级 ⑤冷启动 ⑥一键执行发券触达 ⑦一键执行 blocked 归因 ⑧串户 404。
+
+### 12.7 HTTP 端点 + errcode（主线程）
+
+**errcode 新增（`pkg/errcode/errcode.go`，60017 起；降级非失败走 200+data.degrade）**：
+```
+ErrStrategyNotFound   = Err{40404, "策略不存在", 404}
+ErrMarginGuardExec    = Err{60017, "执行时毛利护栏拦截", 200}
+ErrActionBlocked      = Err{60021, "动作被合规拦截，未执行", 200}
+ErrActionNotExecutable= Err{60022, "该动作暂不可一键执行", 200}
+```
+（60018-60020 预留：ErrBudgetDegrade/ErrLLMDegrade/ErrColdStart；本期这些降级通过 `Advice.Degrade` 字段透传，不强制映射 errcode，handler 返回 200+data。）
+
+**HTTP 端点（boss 面，`interfaces/http/handler/aiengine.go`，参照 reach.go）**：
+| 方法 | 路径 | handler | 入参 → 出参 |
+|---|---|---|---|
+| POST | `/v1/boss/aiengine/today` | `Today` | body `{date?}` → `*output.Advice`（200，降级也 200 带 degrade） |
+| GET | `/v1/boss/aiengine/strategies` | `ListStrategies` | `?date=&status=` → `[]*strategy.Strategy` |
+| GET | `/v1/boss/aiengine/strategies/:id` | `GetStrategy` | → `*strategy.Strategy`（含 items） |
+| POST | `/v1/boss/aiengine/strategies/:id/items/:itemID/execute` | `ExecuteItem` | body `{confirm?}` → `*exec.ExecResult`（blocked 也 200） |
+| POST | `/v1/boss/aiengine/strategies/:id/items/:itemID/feedback` | `RecordFeedback` | body `{useful}` → `{ok:true}` |
+
+### 12.8 显式延后（不在 M3-S1）
+
+语义缓存 PGVector（AI-06，Cache 接口已留，M3-S2 实现）；凌晨预生成 cron（AI-07，M3-S2 加 pregen 包）；gateway lite/V3/R1 分层路由（AI-08，本期全 lite）；效果归因回填 + bandit（AI-10/12，表建好空，M3-S3）；剧本库后台编辑（AI-11，本期 in-code 种子，M3-S3 接 React 后台）；tool-calling LLM 循环（本期 gateway.Chat 单轮 json_object）；moments 朋友圈实发（M3-S2 依赖海报/COS）；recharge_promo 执行（M4 依赖 billing/反二清）；membership/inventory 的 List 方法补充（signal 会员/临期枚举 M3-S1 best-effort，真实枚举留 M3-S2 与 strategy_cache 同期）。

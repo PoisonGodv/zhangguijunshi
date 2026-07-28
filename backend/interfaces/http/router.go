@@ -20,6 +20,8 @@ import (
 
 	"github.com/zhangguijunshi/backend/interfaces/http/handler"
 	"github.com/zhangguijunshi/backend/interfaces/http/middleware"
+	"github.com/zhangguijunshi/backend/internal/aiengine"
+	"github.com/zhangguijunshi/backend/internal/aiengine/exec"
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
@@ -29,6 +31,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/internal/reach"
+	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
@@ -60,6 +63,10 @@ type Deps struct {
 	Reach    *reach.Service
 	Groupbuy *groupbuy.Service
 	CRM      *crm.Service
+	// M3-S1 AI engine (nil in the minimal test fixture).
+	Strategy *strategy.Service
+	Pipeline *aiengine.Pipeline
+	Executor *exec.Executor
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -175,6 +182,14 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.POST("/crm/groups/:id/members", h.AddGroupMembers)
 		boss.POST("/crm/living-codes", h.CreateCode)
 		boss.POST("/crm/living-codes/resolve", h.ResolveCode)
+	}
+	if deps.Pipeline != nil || deps.Executor != nil || deps.Strategy != nil {
+		h := handler.NewAIEngineHandler(deps.Pipeline, deps.Executor, deps.Strategy)
+		boss.POST("/aiengine/today", h.Today)
+		boss.GET("/aiengine/strategies", h.ListStrategies)
+		boss.GET("/aiengine/strategies/:id", h.GetStrategy)
+		boss.POST("/aiengine/strategies/:id/items/:itemID/execute", h.ExecuteItem)
+		boss.POST("/aiengine/strategies/:id/items/:itemID/feedback", h.RecordFeedback)
 	}
 }
 

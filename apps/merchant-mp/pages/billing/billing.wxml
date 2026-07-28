@@ -1,0 +1,5 @@
+<!-- pages/billing/billing.wxml — FE-MP-02 扫码开单占位页 -->
+<view class="placeholder-page">
+  <view class="placeholder-icon">🧾</view>
+  <view class="placeholder-text">扫码开单 · 即将上线 (FE-MP-02)</view>
+</view>

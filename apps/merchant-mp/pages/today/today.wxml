@@ -1,0 +1,38 @@
+<!-- pages/today/today.wxml — 「今日3件事」首页 -->
+<view class="container">
+  <block wx:if="{{loading}}">
+    <view class="loading">军师正在分析今日经营…</view>
+  </block>
+
+  <block wx:else>
+    <!-- AI 降级提示条 (degrade 非空且非 cache_hit) -->
+    <view wx:if="{{degradeHint}}" class="degrade-bar">{{degradeHint}}</view>
+
+    <!-- 今日 3 件事卡片列表 -->
+    <block wx:if="{{cards.length}}">
+      <view
+        wx:for="{{cards}}"
+        wx:key="id"
+        class="advice-card"
+        data-id="{{item.id}}"
+        data-sid="{{item.strategyId}}"
+        bindtap="onTapCard"
+      >
+        <view class="card-header">
+          <view class="rank-badge">{{item.rank}}</view>
+          <view class="action-tag {{item.actionTagClass}}">{{item.actionLabel}}</view>
+          <view wx:if="{{item.marginOk}}" class="margin-badge">毛利✓</view>
+        </view>
+        <view class="copy">{{item.copy}}</view>
+        <view wx:if="{{item.reason}}" class="reason">{{item.reason}}</view>
+        <view wx:if="{{item.effect}}" class="effect">{{item.effect}}</view>
+      </view>
+    </block>
+
+    <!-- 空状态 -->
+    <view wx:else class="empty">
+      <view class="empty-icon">📋</view>
+      <view>今日暂无建议,明日再来看看</view>
+    </view>
+  </block>
+</view>

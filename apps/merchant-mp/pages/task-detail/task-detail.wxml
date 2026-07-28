@@ -1,0 +1,46 @@
+<!-- pages/task-detail/task-detail.wxml — 单条建议详情 + 一键执行 -->
+<view class="container">
+  <block wx:if="{{loading}}">
+    <view class="loading">加载中…</view>
+  </block>
+
+  <block wx:elif="{{detail}}">
+    <!-- 建议主体卡片 -->
+    <view class="detail-card">
+      <view class="card-header">
+        <view class="action-tag tag-wake">{{detail.actionLabel}}</view>
+        <view wx:if="{{detail.marginOk}}" class="margin-badge">毛利✓</view>
+      </view>
+      <view class="copy">{{detail.copy}}</view>
+      <view wx:if="{{detail.reason}}" class="reason">{{detail.reason}}</view>
+    </view>
+
+    <!-- 活动力度 -->
+    <view class="section">
+      <view class="section-title">活动力度</view>
+      <view class="section-body">{{detail.paramsText}}</view>
+    </view>
+
+    <!-- 目标受众 -->
+    <view class="section">
+      <view class="section-title">目标受众</view>
+      <view class="section-body">{{detail.targetText}}</view>
+    </view>
+
+    <!-- 预期效果 -->
+    <view class="section">
+      <view class="section-title">预期效果</view>
+      <view class="section-body">{{detail.effectText}}</view>
+    </view>
+
+    <!-- 一键执行按钮 (recharge_promo / 已执行 → 置灰禁用) -->
+    <view class="footer">
+      <button
+        class="btn-primary"
+        loading="{{executing}}"
+        disabled="{{btnDisabled}}"
+        bindtap="onExecute"
+      >{{btnText}}</button>
+    </view>
+  </block>
+</view>

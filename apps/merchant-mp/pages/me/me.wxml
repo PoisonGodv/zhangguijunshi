@@ -1,0 +1,5 @@
+<!-- pages/me/me.wxml — 「我的」占位页 -->
+<view class="placeholder-page">
+  <view class="placeholder-icon">👤</view>
+  <view class="placeholder-text">我的 · 即将上线</view>
+</view>

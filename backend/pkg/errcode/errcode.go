@@ -46,6 +46,15 @@ var (
 	ErrGroupbuyClosed  = Err{60014, "拼团已结束或不可参团", http.StatusOK}
 	ErrAlreadyJoined   = Err{60015, "该会员已参团", http.StatusOK}
 	ErrSOPTerminal     = Err{60016, "社群SOP已到终态", http.StatusOK}
-	ErrInternal        = Err{50001, "服务器内部错误", http.StatusInternalServerError}
-	ErrUpstream        = Err{50201, "上游服务异常", http.StatusBadGateway}
+	// M3-S1 AI engine / strategy (CONTRACT §12.7). HTTP 200 + 6xxx for business
+	// rejections (blocked / degrade is NOT failure); 40404 for not-found.
+	ErrStrategyNotFound    = Err{40404, "策略不存在", http.StatusNotFound}
+	ErrMarginGuardExec     = Err{60017, "执行时毛利护栏拦截", http.StatusOK}
+	ErrBudgetDegrade       = Err{60018, "AI预算熔断，已降级为规则建议", http.StatusOK}
+	ErrLLMDegrade          = Err{60019, "AI增强失败，已降级为规则建议", http.StatusOK}
+	ErrColdStart           = Err{60020, "数据不足，已使用冷启动剧本", http.StatusOK}
+	ErrActionBlocked       = Err{60021, "动作被合规拦截，未执行", http.StatusOK}
+	ErrActionNotExecutable = Err{60022, "该动作暂不可一键执行", http.StatusOK}
+	ErrInternal            = Err{50001, "服务器内部错误", http.StatusInternalServerError}
+	ErrUpstream            = Err{50201, "上游服务异常", http.StatusBadGateway}
 )

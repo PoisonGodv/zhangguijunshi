@@ -18,6 +18,15 @@ import (
 	"go.uber.org/zap"
 
 	httpserver "github.com/zhangguijunshi/backend/interfaces/http"
+	"github.com/zhangguijunshi/backend/internal/aiengine"
+	"github.com/zhangguijunshi/backend/internal/aiengine/agent"
+	"github.com/zhangguijunshi/backend/internal/aiengine/cache"
+	"github.com/zhangguijunshi/backend/internal/aiengine/converge"
+	"github.com/zhangguijunshi/backend/internal/aiengine/exec"
+	"github.com/zhangguijunshi/backend/internal/aiengine/gateway"
+	"github.com/zhangguijunshi/backend/internal/aiengine/output"
+	"github.com/zhangguijunshi/backend/internal/aiengine/rule"
+	aisignal "github.com/zhangguijunshi/backend/internal/aiengine/signal"
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
@@ -30,6 +39,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/internal/reach"
+	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/jwt"
@@ -162,6 +172,32 @@ func run() error {
 	)
 	crmSvc := crm.New(crm.NewMemoryRepo())
 
+	// M3-S1 AI engine (CONTRACT §12). Five-stage pipeline + ActionExecutor.
+	// gateway.NewFromConfig builds a placeholder (empty-providers) gateway when
+	// no provider API key is configured (dev); agent.EnhanceOrSkip then degrades
+	// to rule-only (no_provider) — the pipeline still produces cold-start / rule
+	// advice. The shared margin guard (defaultMarginFloorPct) is injected into
+	// both rule and exec so the three defense-in-depth checks share one source.
+	gw, _ := gateway.NewFromConfig(cfg.AI)
+	strategySvc := strategy.New(strategy.NewMemoryStrategyRepo())
+	signalCollector := aisignal.NewCollector("fruit", "", signalLookuperAdapter{
+		catalogSvc:    catalogSvc,
+		inventorySvc:  inventorySvc,
+		membershipSvc: membershipSvc,
+		billingSvc:    billingSvc,
+	})
+	ruleEngine := rule.NewEngine(rule.DefaultSeeds(), margin.Guard{MarginFloorPct: defaultMarginFloorPct})
+	pipeline := aiengine.NewPipeline(
+		signalCollector, ruleEngine, agent.New(gw), converge.NewTop3(),
+		output.NewEncoder(strategySvc), cache.NewMemoryCache(),
+		aiengine.WithBusinessType("fruit"),
+	)
+	executor := exec.NewExecutor(
+		strategySvc, margin.Guard{MarginFloorPct: defaultMarginFloorPct},
+		couponIssuerAdapter{marketingSvc}, msgSenderAdapter{reachSvc},
+		priceUpdaterAdapter{catalogSvc}, groupbuyOpenerAdapter{groupbuySvc},
+	)
+
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
 		Handler: httpserver.New(httpserver.Deps{
@@ -178,6 +214,9 @@ func run() error {
 			Reach:      reachSvc,
 			Groupbuy:   groupbuySvc,
 			CRM:        crmSvc,
+			Strategy:   strategySvc,
+			Pipeline:   pipeline,
+			Executor:   executor,
 			DevMock:    cfg.Multitenancy.DevMockHeader,
 		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,

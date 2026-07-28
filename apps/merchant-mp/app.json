@@ -1,0 +1,44 @@
+{
+  "pages": [
+    "pages/today/today",
+    "pages/task-detail/task-detail",
+    "pages/billing/billing",
+    "pages/me/me"
+  ],
+  "tabBar": {
+    "color": "#8C8C8C",
+    "selectedColor": "#FF6B35",
+    "backgroundColor": "#FFFFFF",
+    "borderStyle": "white",
+    "list": [
+      {
+        "pagePath": "pages/today/today",
+        "text": "今日",
+        "iconPath": "assets/tab-inactive.png",
+        "selectedIconPath": "assets/tab-active.png"
+      },
+      {
+        "pagePath": "pages/billing/billing",
+        "text": "开单",
+        "iconPath": "assets/tab-inactive.png",
+        "selectedIconPath": "assets/tab-active.png"
+      },
+      {
+        "pagePath": "pages/me/me",
+        "text": "我的",
+        "iconPath": "assets/tab-inactive.png",
+        "selectedIconPath": "assets/tab-active.png"
+      }
+    ]
+  },
+  "window": {
+    "backgroundTextStyle": "dark",
+    "navigationBarBackgroundColor": "#FF6B35",
+    "navigationBarTitleText": "掌柜军师",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#FFF9F5"
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json",
+  "lazyCodeLoading": "requiredComponents"
+}
