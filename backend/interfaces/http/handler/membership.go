@@ -141,3 +141,75 @@ func (h *MembershipHandler) Redeem(c *gin.Context) {
 	}
 	httpx.OK(c, res)
 }
+
+type rechargeRequest struct {
+	AmountCents int64 `json:"amount_cents" binding:"required,min=1"`
+}
+
+// Recharge tops up a member's stored value (manual / admin book-keeping entry).
+// 反二清: the fund path is prepay(subject=recharge) → WeChat notify →
+// paymentFulfiller → Recharge; this endpoint is the manual/testing entry that
+// credits the book balance directly. Regional cap is enforced (errcode 60003).
+// POST /v1/boss/membership/members/:id/recharge
+func (h *MembershipHandler) Recharge(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	var req rechargeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	var operatorID int64
+	if mc, ok := multitenancy.FromContext(c.Request.Context()); ok {
+		operatorID = mc.UserID
+	}
+	res, err := h.svc.Recharge(c.Request.Context(), membership.RechargeInput{
+		MemberID:    id,
+		AmountCents: req.AmountCents,
+		OperatorID:  operatorID,
+	})
+	if err != nil {
+		switch err {
+		case membership.ErrNotFound:
+			httpx.Fail(c, errcode.Err{Code: 40402, Message: "会员不存在", HTTP: 404})
+		case membership.ErrMemberBlocked:
+			httpx.Fail(c, errcode.Err{Code: 42302, Message: "会员已被冻结", HTTP: 423})
+		default:
+			httpx.FailError(c, err)
+		}
+		return
+	}
+	httpx.OK(c, res)
+}
+
+type regionCapRequest struct {
+	RegionCapCents int64 `json:"region_cap_cents"`
+}
+
+// SetRegionCap sets the member's stored-value regional cap (compliance for
+// 上海/江苏 etc.; 0 = unlimited).
+// POST /v1/boss/membership/members/:id/region-cap
+func (h *MembershipHandler) SetRegionCap(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	var req regionCapRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	if err := h.svc.SetRegionCap(c.Request.Context(), id, req.RegionCapCents); err != nil {
+		if err == membership.ErrNotFound {
+			httpx.Fail(c, errcode.Err{Code: 40402, Message: "会员不存在", HTTP: 404})
+			return
+		}
+		httpx.FailError(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"ok": true})
+}

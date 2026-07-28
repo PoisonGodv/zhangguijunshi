@@ -111,3 +111,56 @@ func (h *BillingHandler) DailySummary(c *gin.Context) {
 	}
 	httpx.OK(c, sum)
 }
+
+// CreatePendingOrder records a pending (awaiting-online-payment) order for the
+// online-pay flow: create pending → prepay → WeChat notify → MarkOrderPaid
+// (CONTRACT §15.7). Same body as CreateOrder.
+// POST /v1/boss/billing/orders/pending
+func (h *BillingHandler) CreatePendingOrder(c *gin.Context) {
+	var req createOrderRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	items := make([]billing.CreateOrderItem, 0, len(req.Items))
+	for _, it := range req.Items {
+		items = append(items, billing.CreateOrderItem{ProductID: it.ProductID, Qty: it.Qty})
+	}
+	order, err := h.svc.CreatePendingOrder(c.Request.Context(), billing.CreateOrderInput{
+		StoreID:       req.StoreID,
+		MemberID:      req.MemberID,
+		Channel:       req.Channel,
+		PaymentMethod: req.PaymentMethod,
+		Items:         items,
+	})
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	httpx.OK(c, order)
+}
+
+// SimulatePay marks a pending order paid — a dev convenience to exercise the
+// pending→paid transition without the WeChat callback. Production always goes
+// through the notify callback → paymentFulfiller → MarkOrderPaid.
+// POST /v1/boss/billing/orders/:id/pay
+func (h *BillingHandler) SimulatePay(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	order, err := h.svc.MarkOrderPaid(c.Request.Context(), id, "sim_"+strconv.FormatInt(id, 10), time.Now())
+	if err != nil {
+		switch err {
+		case billing.ErrNotFound:
+			httpx.Fail(c, errcode.Err{Code: 40401, Message: "订单不存在", HTTP: 404})
+		case billing.ErrStatusConflict:
+			httpx.Fail(c, errcode.Err{Code: 40903, Message: "订单状态不可推进", HTTP: 409})
+		default:
+			httpx.FailError(c, err)
+		}
+		return
+	}
+	httpx.OK(c, order)
+}

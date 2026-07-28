@@ -43,8 +43,10 @@ import (
 	"github.com/zhangguijunshi/backend/internal/margin"
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
+	"github.com/zhangguijunshi/backend/internal/payment"
 	"github.com/zhangguijunshi/backend/internal/reach"
 	"github.com/zhangguijunshi/backend/internal/strategy"
+	"github.com/zhangguijunshi/backend/internal/subscription"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/jwt"
@@ -246,27 +248,47 @@ func run() error {
 		}
 	}()
 
+	// M4-S1 payment + subscription (CONTRACT §15.7). dev: FakeWxPay (deterministic,
+	// never-network) wires all three WeChat-Pay V3 ports; the composite
+	// paymentFulfiller dispatches a successful payment to billing/membership/
+	// subscription by Subject. subscription defaults to free (empty MemoryStore)
+	// until a boss subscribes. 生产: replace FakeWxPay with the real V3 client and
+	// the Memory repos with PG repos once PG + wx credentials are configured.
+	fakeWxPay := payment.NewFakeWxPay()
+	subscriptionSvc := subscription.NewService(subscription.NewMemoryStore())
+	paymentSvc := payment.NewService(
+		payment.NewMemorySubMerchantRepo(),
+		payment.NewMemoryPaymentRepo(),
+		payment.NewMemoryLedgerRepo(),
+		payment.WithApplier(fakeWxPay),
+		payment.WithPreparer(fakeWxPay),
+		payment.WithNotifyParser(fakeWxPay),
+		payment.WithFulfiller(paymentFulfiller{bill: billingSvc, mbr: membershipSvc, sub: subscriptionSvc}),
+	)
+
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
 		Handler: httpserver.New(httpserver.Deps{
-			Cfg:         cfg,
-			DB:          database,
-			JWT:         jwtMgr,
-			Store:       store,
-			AuthSvc:     authSvc,
-			Catalog:     catalogSvc,
-			Billing:     billingSvc,
-			Inventory:   inventorySvc,
-			Membership:  membershipSvc,
-			Marketing:   marketingSvc,
-			Reach:       reachSvc,
-			Groupbuy:    groupbuySvc,
-			CRM:         crmSvc,
-			Strategy:    strategySvc,
-			Pipeline:    pipeline,
-			Executor:    executor,
-			Attribution: attrRepo,
-			DevMock:     cfg.Multitenancy.DevMockHeader,
+			Cfg:          cfg,
+			DB:           database,
+			JWT:          jwtMgr,
+			Store:        store,
+			AuthSvc:      authSvc,
+			Catalog:      catalogSvc,
+			Billing:      billingSvc,
+			Inventory:    inventorySvc,
+			Membership:   membershipSvc,
+			Marketing:    marketingSvc,
+			Reach:        reachSvc,
+			Groupbuy:     groupbuySvc,
+			CRM:          crmSvc,
+			Strategy:     strategySvc,
+			Pipeline:     pipeline,
+			Executor:     executor,
+			Attribution:  attrRepo,
+			Payment:      paymentSvc,
+			Subscription: subscriptionSvc,
+			DevMock:      cfg.Multitenancy.DevMockHeader,
 		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,

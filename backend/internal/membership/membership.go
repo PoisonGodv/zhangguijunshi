@@ -41,9 +41,14 @@ type Member struct {
 // BalanceAccount is a member's stored-value (储值) book account. Exactly one
 // account exists per (tenant, member); Join creates it with a zero balance.
 // BalanceCents is the real paid-in balance, GiftCents the bonus/granted part.
+// RegionCapCents is the per-card stored-value ceiling mandated by regional
+// pre-paid-card compliance (e.g. Shanghai/Jiangsu); 0 means uncapped. Recharge
+// enforces balance+amount+gift <= RegionCapCents (errcode.ErrBalanceOver on
+// breach) so a single card never holds more stored value than the law allows.
 type BalanceAccount struct {
 	ID, TenantID, MemberID  int64
 	BalanceCents, GiftCents int64
+	RegionCapCents          int64 `json:"region_cap_cents"` // 地区单卡余额上限(0=不限)
 	CreatedAt, UpdatedAt    time.Time
 }
 
@@ -112,6 +117,21 @@ type MemberRepo interface {
 	// Implementations MUST change NO state when the balance would overdraw
 	// (return ErrInsufficientBalance).
 	redeemAtomic(tenantID, memberID int64, now time.Time, consumeCents, earnPoints, refOrderID int64) (*redeemOutcome, error)
+
+	// rechargeAtomic performs the Recharge critical section (M4-S1 BE-B-12) —
+	// load account (absent → ErrNotFound), enforce the regional per-card cap
+	// (balance+amount+gift <= RegionCapCents; 0 = uncapped; breach →
+	// errcode.ErrBalanceOver with NO state change), then credit
+	// BalanceCents+=amount + GiftCents+=gift, append the recharge balance-flow,
+	// and return the updated account — as one atomic step. The fund flow itself
+	// is settled by WeChat Pay directly to the sub-merchant (反二清: the platform
+	// never holds the money); this method only books the balance.
+	rechargeAtomic(tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error)
+
+	// UpdateAccountRegionCap sets RegionCapCents for the (tenantID, memberID)
+	// account (admin / compliance; the main thread seeds it from the tenant's
+	// province). Cross-tenant or absent account → ErrNotFound.
+	UpdateAccountRegionCap(ctx context.Context, tenantID, memberID, regionCapCents int64) error
 }
 
 // redeemOutcome carries the post-redemption account/member state from
@@ -157,6 +177,62 @@ type RedeemInput struct {
 type RedeemResult struct {
 	MemberID, Points, BalanceCents int64
 	ConsumedCents                  int64
+}
+
+// RechargeTier is one stored-value recharge bracket: recharge AmountCents earns
+// GiftCents bonus (plan §7.4 "充200送20、充500送80"). The in-code seed table
+// (rechargeTiers) is the single source of truth for the gift schedule.
+type RechargeTier struct {
+	AmountCents int64
+	GiftCents   int64
+}
+
+// rechargeTiers is the in-code recharge-gift schedule (M4-S1 BE-B-12 seed). A
+// recharge qualifies for every tier whose AmountCents it meets or exceeds;
+// GiftForAmount returns the best (highest) qualifying gift. Ordered ascending
+// so the iteration in GiftForAmount naturally picks the largest match.
+var rechargeTiers = []RechargeTier{
+	{AmountCents: 20000, GiftCents: 2000},   // 充200送20
+	{AmountCents: 50000, GiftCents: 8000},   // 充500送80
+	{AmountCents: 100000, GiftCents: 20000}, // 充1000送200
+}
+
+// GiftForAmount returns the bonus gift for a recharge of amountCents, matching
+// the best qualifying tier; an amount below every tier earns no gift (0). Pure
+// function (no state), so it is directly unit-testable.
+func GiftForAmount(amountCents int64) int64 {
+	var gift int64
+	for _, t := range rechargeTiers {
+		if amountCents >= t.AmountCents && t.GiftCents > gift {
+			gift = t.GiftCents
+		}
+	}
+	return gift
+}
+
+// RechargeInput carries a stored-value recharge request (M4-S1 BE-B-12). The
+// funds are settled by WeChat Pay directly to the sub-merchant (反二清: the
+// platform never holds the money); Recharge only books the balance. MemberID is
+// the member whose account is topped up; AmountCents is the real paid-in amount
+// (the gift is computed internally via GiftForAmount, NOT trusted from caller);
+// RefPaymentID optionally links the auditing payment.ID; OperatorID is the
+// staff member who performed the top-up.
+type RechargeInput struct {
+	MemberID     int64
+	AmountCents  int64
+	RefPaymentID int64
+	OperatorID   int64
+}
+
+// RechargeResult reports the post-recharge account state. BalanceCents /
+// GiftCents are the resulting totals; RechargedCents / GiftedCents are this
+// call's increments (echoed back so the caller can render "充200送20" receipts).
+type RechargeResult struct {
+	MemberID       int64
+	BalanceCents   int64 // 入账后实付余额
+	GiftCents      int64 // 入账后赠送余额
+	RechargedCents int64 // 本次实付
+	GiftedCents    int64 // 本次赠送(档位规则算)
 }
 
 // MemberFilter narrows a ListMembers query (M3-S2 signal real enumeration).

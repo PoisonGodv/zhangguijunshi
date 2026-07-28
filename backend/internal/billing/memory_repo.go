@@ -138,6 +138,33 @@ func (r *MemoryOrderRepo) RepurchaseMembers(_ context.Context, tenantID int64, m
 	return len(repurchased), nil
 }
 
+// UpdateStatus implements OrderRepo. It transitions an order's status and, when
+// the target status is "paid", fills the payment fields (paidCents, paidAt,
+// paymentRef) and bumps UpdatedAt to paidAt. For any other target status the
+// payment fields are left untouched (callers pass zero values). A cross-tenant
+// or absent id returns ErrNotFound. The returned order is a defensive copy
+// (including Items and PaidAt).
+func (r *MemoryOrderRepo) UpdateStatus(_ context.Context, tenantID, id int64, status string, paidCents int64, paidAt *time.Time, paymentRef string) (*Order, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	o, ok := r.byID[id]
+	if !ok || o.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	o.Status = status
+	if status == orderStatusPaid {
+		o.PaidCents = paidCents
+		if paidAt != nil {
+			t := *paidAt
+			o.PaidAt = &t
+			o.UpdatedAt = t
+		}
+		o.PaymentRef = paymentRef
+	}
+	return cloneOrder(o), nil
+}
+
 // orderPaidInRange reports whether o was paid within [since, until]
 // (inclusive). Orders without a PaidAt are not in range (paid orders always
 // carry PaidAt, set by CreateOrder; non-paid statuses are filtered upstream).

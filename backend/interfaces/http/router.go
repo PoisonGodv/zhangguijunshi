@@ -31,8 +31,10 @@ import (
 	"github.com/zhangguijunshi/backend/internal/inventory"
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
+	"github.com/zhangguijunshi/backend/internal/payment"
 	"github.com/zhangguijunshi/backend/internal/reach"
 	"github.com/zhangguijunshi/backend/internal/strategy"
+	"github.com/zhangguijunshi/backend/internal/subscription"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
@@ -71,6 +73,9 @@ type Deps struct {
 	// M3-S3 attribution read API (CONTRACT §14.7). nil disables the
 	// /strategies/:id/attribution endpoint cleanly.
 	Attribution attribution.Repo
+	// M4-S1 payment / subscription (nil in the minimal test fixture).
+	Payment      *payment.Service
+	Subscription *subscription.Service
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -101,6 +106,13 @@ func New(deps Deps) *gin.Engine {
 	r.GET("/healthz", liveness)
 	r.GET("/readyz", readiness(deps.DB))
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	// M4-S1 WeChat-pay notify: unauthenticated callback (tenant recovered from
+	// the out_trade_no in the body, CONTRACT §15.7).
+	if deps.Payment != nil {
+		ph := handler.NewPaymentHandler(deps.Payment)
+		r.POST("/v1/wxshop/payment/notify", ph.Notify)
+	}
 
 	wireWxshop(r, deps)
 	for _, prefix := range []string{"/v1/boss", "/v1/admin"} {
@@ -134,6 +146,8 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.GET("/billing/orders/:id", h.GetOrder)
 		boss.GET("/billing/summary/today", h.DailySummaryToday)
 		boss.GET("/billing/summary/:date", h.DailySummary)
+		boss.POST("/billing/orders/pending", h.CreatePendingOrder)
+		boss.POST("/billing/orders/:id/pay", h.SimulatePay)
 	}
 	if deps.Inventory != nil {
 		h := handler.NewInventoryHandler(deps.Inventory)
@@ -148,6 +162,8 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.GET("/membership/members/:id", h.GetMember)
 		boss.POST("/membership/members/:id/code", h.IssueCode)
 		boss.POST("/membership/redeem", h.Redeem)
+		boss.POST("/membership/members/:id/recharge", h.Recharge)
+		boss.POST("/membership/members/:id/region-cap", h.SetRegionCap)
 	}
 	if deps.Marketing != nil {
 		h := handler.NewMarketingHandler(deps.Marketing)
@@ -197,6 +213,21 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		if deps.Attribution != nil {
 			boss.GET("/aiengine/strategies/:id/attribution", h.GetAttribution)
 		}
+	}
+	if deps.Payment != nil {
+		ph := handler.NewPaymentHandler(deps.Payment)
+		boss.POST("/payment/sub-merchants", ph.ApplySubMerchant)
+		boss.GET("/payment/sub-merchants", ph.ListSubMerchants)
+		boss.POST("/payment/sub-merchants/:id/query", ph.QuerySubMerchant)
+		boss.POST("/payment/prepay", ph.Prepay)
+		boss.GET("/payment/payments/:id", ph.GetPayment)
+		boss.GET("/payment/ledger", ph.ListLedger)
+	}
+	if deps.Subscription != nil {
+		sh := handler.NewSubscriptionHandler(deps.Subscription)
+		boss.GET("/subscription", sh.GetSubscription)
+		boss.POST("/subscription", sh.Subscribe)
+		boss.POST("/subscription/check", sh.CheckFeature)
 	}
 }
 

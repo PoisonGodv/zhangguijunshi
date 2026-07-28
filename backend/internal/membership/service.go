@@ -245,3 +245,58 @@ func (s *Service) Redeem(ctx context.Context, in RedeemInput) (*RedeemResult, er
 	}
 	return res, nil
 }
+
+// Recharge books a stored-value top-up (M4-S1 BE-B-12). The fund flow is
+// settled by WeChat Pay directly to the sub-merchant (反二清: the platform never
+// holds the money); this method only credits the book balance + gift and
+// appends the recharge audit log. The gift is computed internally from the
+// recharge-tier schedule (GiftForAmount) — it is NEVER trusted from the caller.
+//
+// Steps: EnforceTenant; amountCents>0 (else errcode.ErrParam); member exists
+// (ErrNotFound incl. cross-tenant) and is active (else ErrMemberBlocked);
+// rechargeAtomic enforces the regional per-card cap (breach →
+// errcode.ErrBalanceOver, balance unchanged) and credits amount+gift.
+func (s *Service) Recharge(ctx context.Context, in RechargeInput) (*RechargeResult, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if in.AmountCents <= 0 {
+		return nil, errcode.ErrParam
+	}
+
+	// The member must belong to THIS tenant and be active.
+	m, err := s.repo.GetMember(ctx, tenantID, in.MemberID)
+	if err != nil {
+		return nil, err // ErrNotFound (incl. cross-tenant)
+	}
+	if m.Status != memberStatusActive {
+		return nil, ErrMemberBlocked
+	}
+
+	gift := GiftForAmount(in.AmountCents)
+	now := s.now()
+	acc, err := s.repo.rechargeAtomic(tenantID, in.MemberID, now, in.AmountCents, gift, in.RefPaymentID, in.OperatorID)
+	if err != nil {
+		return nil, err // errcode.ErrBalanceOver (cap) / ErrNotFound
+	}
+	return &RechargeResult{
+		MemberID:       in.MemberID,
+		BalanceCents:   acc.BalanceCents,
+		GiftCents:      acc.GiftCents,
+		RechargedCents: in.AmountCents,
+		GiftedCents:    gift,
+	}, nil
+}
+
+// SetRegionCap sets the per-card stored-value ceiling for a member's account
+// (M4-S1 BE-B-12). The main thread seeds it from the tenant's province at
+// onboarding; admin/compliance staff may adjust it later. Cross-tenant or
+// absent account → ErrNotFound.
+func (s *Service) SetRegionCap(ctx context.Context, memberID, regionCapCents int64) error {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return err
+	}
+	return s.repo.UpdateAccountRegionCap(ctx, tenantID, memberID, regionCapCents)
+}

@@ -22,6 +22,7 @@ import (
 const (
 	defaultChannel       = "in_store"
 	defaultPaymentMethod = "cash"
+	orderStatusPending   = "pending" // M4-S1: awaiting async wxpay notify (CreatePendingOrder)
 	orderStatusPaid      = "paid"
 	productStatusActive  = "active"
 	maxTopProducts       = 5
@@ -207,6 +208,154 @@ func (s *Service) CreateOrder(ctx context.Context, in CreateOrderInput) (*Order,
 		}
 	}
 	return created, nil
+}
+
+// CreatePendingOrder builds a PENDING (awaiting-payment) order for the ctx
+// tenant. It reuses CreateOrder's pricing/snapshot logic (per-item
+// ProductPricer lookup, cross-tenant + active guards, total = Σ qty*price) but
+// records the order with Status=pending, PaidCents=0, PaidAt=nil and an empty
+// PaymentRef, so the sale is not yet recognised as revenue.
+//
+// Stock is NOT deducted at the pending stage: an unpaid order must not reserve
+// inventory yet. When the order is later promoted to paid via MarkOrderPaid,
+// FIFO stock is consumed best-effort there (same reconciliation-loose semantics
+// as CreateOrder). This keeps a pending order side-effect-free and cancellable.
+//
+// billing does not import payment; the wxpay out_trade_no is associated later
+// by MarkOrderPaid (CONTRACT §15.3.0/§15.3.3).
+func (s *Service) CreatePendingOrder(ctx context.Context, in CreateOrderInput) (*Order, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(in.Items) == 0 {
+		return nil, errcode.ErrParam
+	}
+
+	now := s.now()
+	items := make([]OrderItem, 0, len(in.Items))
+	var total int64
+	for _, it := range in.Items {
+		if it.Qty <= 0 {
+			return nil, errcode.ErrParam
+		}
+		p, err := s.pricer.GetByID(ctx, tenantID, it.ProductID)
+		if err != nil {
+			return nil, err
+		}
+		// Cross-tenant defence-in-depth: the pricer should already scope to
+		// tenantID, but never trust it blindly.
+		if p.TenantID != tenantID {
+			return nil, errcode.ErrForbidden
+		}
+		if p.Status != productStatusActive {
+			return nil, errcode.ErrParam
+		}
+		items = append(items, OrderItem{
+			ProductID:    p.ID,
+			NameSnapshot: p.Name,
+			Unit:         p.Unit,
+			Qty:          it.Qty,
+			PriceCents:   p.PriceCents,
+			CostCents:    p.CostCents,
+		})
+		total += it.Qty * p.PriceCents
+	}
+
+	channel := in.Channel
+	if channel == "" {
+		channel = defaultChannel
+	}
+	payMethod := in.PaymentMethod
+	if payMethod == "" {
+		payMethod = defaultPaymentMethod
+	}
+
+	storeID := in.StoreID
+	if storeID <= 0 {
+		if mc, ok := multitenancy.FromContext(ctx); ok {
+			storeID = mc.StoreID
+		}
+	}
+
+	order := &Order{
+		TenantID:      tenantID,
+		StoreID:       storeID,
+		MemberID:      in.MemberID,
+		OrderNo:       s.orderNo(tenantID, now),
+		Channel:       channel,
+		Status:        orderStatusPending,
+		TotalCents:    total,
+		PaidCents:     0,
+		DiscountCents: 0,
+		PaymentMethod: payMethod,
+		Items:         items,
+		// PaidAt nil, PaymentRef "" (zero value): a pending order is unpaid.
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if mc, ok := multitenancy.FromContext(ctx); ok {
+		order.OperatorID = mc.UserID
+	}
+
+	created, err := s.repo.Create(ctx, order)
+	if err != nil {
+		return nil, errcode.ErrInternal
+	}
+	// NOTE: no stock deduction here — see MarkOrderPaid.
+	return created, nil
+}
+
+// MarkOrderPaid promotes a PENDING order to PAID, filling PaidCents=TotalCents,
+// PaidAt and PaymentRef (the wxpay out_trade_no; empty for cash). It is the
+// billing-side fulfilment hook invoked by payment.HandleNotify through the main
+// thread's Fulfiller adapter (CONTRACT §15.3.0/§15.7). billing does not import
+// payment — the out_trade_no arrives as a plain string parameter.
+//
+// Transitions:
+//   - pending → paid: record payment fields + best-effort FIFO stock deduction,
+//     return (order, nil).
+//   - paid → paid: idempotent no-op, return (current, nil). A repeat notify for
+//     an already-paid order MUST NOT re-deduct stock or overwrite fields.
+//   - refunded/voided/unknown → (nil, ErrStatusConflict): irreversible past paid.
+//   - cross-tenant / not-found → (nil, ErrNotFound).
+func (s *Service) MarkOrderPaid(ctx context.Context, orderID int64, paymentRef string, paidAt time.Time) (*Order, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	current, err := s.repo.GetByID(ctx, tenantID, orderID)
+	if err != nil {
+		// Cross-tenant reads are indistinguishable from absence (ErrNotFound).
+		return nil, err
+	}
+
+	switch current.Status {
+	case orderStatusPending:
+		updated, err := s.repo.UpdateStatus(ctx, tenantID, orderID, orderStatusPaid, current.TotalCents, &paidAt, paymentRef)
+		if err != nil {
+			return nil, err
+		}
+		// Best-effort FIFO stock deduction now that the order is durably paid.
+		// Same reconciliation-loose semantics as CreateOrder: a shortfall is
+		// logged as a later reconciliation gap, never rejecting the committed
+		// payment. Wired only when a StockConsumer is injected (M1-S2); nil
+		// keeps the no-stock behaviour.
+		if s.stock != nil {
+			for _, it := range updated.Items {
+				_ = s.stock.ConsumeFIFO(ctx, updated.StoreID, it.ProductID, it.Qty, updated.ID)
+			}
+		}
+		return updated, nil
+	case orderStatusPaid:
+		// Idempotent: a duplicate payment notify must not re-deduct stock or
+		// overwrite the recorded PaymentRef. Return the order unchanged.
+		return current, nil
+	default:
+		// refunded / voided / unknown: the order has moved past the payable
+		// state; paying it again is a status conflict, not a not-found.
+		return nil, ErrStatusConflict
+	}
 }
 
 // GetOrder loads one order (with Items) for the ctx tenant.

@@ -22,6 +22,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zhangguijunshi/backend/pkg/errcode"
 )
 
 // defaultListMembersLimit is used when MemberFilter.Limit <= 0.
@@ -377,6 +379,72 @@ func (r *MemoryMemberRepo) redeemAtomic(tenantID, memberID int64, now time.Time,
 	return out, nil
 }
 
+// rechargeAtomic implements MemberRepo (M4-S1 BE-B-12). It runs the whole
+// Recharge critical section under the repo's single write lock: re-load the
+// account, enforce the regional per-card cap (errcode.ErrBalanceOver with NO
+// state changed on breach), credit BalanceCents+=amount + GiftCents+=gift, and
+// append the recharge balance-flow. The fund flow is settled by WeChat Pay
+// directly to the sub-merchant (反二清: the platform never holds the money); this
+// method books the balance only. operatorID is accepted for the audit contract
+// but not yet persisted (the M1-S2 balance-flow row has no operator column).
+func (r *MemoryMemberRepo) rechargeAtomic(tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	accID, ok := r.accountIDByTuple[accountKey(tenantID, memberID)]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	acc := r.accountsByID[accID]
+	if acc == nil || acc.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+
+	// Regional per-card stored-value cap (0 = uncapped). A breach leaves ALL
+	// state untouched (no balance credit, no audit row).
+	if acc.RegionCapCents > 0 && acc.BalanceCents+amountCents+giftCents > acc.RegionCapCents {
+		return nil, errcode.ErrBalanceOver
+	}
+
+	acc.BalanceCents += amountCents
+	acc.GiftCents += giftCents
+	acc.UpdatedAt = now
+	r.balanceLog = append(r.balanceLog, balanceFlow{
+		id:           r.nextLogID.Add(1),
+		tenantID:     tenantID,
+		memberID:     memberID,
+		accountID:    acc.ID,
+		typ:          "recharge",
+		amountCents:  amountCents,
+		balanceAfter: acc.BalanceCents,
+		refOrderID:   refPaymentID,
+		createdAt:    now,
+	})
+	_ = operatorID // reserved for future operator-audit column
+	return cloneAccount(acc), nil
+}
+
+// UpdateAccountRegionCap implements MemberRepo (M4-S1 BE-B-12). It sets
+// RegionCapCents on the (tenantID, memberID) account (admin/compliance; the
+// main thread seeds it from the tenant's province). Cross-tenant or absent
+// account → ErrNotFound (ARCH-01: absence and foreign ownership are
+// indistinguishable).
+func (r *MemoryMemberRepo) UpdateAccountRegionCap(_ context.Context, tenantID, memberID, regionCapCents int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	accID, ok := r.accountIDByTuple[accountKey(tenantID, memberID)]
+	if !ok {
+		return ErrNotFound
+	}
+	acc := r.accountsByID[accID]
+	if acc == nil || acc.TenantID != tenantID {
+		return ErrNotFound
+	}
+	acc.RegionCapCents = regionCapCents
+	return nil
+}
+
 // --- test introspection helpers (not part of MemberRepo) ---
 
 // pointsLogCount reports how many points-flow rows exist for (tenantID,
@@ -433,6 +501,21 @@ func (r *MemoryMemberRepo) lastBalanceAfter(tenantID, memberID int64) (int64, bo
 		}
 	}
 	return 0, false
+}
+
+// lastBalanceFlow returns the typ + amountCents of the most recent balance-flow
+// row for (tenantID, memberID); ok=false when none. Used by Recharge tests to
+// assert a "recharge" row was appended with the credited amount.
+func (r *MemoryMemberRepo) lastBalanceFlow(tenantID, memberID int64) (typ string, amountCents int64, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for i := len(r.balanceLog) - 1; i >= 0; i-- {
+		f := r.balanceLog[i]
+		if f.tenantID == tenantID && f.memberID == memberID {
+			return f.typ, f.amountCents, true
+		}
+	}
+	return "", 0, false
 }
 
 // cloneMember returns a deep copy of m (LastVisitAt / Birthday pointers

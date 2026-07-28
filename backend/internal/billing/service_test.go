@@ -570,3 +570,332 @@ func TestRepurchaseMembers_NoTenant(t *testing.T) {
 		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
 	}
 }
+
+// ===== M4-S1 (BE-A-10): pending orders + MarkOrderPaid =====
+
+// paidAt is the deterministic payment moment for MarkOrderPaid tests, kept
+// distinct from fixedNow so we can assert the field was actually written.
+var paidAt = time.Date(2026, 7, 20, 16, 0, 0, 0, time.Local)
+
+// stockCall records one ConsumeFIFO invocation.
+type stockCall struct {
+	storeID, productID, qty, refOrderID int64
+}
+
+// recordingStock is a StockConsumer that records every ConsumeFIFO call so
+// tests can assert whether the pending vs paid path deducted stock (and how
+// many times — idempotency must not double-deduct).
+type recordingStock struct {
+	calls []stockCall
+}
+
+func (r *recordingStock) ConsumeFIFO(_ context.Context, storeID, productID, qty, refOrderID int64) error {
+	r.calls = append(r.calls, stockCall{storeID, productID, qty, refOrderID})
+	return nil
+}
+
+// newServiceWithStock is newService plus a wired StockConsumer.
+func newServiceWithStock(pricer ProductPricer, stock StockConsumer) (*Service, *MemoryOrderRepo) {
+	repo := NewMemoryOrderRepo()
+	svc := New(repo, pricer,
+		WithNowFunc(func() time.Time { return fixedNow }),
+		WithOrderNoFunc(func(tenantID int64, now time.Time) string {
+			return "ZG-TEST-" + now.Format("20060102")
+		}),
+		WithStockConsumer(stock),
+	)
+	return svc, repo
+}
+
+func TestCreatePendingOrder_Success(t *testing.T) {
+	pricer := &fakePricer{byID: map[int64]*PricedProduct{
+		1: activeProduct(1, 100, 10, "可乐", "瓶", 300, 200),
+		2: activeProduct(2, 100, 10, "薯片", "包", 500, 350),
+	}}
+	svc, _ := newService(pricer)
+
+	order, err := svc.CreatePendingOrder(ctxFor(100, 10, 7), CreateOrderInput{
+		StoreID: 10,
+		Items: []CreateOrderItem{
+			{ProductID: 1, Qty: 2},
+			{ProductID: 2, Qty: 3},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingOrder: %v", err)
+	}
+
+	// total = 2*300 + 3*500 = 2100, but unpaid.
+	if order.TotalCents != 2100 {
+		t.Errorf("TotalCents = %d, want 2100", order.TotalCents)
+	}
+	if order.PaidCents != 0 || order.DiscountCents != 0 {
+		t.Errorf("Paid/Discount = %d/%d, want 0/0 (pending is unpaid)", order.PaidCents, order.DiscountCents)
+	}
+	if order.Status != orderStatusPending {
+		t.Errorf("Status = %q, want pending", order.Status)
+	}
+	if order.PaidAt != nil {
+		t.Errorf("PaidAt = %v, want nil for pending", order.PaidAt)
+	}
+	if order.PaymentRef != "" {
+		t.Errorf("PaymentRef = %q, want empty for pending", order.PaymentRef)
+	}
+	if order.TenantID != 100 || order.StoreID != 10 || order.OperatorID != 7 {
+		t.Errorf("tenant/store/operator = %d/%d/%d", order.TenantID, order.StoreID, order.OperatorID)
+	}
+	// Snapshot fidelity preserved (same as CreateOrder).
+	if len(order.Items) != 2 || order.Items[0].PriceCents != 300 || order.Items[0].CostCents != 200 {
+		t.Errorf("items snapshot wrong: %+v", order.Items)
+	}
+}
+
+func TestCreatePendingOrder_StockNotDeducted(t *testing.T) {
+	pricer := &fakePricer{byID: map[int64]*PricedProduct{
+		1: activeProduct(1, 100, 10, "可乐", "瓶", 300, 200),
+	}}
+	stock := &recordingStock{}
+	svc, _ := newServiceWithStock(pricer, stock)
+
+	pending, err := svc.CreatePendingOrder(ctxFor(100, 10, 7), CreateOrderInput{
+		StoreID: 10,
+		Items:   []CreateOrderItem{{ProductID: 1, Qty: 2}},
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingOrder: %v", err)
+	}
+	// A pending order must NOT reserve inventory.
+	if len(stock.calls) != 0 {
+		t.Errorf("pending stage deducted stock %d times, want 0", len(stock.calls))
+	}
+
+	// Promoting to paid deducts exactly once per line.
+	if _, err := svc.MarkOrderPaid(ctxFor(100, 10, 7), pending.ID, "wxpay-OTN-1", paidAt); err != nil {
+		t.Fatalf("MarkOrderPaid: %v", err)
+	}
+	if len(stock.calls) != 1 {
+		t.Fatalf("paid stage stock calls = %d, want 1", len(stock.calls))
+	}
+	c := stock.calls[0]
+	if c.productID != 1 || c.qty != 2 || c.refOrderID != pending.ID || c.storeID != 10 {
+		t.Errorf("stock call = %+v, want {product 1 qty 2 order %d store 10}", c, pending.ID)
+	}
+}
+
+func TestMarkOrderPaid_PendingToPaid(t *testing.T) {
+	pricer := &fakePricer{byID: map[int64]*PricedProduct{
+		1: activeProduct(1, 100, 10, "可乐", "瓶", 300, 200),
+	}}
+	svc, _ := newService(pricer)
+
+	pending, err := svc.CreatePendingOrder(ctxFor(100, 10, 7), CreateOrderInput{
+		StoreID: 10,
+		Items:   []CreateOrderItem{{ProductID: 1, Qty: 2}}, // total 600
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingOrder: %v", err)
+	}
+
+	got, err := svc.MarkOrderPaid(ctxFor(100, 10, 7), pending.ID, "wxpay-OTN-9", paidAt)
+	if err != nil {
+		t.Fatalf("MarkOrderPaid: %v", err)
+	}
+	if got.Status != orderStatusPaid {
+		t.Errorf("Status = %q, want paid", got.Status)
+	}
+	if got.PaidCents != got.TotalCents || got.PaidCents != 600 {
+		t.Errorf("PaidCents = %d, want total 600", got.PaidCents)
+	}
+	if got.PaymentRef != "wxpay-OTN-9" {
+		t.Errorf("PaymentRef = %q, want wxpay-OTN-9", got.PaymentRef)
+	}
+	if got.PaidAt == nil || !got.PaidAt.Equal(paidAt) {
+		t.Errorf("PaidAt = %v, want %v", got.PaidAt, paidAt)
+	}
+
+	// Persisted: a fresh GetOrder observes the paid state.
+	reloaded, err := svc.GetOrder(ctxFor(100, 10, 7), pending.ID)
+	if err != nil {
+		t.Fatalf("GetOrder: %v", err)
+	}
+	if reloaded.Status != orderStatusPaid || reloaded.PaymentRef != "wxpay-OTN-9" || reloaded.PaidCents != 600 {
+		t.Errorf("persisted order wrong: %+v", reloaded)
+	}
+}
+
+func TestMarkOrderPaid_Idempotent(t *testing.T) {
+	pricer := &fakePricer{byID: map[int64]*PricedProduct{
+		1: activeProduct(1, 100, 10, "可乐", "瓶", 300, 200),
+	}}
+	stock := &recordingStock{}
+	svc, _ := newServiceWithStock(pricer, stock)
+
+	pending, err := svc.CreatePendingOrder(ctxFor(100, 10, 7), CreateOrderInput{
+		StoreID: 10,
+		Items:   []CreateOrderItem{{ProductID: 1, Qty: 1}},
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingOrder: %v", err)
+	}
+
+	first, err := svc.MarkOrderPaid(ctxFor(100, 10, 7), pending.ID, "ref-A", paidAt)
+	if err != nil {
+		t.Fatalf("first MarkOrderPaid: %v", err)
+	}
+
+	// A duplicate notify arrives with a different ref/time. It must be a no-op:
+	// no error, no stock re-deduction, no PaymentRef overwrite.
+	laterPaidAt := paidAt.Add(time.Hour)
+	second, err := svc.MarkOrderPaid(ctxFor(100, 10, 7), pending.ID, "ref-B", laterPaidAt)
+	if err != nil {
+		t.Fatalf("second (idempotent) MarkOrderPaid: %v, want nil", err)
+	}
+	if second.Status != orderStatusPaid {
+		t.Errorf("second status = %q, want paid", second.Status)
+	}
+	if second.PaymentRef != "ref-A" {
+		t.Errorf("second PaymentRef = %q, want ref-A (must not be overwritten)", second.PaymentRef)
+	}
+	if second.PaidAt == nil || !second.PaidAt.Equal(paidAt) {
+		t.Errorf("second PaidAt = %v, want original %v (must not be overwritten)", second.PaidAt, paidAt)
+	}
+	if len(stock.calls) != 1 {
+		t.Errorf("stock calls = %d after duplicate notify, want 1 (no re-deduction)", len(stock.calls))
+	}
+	// Idempotent return value equals the first committed state.
+	if first.PaymentRef != second.PaymentRef || first.PaidCents != second.PaidCents {
+		t.Errorf("idempotent return diverged: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestMarkOrderPaid_StatusConflict(t *testing.T) {
+	pricer := &fakePricer{byID: map[int64]*PricedProduct{
+		1: activeProduct(1, 100, 10, "可乐", "瓶", 300, 200),
+	}}
+	svc, repo := newService(pricer)
+
+	for _, status := range []string{"refunded", "voided", "weird-unknown"} {
+		// Seed an order already past the payable state directly in the repo.
+		seeded := &Order{
+			TenantID:   100,
+			StoreID:    10,
+			Status:     status,
+			TotalCents: 500,
+			PaidCents:  500,
+			Items:      []OrderItem{{ProductID: 1, Qty: 1, PriceCents: 500, CostCents: 200}},
+		}
+		created, err := repo.Create(context.Background(), seeded)
+		if err != nil {
+			t.Fatalf("seed %q: %v", status, err)
+		}
+		_, err = svc.MarkOrderPaid(ctxFor(100, 10, 7), created.ID, "ref", paidAt)
+		if !errors.Is(err, ErrStatusConflict) {
+			t.Errorf("status=%q err = %v, want ErrStatusConflict", status, err)
+		}
+		// State must be untouched on conflict.
+		got, err := svc.GetOrder(ctxFor(100, 10, 7), created.ID)
+		if err != nil {
+			t.Fatalf("GetOrder: %v", err)
+		}
+		if got.Status != status {
+			t.Errorf("status=%q was mutated to %q", status, got.Status)
+		}
+	}
+}
+
+func TestMarkOrderPaid_CrossTenantAndNotFound(t *testing.T) {
+	pricer := &fakePricer{byID: map[int64]*PricedProduct{
+		1: activeProduct(1, 100, 10, "可乐", "瓶", 300, 200),
+	}}
+	svc, _ := newService(pricer)
+
+	pending, err := svc.CreatePendingOrder(ctxFor(100, 10, 7), CreateOrderInput{
+		StoreID: 10,
+		Items:   []CreateOrderItem{{ProductID: 1, Qty: 1}},
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingOrder: %v", err)
+	}
+
+	// Tenant B cannot pay tenant A's order — indistinguishable from absence.
+	_, err = svc.MarkOrderPaid(ctxFor(200, 20, 8), pending.ID, "ref", paidAt)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-tenant err = %v, want ErrNotFound", err)
+	}
+	// Tenant A's order is still pending (the cross-tenant call changed nothing).
+	got, err := svc.GetOrder(ctxFor(100, 10, 7), pending.ID)
+	if err != nil {
+		t.Fatalf("GetOrder: %v", err)
+	}
+	if got.Status != orderStatusPending {
+		t.Errorf("after cross-tenant attempt, status = %q, want pending", got.Status)
+	}
+
+	// A non-existent id is also ErrNotFound (not a panic / not conflict).
+	_, err = svc.MarkOrderPaid(ctxFor(100, 10, 7), 999999, "ref", paidAt)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing id err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMarkOrderPaid_NoTenant(t *testing.T) {
+	svc, _ := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	_, err := svc.MarkOrderPaid(context.Background(), 5001, "ref", paidAt)
+	if !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
+	}
+}
+
+// TestUpdateStatus_Repo exercises the repo method directly: paid fields are
+// filled on status=paid, untouched on other statuses, and cross-tenant ids are
+// rejected (ARCH-01 row isolation).
+func TestUpdateStatus_Repo(t *testing.T) {
+	repo := NewMemoryOrderRepo()
+	pending := &Order{
+		TenantID:   100,
+		StoreID:    10,
+		Status:     orderStatusPending,
+		TotalCents: 800,
+		Items:      []OrderItem{{ProductID: 1, Qty: 2, PriceCents: 400, CostCents: 150}},
+	}
+	created, err := repo.Create(context.Background(), pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// pending → paid fills payment fields + bumps UpdatedAt to paidAt.
+	upd, err := repo.UpdateStatus(context.Background(), 100, created.ID, orderStatusPaid, 800, &paidAt, "OTN-1")
+	if err != nil {
+		t.Fatalf("UpdateStatus paid: %v", err)
+	}
+	if upd.Status != orderStatusPaid || upd.PaidCents != 800 || upd.PaymentRef != "OTN-1" {
+		t.Errorf("paid update wrong: %+v", upd)
+	}
+	if upd.PaidAt == nil || !upd.PaidAt.Equal(paidAt) || !upd.UpdatedAt.Equal(paidAt) {
+		t.Errorf("PaidAt/UpdatedAt = %v/%v, want %v", upd.PaidAt, upd.UpdatedAt, paidAt)
+	}
+
+	// Cross-tenant UpdateStatus is rejected; the paid record is unchanged.
+	if _, err := repo.UpdateStatus(context.Background(), 200, created.ID, orderStatusPaid, 1, &paidAt, "hack"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant err = %v, want ErrNotFound", err)
+	}
+	got, err := repo.GetByID(context.Background(), 100, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PaymentRef != "OTN-1" || got.PaidCents != 800 {
+		t.Errorf("cross-tenant attempt mutated record: %+v", got)
+	}
+
+	// A non-paid target status must NOT touch the payment fields.
+	voided, err := repo.UpdateStatus(context.Background(), 100, created.ID, "voided", 0, nil, "")
+	if err != nil {
+		t.Fatalf("UpdateStatus voided: %v", err)
+	}
+	if voided.Status != "voided" {
+		t.Errorf("status = %q, want voided", voided.Status)
+	}
+	if voided.PaidCents != 800 || voided.PaymentRef != "OTN-1" || voided.PaidAt == nil {
+		t.Errorf("non-paid target cleared payment fields: %+v", voided)
+	}
+}

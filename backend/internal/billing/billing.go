@@ -32,8 +32,10 @@ type OrderItem struct {
 }
 
 // Order is a checkout record. M1-S1 only ever creates Status=paid orders
-// (paid == total, discount == 0); the other statuses exist for the schema and
-// later refund/void flows.
+// (paid == total, discount == 0); M4-S1 adds the pending state via
+// CreatePendingOrder + MarkOrderPaid so an order can await an async wxpay
+// notify before becoming paid. refunded/voided exist for the schema and later
+// refund/void flows.
 type Order struct {
 	ID, TenantID, StoreID, MemberID      int64 // MemberID 可 0(散客)
 	OrderNo                              string
@@ -45,11 +47,19 @@ type Order struct {
 	Items                                []OrderItem
 	PaidAt                               *time.Time
 	CreatedAt, UpdatedAt                 time.Time
+	PaymentRef                           string `json:"payment_ref,omitempty"` // 关联支付单 out_trade_no (M4-S1 pending→paid 推进时填; 现金单空)
 }
 
 // ErrNotFound is returned when no order matches (including cross-tenant reads,
 // which are indistinguishable from absence).
 var ErrNotFound = errors.New("billing: order not found")
+
+// ErrStatusConflict is returned when an order's status cannot transition to the
+// requested state — notably MarkOrderPaid on a refunded/voided/unknown order, or
+// re-paying an order that has moved past the payable state. The pending→paid and
+// paid→paid (idempotent) transitions are the only valid ones through
+// MarkOrderPaid; the state machine is irreversible past paid (CONTRACT §15.5.5).
+var ErrStatusConflict = errors.New("billing: order status conflict")
 
 // OrderRepo persists orders. The real implementation will be pgx-backed
 // (orders/order_items tables with tenant_id row isolation); an in-memory
@@ -79,6 +89,15 @@ type OrderRepo interface {
 	// ends) within tenantID. Empty memberIDs or since.After(until) returns
 	// 0 with nil error. Cross-tenant orders are excluded.
 	RepurchaseMembers(ctx context.Context, tenantID int64, memberIDs []int64, since, until time.Time) (int, error)
+
+	// UpdateStatus transitions an order's status and, when the target status
+	// is "paid", fills the payment fields (paidCents, paidAt, paymentRef).
+	// For any other target status the payment fields are left untouched
+	// (callers pass zero values). tenantID is injected (ARCH-01): a
+	// cross-tenant or absent id returns ErrNotFound. Returns the updated
+	// order (with Items). M4-S1 BE-A-10: the pending→paid promotion driven
+	// by MarkOrderPaid.
+	UpdateStatus(ctx context.Context, tenantID, id int64, status string, paidCents int64, paidAt *time.Time, paymentRef string) (*Order, error)
 }
 
 // PricedProduct is billing's minimal anti-corruption mirror of a catalog

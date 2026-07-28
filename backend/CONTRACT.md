@@ -2370,3 +2370,681 @@ M3-S3 收尾三项遗留已交付（集成核心 + 主线程收尾）：
 **moments_engage 仍延后**：本期不产出（无企微朋友圈互动 API 数据源；`exec.execMomentsPost` 当前只 audit 不实发）。归因 `Computer` 不 emit `MetricMomentsEngage`，看板 `revenue_cny` 同款 best-effort 逻辑对其不适用（无触达会员集），看板字段 null。CONTRACT §14.3.1 `MetricMomentsEngage` 注释仍标"本期不产出(无企微互动数据源, 延后 M4)"。延后项见 §14.8。
 
 **best-effort 语义**：repurchase/revenue_cny/groupbuy_success 三项均为 best-effort —— 端口未 wired（dev 最小 fixture）、strategyID<=0、无触达会员、无已付订单、上游 error 任一发生 → 对应 metric/字段省略（JSON null），不 panic、不串租、不误导看板（boss 见"—"）。归因窗口口径：repurchase = `[executedAt, measuredAt]`（Computer 调用方 pregene cron 传入）；revenue_cny = `[item.ExecutedAt, now]`（handler 用请求时刻 now）。真实 PG/Redis 接入与 pgx repo 的 `ListByStrategy/OrderTotalByMembers/RepurchaseMembers` 实装为 M4 落地项（本期 Memory 双实现）。
+
+---
+
+## 15. M4-S1 增量契约（WX-07 微信支付服务商 + BE-A-10 支付回调幂等 + BE-B-12 储值充值反二清 + BE-B-13 订阅付费墙 + DB-06，2026-07-28）
+
+M4-S1 是「商业化」sprint。**两个全新 Go 包**（`internal/payment`、`internal/subscription`，当前为空 .gitkeep）+ **两个已有包加性扩展**（`internal/billing`、`internal/membership`），互斥，跨包只走声明接口（无环）。本机无 wx appid/无支付商户号/无 PG → 沿用「接口 + 内存实现 + Fake/mock 测试」原则：微信支付 V3 走自声明反腐端口（dev FakeWxPay 确定性实现），签名/验签是确定性纯函数（真实可测），HTTP 调用降级。`go build ./... && go test -race ./...` 全绿不连任何真实外部依赖。
+
+### 15.1 范围与裁剪（对照 ch05 §5.3.3 / §5.3.7 / ch03 §3.x / ch00 WBS §M4-S1）
+
+- **payment（WX-07 + BE-A-10 + DB-06 payment 部分）**：特约商户进件（sub_merchants）+ 支付单（payments）+ 支付流水（payment_ledger，反二清审计）+ 微信支付 V3 三反腐端口（进件 Apply / 统一下单 Prepay / 回调验签 ParseNotify）+ FakeWxPay（dev）+ V3 签名/验签纯函数。回调幂等（UNIQUE 交易号 + 状态机 pending→success 不可逆 + 重复回调不重入账不重履约）。
+- **subscription（BE-B-13 + DB-06 subscription 部分）**：订阅三层（free/pro/flagship）功能矩阵 + 付费墙门禁（Can/Require）+ 订阅状态（subscriptions 表）。tenants.plan 字段已存（000001）但全代码无读取，本期 subscription 自带 SubscriptionStore（内存 dev + subscriptions 表生产），主线程种默认 free。
+- **billing 扩展（BE-A-10 订单状态推进）**：Order 状态机加 pending（现仅创建 paid）+ CreatePendingOrder + MarkOrderPaid（pending→paid 幂等推进，关联 PaymentRef）。**加性扩展，现有 CreateOrder/测试不破**。
+- **membership 扩展（BE-B-12 储值充值 + 地区合规）**：Recharge（反二清记账：余额入账 + recharge 流水）+ BalanceAccount 加 RegionCapCents 字段 + 地区单卡余额上限校验（超额→errcode.ErrBalanceOver 60003）+ rechargeAtomic repo 原子方法 + 储值档位规则（充200送20/充500送80，in-code seed）。**加性扩展，现有 Join/Redeem/测试不破**。
+
+**裁剪（对照 ch03/ch05/ch06）**：
+- ch05 §5.3.3 `payment_ledger` 原设计**按月分区**（PARTITION BY RANGE created_at）+ UNIQUE 含 created_at → **本期不分区**（单机/dev），UNIQUE 简化为 `(tenant_id, provider, provider_tx_id)`（同一微信交易号全局唯一，幂等核心）。分区延后生产部署。
+- ch05 `reconciliation_diffs`（对账差异表）**本期不建**（M4-S2 BE-A-11 供应商/外卖对账）。
+- 支付宝 ISV（WX-01 支付宝侧）**本期不实现**（provider=alipay 留接口位，FakeWxPay 只实装 wxpay；alipay 进件/下单延后 M4-S2/生产）。
+- 微信支付 V3 **真实 HTTP 调用降级**：`SubMerchantApplier/Preparer/NotifyParser` 是接口，FakeWxPay 给确定性返回（dev/测试）；真实 V3 实现（调 api.mch.weixin.qq.com）可写但本机不连，签名/验签纯函数真实可测。平台证书下载/轮换延后生产。
+- 储值**资金流与入账分离**（反二清）：充值 = payment 创建 recharge 支付单（资金经微信直清特约商户 sub_merchant，**不沉淀平台**）→ 回调 success → membership.Recharge 入账（BalanceAccount += amount+gift）。平台不持有资金，payment_ledger 仅审计记账。
+- 储值赠送（gift）**由 membership 内部档位规则算**（RechargeTier：amount→gift 映射 in-code seed），payment/Fulfiller 只传 amountCents。计划书 §7.4「充200送20、充500送80送鸡蛋」。
+- 订阅价格**本期 in-code 映射**（pro=3900 月/flagship=9900 月，待核实计划书 §8.1 L2=39元月）；微信支付订阅收款走 payment(Subject=subscription)→ConfirmPayment 激活。
+- 「不做交易抽成」（计划书 §8.1）→ payment 域**无平台抽佣逻辑**，仅服务商模式（特约商户进件 + 微信支付分润由微信侧结算，平台不碰资金）。
+- WX-01 微信支付服务商**资质申请**（行政）不在本期；本期代码就绪，资质到位后配置 mchid/apikey 即可上线。
+
+### 15.2 迁移编号（DB-06）
+
+WBS §M4-S1 写的「000007 payment / 000004 membership」编号**已过期**（000007=ai_strategy、000004=membership 已用）。本期新增 **000012 + 000013**：
+
+- **A1 payment 拥有** `migrations/000012_payment_submerchant.{up,down}.sql`（sub_merchants + payments + payment_ledger 三表）：
+```sql
+-- 000012_payment_submerchant.up.sql
+-- 支付服务商进件 + 支付单 + 支付流水(反二清审计) (M4-S1, WX-07/BE-A-10). 依据 ch05 §5.3.3/§5.3.7.
+-- 本期不分区(payment_ledger 生产部署时按 created_at 月分区, 见 §15.8).
+
+-- 特约商户(子商户)进件记录
+CREATE TABLE sub_merchants (
+    id           BIGSERIAL    PRIMARY KEY,
+    tenant_id    BIGINT       NOT NULL REFERENCES tenants(id),
+    store_id     BIGINT       NOT NULL REFERENCES stores(id),
+    provider     TEXT         NOT NULL,                         -- wxpay|alipay
+    sub_mch_id   TEXT,                                          -- 进件成功后的特约商户号
+    applyment_id TEXT,                                          -- 微信申请单号
+    status       TEXT         NOT NULL DEFAULT 'pending'        -- pending|reviewing|active|rejected|frozen
+                 CHECK (status IN ('pending','reviewing','active','rejected','frozen')),
+    rate_bps     INT,                                            -- 费率基点 38=0.38%
+    materials    JSONB,                                          -- 进件材料快照(脱敏)
+    applied_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    approved_at  TIMESTAMPTZ,
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX uniq_submch_provider_mchid ON sub_merchants(tenant_id, provider, sub_mch_id) WHERE sub_mch_id IS NOT NULL;
+CREATE INDEX idx_submch_tenant_status ON sub_merchants(tenant_id, status);
+COMMENT ON TABLE sub_merchants IS '特约商户进件(M4-S1); 服务商模式批量进件; sub_mch_id NULL=未进件成功';
+
+-- 支付单(业务侧; 状态机 pending→success)
+CREATE TABLE payments (
+    id             BIGSERIAL    PRIMARY KEY,
+    tenant_id      BIGINT       NOT NULL REFERENCES tenants(id),
+    store_id       BIGINT       NOT NULL REFERENCES stores(id),
+    sub_merchant_id BIGINT      NOT NULL,                        -- 清算到的特约商户(反二清)
+    out_trade_no   TEXT         NOT NULL,                        -- 商户订单号(业务侧生成, UNIQUE)
+    provider       TEXT         NOT NULL,                        -- wxpay|alipay
+    provider_tx_id TEXT,                                         -- 微信/支付宝交易号(回调填, 对账键)
+    subject        TEXT         NOT NULL,                        -- order|recharge|subscription (履约分发)
+    ref_id         BIGINT,                                       -- 按 subject 解释: orderID/memberID/0(subscription)
+    amount_cents   BIGINT       NOT NULL,
+    type           TEXT         NOT NULL DEFAULT 'pay'           -- pay|refund
+                 CHECK (type IN ('pay','refund')),
+    status         TEXT         NOT NULL DEFAULT 'pending'       -- pending|success|failed|refunded
+                 CHECK (status IN ('pending','success','failed','refunded')),
+    paid_at        TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, out_trade_no)
+);
+CREATE INDEX idx_payments_tenant_status ON payments(tenant_id, status);
+CREATE INDEX idx_payments_txid ON payments(tenant_id, provider, provider_tx_id) WHERE provider_tx_id IS NOT NULL;
+COMMENT ON COLUMN payments.subject IS '履约分发键: order→billing.MarkOrderPaid, recharge→membership.Recharge, subscription→subscription.ConfirmPayment';
+
+-- 支付流水(反二清审计; 禁软删; UNIQUE 交易号=回调幂等核心)
+CREATE TABLE payment_ledger (
+    id             BIGSERIAL    PRIMARY KEY,
+    tenant_id      BIGINT       NOT NULL REFERENCES tenants(id),
+    store_id       BIGINT       NOT NULL REFERENCES stores(id),
+    sub_merchant_id BIGINT      NOT NULL,
+    order_id       BIGINT,                                       -- 可 0(非订单支付)
+    provider       TEXT         NOT NULL,
+    provider_tx_id TEXT,
+    amount_cents   BIGINT       NOT NULL,
+    fee_cents      BIGINT       NOT NULL DEFAULT 0,              -- 手续费
+    type           TEXT         NOT NULL CHECK (type IN ('pay','refund')),
+    status         TEXT         NOT NULL CHECK (status IN ('success','pending','failed','refunded')),
+    raw_payload    JSONB,                                        -- 回调原始报文(审计)
+    paid_at        TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, provider, provider_tx_id)                 -- 同一交易号全局唯一=幂等
+);
+CREATE INDEX idx_ledger_tenant_created ON payment_ledger(tenant_id, created_at);
+COMMENT ON TABLE payment_ledger IS '支付流水(M4-S1); 反二清: 仅审计记账, 资金经微信直清特约商户, 不沉淀平台';
+-- trg_set_updated_at 挂 sub_merchants/payments (有 updated_at); payment_ledger 无 updated_at 不挂。
+-- down: DROP TABLE payment_ledger; DROP TABLE payments; DROP TABLE sub_merchants;
+```
+
+- **A2 subscription 拥有** `migrations/000013_subscription.{up,down}.sql`（subscriptions 订阅流水 + 当前态）：
+```sql
+-- 000013_subscription.up.sql
+-- 订阅状态与流水(M4-S1, BE-B-13). tenants.plan(000001)是冗余快照, 本表是权威流水.
+CREATE TABLE subscriptions (
+    id              BIGSERIAL    PRIMARY KEY,
+    tenant_id       BIGINT       NOT NULL REFERENCES tenants(id),
+    plan            TEXT         NOT NULL                        -- free|pro|flagship
+                    CHECK (plan IN ('free','pro','flagship')),
+    period_started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    period_ends_at  TIMESTAMPTZ,                                  -- NULL=永久(仅 free)
+    status          TEXT         NOT NULL DEFAULT 'active'       -- active|expired|cancelled
+                    CHECK (status IN ('active','expired','cancelled')),
+    source          TEXT         NOT NULL DEFAULT 'manual'       -- manual|wxpay|alipay|admin
+                    CHECK (source IN ('manual','wxpay','alipay','admin')),
+    payment_ref     TEXT,                                         -- 关联支付单 out_trade_no(可选)
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_subscriptions_tenant ON subscriptions(tenant_id, status);
+-- 每租户至多一条 active 订阅(切换 plan 时旧记录置 cancelled)
+CREATE UNIQUE INDEX uniq_subscriptions_active_one ON subscriptions(tenant_id) WHERE status='active';
+COMMENT ON TABLE subscriptions IS '订阅流水(M4-S1); 三层蛋糕 L1 free/L2 pro 39元月/L3 flagship; UNIQUE active 保证单租户单有效订阅';
+-- 挂 trg_set_updated_at; down: DROP TABLE subscriptions;
+```
+
+### 15.3 领域类型与接口（**已固定，agent 必须一字不差实现签名**）
+
+#### 15.3.0 包依赖 DAG（**无环，跨包只走声明接口**）
+```
+payment       → (无 internal 依赖; SubMerchantApplier/Preparer/NotifyParser/Fulfiller 自声明, 主线程适配)
+subscription  → (无 internal 依赖; 自带 SubscriptionStore 内存实现)
+billing       → (无新 internal 依赖; 现有 + MarkOrderPaid 加性扩展, 不 import payment)
+membership    → (无新 internal 依赖; 现有 + Recharge 加性扩展, 不 import payment)
+handler/main  → payment + subscription + billing + membership (主线程集成, 写 Fulfiller/adapter)
+```
+**禁止**：payment 不 import billing/membership/subscription（履约走自声明 `Fulfiller` 端口）；billing/membership 不 import payment（支付单号作 int64/string 参数传入）；subscription 不 import payment。四包两两不互 import（除 stdlib）。
+
+#### 15.3.1 payment 包（A1，新包，零 internal 依赖）
+```go
+package payment // import github.com/zhangguijunshi/backend/internal/payment
+
+import (
+    "context"
+    "errors"
+    "time"
+)
+
+// provider 常量
+const (
+    ProviderWxPay  = "wxpay"
+    ProviderAlipay = "alipay"
+)
+
+// SubMerchantStatus 特约商户进件状态 (sub_merchants.status).
+type SubMerchantStatus string
+const (
+    SubMerchantPending   SubMerchantStatus = "pending"
+    SubMerchantReviewing SubMerchantStatus = "reviewing"
+    SubMerchantActive    SubMerchantStatus = "active"
+    SubMerchantRejected  SubMerchantStatus = "rejected"
+    SubMerchantFrozen    SubMerchantStatus = "frozen"
+)
+
+// SubMerchant 特约商户进件记录 (sub_merchants 表).
+type SubMerchant struct {
+    ID, TenantID, StoreID int64
+    Provider              string             // wxpay|alipay
+    SubMchID              string             // 进件成功后的特约商户号(空=未成功)
+    ApplymentID           string             // 微信申请单号
+    Status                SubMerchantStatus
+    RateBPS               int32              // 费率基点 38=0.38%
+    Materials             map[string]any     // 进件材料快照(脱敏, JSONB)
+    AppliedAt             time.Time
+    ApprovedAt            *time.Time
+    UpdatedAt             time.Time
+}
+
+// PaymentStatus 支付单状态机.
+type PaymentStatus string
+const (
+    PaymentStatusPending  PaymentStatus = "pending"
+    PaymentStatusSuccess  PaymentStatus = "success"
+    PaymentStatusFailed   PaymentStatus = "failed"
+    PaymentStatusRefunded PaymentStatus = "refunded"
+)
+
+// PaymentType.
+type PaymentType string
+const (
+    PaymentTypePay    PaymentType = "pay"
+    PaymentTypeRefund PaymentType = "refund"
+)
+
+// subject 履约分发键 (payments.subject). 决定回调成功后调哪个 Fulfiller.
+const (
+    SubjectOrder       = "order"        // → billing.MarkOrderPaid(RefID=orderID)
+    SubjectRecharge    = "recharge"     // → membership.Recharge(RefID=memberID, AmountCents=实付)
+    SubjectSubscription = "subscription" // → subscription.ConfirmPayment(RefID 忽略, tenantID 从 ctx)
+)
+
+// Payment 一笔支付单 (payments 表).
+type Payment struct {
+    ID, TenantID, StoreID, SubMerchantID int64
+    OutTradeNo   string        // 商户订单号(业务侧生成, UNIQUE per tenant)
+    Provider     string        // wxpay|alipay
+    ProviderTxID string        // 微信交易号(回调填, 对账键)
+    Subject      string        // order|recharge|subscription
+    RefID        int64         // 按 Subject 解释
+    AmountCents  int64
+    Type         PaymentType
+    Status       PaymentStatus
+    PaidAt       *time.Time
+    CreatedAt    time.Time
+    UpdatedAt    time.Time
+}
+
+// PaymentLedger 支付流水 (payment_ledger 表, 反二清审计, 禁软删).
+type PaymentLedger struct {
+    ID, TenantID, StoreID, SubMerchantID int64
+    OrderID      int64         // 可 0
+    Provider     string
+    ProviderTxID string        // UNIQUE(tenant,provider,tx_id) 幂等核心
+    AmountCents  int64
+    FeeCents     int64
+    Type         PaymentType
+    Status       string        // success|pending|failed|refunded
+    RawPayload   []byte        // 回调原始报文(审计, JSONB 序列化)
+    PaidAt       *time.Time
+    CreatedAt    time.Time
+}
+
+// ===== 反腐端口：微信支付 V3 服务商 SDK (主线程适配; dev FakeWxPay) =====
+
+// ApplySubMerchantInput 进件请求参数.
+type ApplySubMerchantInput struct {
+    TenantID, StoreID int64
+    Provider          string // wxpay
+    BusinessName      string
+    LicenseNo         string // 营业执照号
+    LicenseType       string // individual|enterprise
+    ContactName       string
+    ContactPhone      string
+    RateBPS           int32
+}
+
+// SubMerchantApplier 进件端口 → 微信支付 V3 applyment. 真实实现调 api.mch.weixin.qq.com;
+// FakeWxPay 返回确定性 applyment_id + 即时 reviewing 状态(dev/测试).
+type SubMerchantApplier interface {
+    Apply(ctx context.Context, in ApplySubMerchantInput) (applymentID string, err error)
+    Query(ctx context.Context, tenantID int64, applymentID string) (status SubMerchantStatus, subMchID string, err error)
+}
+
+// PrepayInput 统一下单请求.
+type PrepayInput struct {
+    TenantID, StoreID, SubMerchantID int64
+    OutTradeNo  string
+    Subject     string
+    RefID       int64
+    AmountCents int64
+    OpenID      string // 付款方 openid (JSAPI 小程序支付; 空=Native 扫码)
+    Description string
+}
+
+// PrepayResult 统一下单返回 (JSAPI 调起支付参数).
+type PrepayResult struct {
+    PrepayID  string
+    TimeStamp string
+    NonceStr  string
+    Package   string // "prepay_id=xxx"
+    PaySign   string
+    SignType  string // RSA
+}
+
+// Preparer 统一下单端口 → 微信支付 V3 prepay. FakeWxPay 返回确定性 PrepayResult.
+type Preparer interface {
+    Prepay(ctx context.Context, in PrepayInput) (PrepayResult, error)
+}
+
+// NotifyResult 回调验签后的标准化结果.
+type NotifyResult struct {
+    OutTradeNo   string
+    ProviderTxID string
+    AmountCents  int64
+    Status       PaymentStatus // success|failed
+    PaidAt       time.Time
+    RawPayload   []byte
+}
+
+// NotifyParser 回调验签端口 → 微信支付 V3 notify. 验签失败返 ErrSignInvalid.
+// FakeWxPay 从 body JSON 反序列化(不验签); 真实实现 V3 验签+AES-GCM 解密.
+type NotifyParser interface {
+    ParseNotify(ctx context.Context, headers map[string]string, body []byte) (NotifyResult, error)
+}
+
+// Fulfiller 履约端口 (支付 pending→success 后回调业务侧; 主线程写复合 adapter 按 Subject 分发).
+// 仅在状态真推进时调用(重复回调不重履约). nil=不履约(dev/test 安全).
+type Fulfiller interface {
+    Fulfill(ctx context.Context, p *Payment) error
+}
+
+// 哨兵错误. 跨租户=ErrNotFound(ARCH-01).
+var (
+    ErrNotFound            = errors.New("payment: not found")
+    ErrSignInvalid         = errors.New("payment: notify signature invalid")
+    ErrDuplicateOutTradeNo = errors.New("payment: duplicate out_trade_no")
+    ErrSubMerchantNotActive = errors.New("payment: sub-merchant not active")
+    ErrStatusConflict      = errors.New("payment: status conflict") // 非 pending 推进 success
+)
+
+// ===== Repo (各 Memory + PG pgxmock) =====
+
+type SubMerchantRepo interface {
+    Create(ctx context.Context, sm *SubMerchant) (*SubMerchant, error)
+    GetByID(ctx context.Context, tenantID, id int64) (*SubMerchant, error)
+    GetActiveByStore(ctx context.Context, tenantID, storeID int64, provider string) (*SubMerchant, error) // 返 status=active 的; 无→ErrNotFound
+    UpdateStatus(ctx context.Context, tenantID, id int64, status SubMerchantStatus, subMchID string, approvedAt time.Time) error
+    ListByTenant(ctx context.Context, tenantID int64) ([]*SubMerchant, error)
+}
+type MemorySubMerchantRepo struct{ /* map + sync.Mutex, -race 安全 */ }
+func NewMemorySubMerchantRepo() *MemorySubMerchantRepo
+
+type PaymentRepo interface {
+    Create(ctx context.Context, p *Payment) (*Payment, error)
+    GetByID(ctx context.Context, tenantID, id int64) (*Payment, error)
+    GetByOutTradeNo(ctx context.Context, tenantID int64, outTradeNo string) (*Payment, error)
+    // MarkSuccess 幂等推进 pending→success:
+    //   pending → success, 填 ProviderTxID/PaidAt/UpdatedAt, 返 (p, changed=true, nil)
+    //   success → no-op, 返 (p, changed=false, nil)  ← 重复回调幂等, 不重入账
+    //   其它    → (nil, false, ErrStatusConflict)
+    MarkSuccess(ctx context.Context, tenantID, id int64, providerTxID string, paidAt time.Time) (p *Payment, changed bool, err error)
+    UpdateStatus(ctx context.Context, tenantID, id int64, status PaymentStatus) error
+}
+type MemoryPaymentRepo struct{ /* ... */ }
+func NewMemoryPaymentRepo() *MemoryPaymentRepo
+
+type LedgerRepo interface {
+    // Append 幂等写流水: UNIQUE(tenant,provider,provider_tx_id) 已存在→返已存记录(nil error);
+    // provider_tx_id 空→直接写(不去重). 返写入(或已存)的记录.
+    Append(ctx context.Context, l *PaymentLedger) (*PaymentLedger, error)
+    ListByTenant(ctx context.Context, tenantID int64, limit int) ([]*PaymentLedger, error)
+}
+type MemoryLedgerRepo struct{ /* ... */ }
+func NewMemoryLedgerRepo() *MemoryLedgerRepo
+
+// PGRepo 各自窄 Pool 接口 (同 attribution.PGPool 范式, 主线程共用一个 pgxpool).
+// pgxmock 测 ON CONFLICT upsert + SELECT. type-assert 到 queryer 读多行(同 bandit.PGRepo).
+type PGPool interface {
+    QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+    Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+type PGSubMerchantRepo struct{ pool PGPool }
+func NewPGSubMerchantRepo(pool PGPool) *PGSubMerchantRepo
+type PGPaymentRepo struct{ pool PGPool }
+func NewPGPaymentRepo(pool PGPool) *PGPaymentRepo
+type PGLedgerRepo struct{ pool PGPool }
+func NewPGLedgerRepo(pool PGPool) *PGLedgerRepo
+
+// ===== Service =====
+type Service struct { /* smRepo, payRepo, ledgerRepo, applier, preparer, parser, fulfiller, now, outTradeNoFunc */ }
+func NewService(smRepo SubMerchantRepo, payRepo PaymentRepo, ledgerRepo LedgerRepo, opts ...Option) *Service
+type Option func(*Service)
+func WithApplier(a SubMerchantApplier) Option
+func WithPreparer(p Preparer) Option
+func WithNotifyParser(p NotifyParser) Option
+func WithFulfiller(f Fulfiller) Option
+func WithNowFunc(f func() time.Time) Option
+func WithOutTradeNoFunc(f func(tenantID int64, now time.Time) string) Option
+
+// ApplySubMerchant 提交特约商户进件. status=reviewing(Fake 即时)/pending(真实异步). 写库 + 调 applier.
+func (s *Service) ApplySubMerchant(ctx context.Context, in ApplySubMerchantInput) (*SubMerchant, error)
+// QuerySubMerchant 查进件状态回写(成功→active+sub_mch_id+approved_at). applier nil→仅读库.
+func (s *Service) QuerySubMerchant(ctx context.Context, id int64) (*SubMerchant, error)
+// ListSubMerchants 列 ctx 租户特约商户.
+func (s *Service) ListSubMerchants(ctx context.Context) ([]*SubMerchant, error)
+
+// Prepay 建支付单(pending)+ 调统一下单. 需 store 有 active 特约商户(provider 匹配).
+// outTradeNo 唯一(同 outTradeNo 重复→ErrDuplicateOutTradeNo). 返 (payment, prepayResult).
+func (s *Service) Prepay(ctx context.Context, in PrepayInput) (*Payment, *PrepayResult, error)
+// GetPayment 查支付单.
+func (s *Service) GetPayment(ctx context.Context, id int64) (*Payment, error)
+
+// HandleNotify 回调入口(幂等核心):
+//  1. parser.ParseNotify 验签(失败→ErrSignInvalid, 不动库)
+//  2. GetByOutTradeNo 找 payment(未找到→ErrNotFound; 跨租户=不存在)
+//  3. ledgerRepo.Append 幂等写流水(UNIQUE tx_id 去重)
+//  4. payRepo.MarkSuccess 推进 pending→success, 拿 changed 标志
+//  5. changed==true 且 fulfiller!=nil → fulfiller.Fulfill(payment) 履约(失败仅日志 best-effort, 不回滚 payment)
+// 重复回调: 步3 Append 返已存, 步4 changed=false → 不重履约. 返最终 payment.
+func (s *Service) HandleNotify(ctx context.Context, headers map[string]string, body []byte) (*Payment, error)
+
+// ListLedger 读流水(boss 对账看板用).
+func (s *Service) ListLedger(ctx context.Context, limit int) ([]*PaymentLedger, error)
+```
+**V3 签名纯函数**（agent 同包内 `sign.go`，真实可测，不连网）：
+```go
+// SignV3Authorization 构造微信支付 V3 请求签名 Authorization 头 (APIv3).
+// 真实算法: SHA256withRSA(method\nurl\ntimestamp\nnonce\nbody\n) → base64, header "WECHATPAY2-SHA256-RSA2048".
+// 本期实现: 输入确定性 → 输出确定性(用注入私钥 *rsa.PrivateKey); 无私钥→返空串+err(不 panic).
+func SignV3Authorization(method, url, body, nonce string, ts int64, mchID, serial string, priv *rsa.PrivateKey) (string, error)
+// VerifyV3Notify 验签回调: 用微信平台证书公钥验 Authorization 头 + 时间戳偏移±5min.
+// 验签是确定性纯函数(注入 *rsa.PublicKey). 失败返 ErrSignInvalid.
+func VerifyV3Notify(headers map[string]string, body []byte, pub *rsa.PublicKey) error
+```
+**注意**：SignV3/VerifyV3 是 stdlib `crypto/rsa + crypto/sha256 + crypto/x509` 实现，**不引第三方微信 SDK**（白名单 §3 不含）。FakeWxPay 的 ParseNotify 不调 VerifyV3（直接 JSON 反序列化），真实 NotifyParser 实现调 VerifyV3。两者同包，agent 都写。
+
+#### 15.3.2 subscription 包（A2，新包，零 internal 依赖）
+```go
+package subscription // import github.com/zhangguijunshi/backend/internal/subscription
+
+import (
+    "context"
+    "errors"
+    "time"
+)
+
+// plan 常量 (与 tenants.plan CHECK 一致).
+const (
+    PlanFree     = "free"
+    PlanPro      = "pro"      // L2 营销版 39元/月或365元/年
+    PlanFlagship = "flagship" // L3 旗舰版
+)
+
+// 功能常量 (FeatureGate 检查 key; 计划书 §8.1 三层蛋糕功能矩阵).
+const (
+    FeatureAIAdvice       = "ai_advice"        // 今日3件事 (pro+)
+    FeatureMarketingAuto  = "marketing_auto"   // 自动化营销 (pro+)
+    FeatureGroupbuy       = "groupbuy"         // 拼团裂变 (pro+)
+    FeatureGroupSOP       = "group_sop"        // 社群SOP (pro+)
+    FeatureAttributionBI  = "attribution_bi"   // 归因看板 (flagship)
+    FeatureMultiStore     = "multi_store"      // 多店 (flagship)
+    FeatureAdvancedReport = "advanced_report"  // 高级报表 (flagship)
+)
+
+// PlanLevel plan 等级 free=0/pro=1/flagship=2, 用于 >= 比较. 未知→0.
+func PlanLevel(plan string) int
+
+// PlanPriceCents plan 月价(分). pro=3900, flagship=9900, free=0 (in-code, 待核实计划书 §8.1).
+func PlanPriceCents(plan string) int64
+
+// Subscription 租户订阅状态 (subscriptions 表).
+type Subscription struct {
+    ID, TenantID          int64
+    Plan                  string        // free|pro|flagship
+    PeriodStartedAt       time.Time
+    PeriodEndsAt          *time.Time    // nil=永久(仅 free)
+    Status                string        // active|expired|cancelled
+    Source                string        // manual|wxpay|alipay|admin
+    PaymentRef            string        // 关联支付单 out_trade_no
+    CreatedAt, UpdatedAt  time.Time
+}
+
+// ErrPlanUpgradeRequired 功能门禁不通过(需升级 plan).
+var ErrPlanUpgradeRequired = errors.New("subscription: plan upgrade required")
+
+// featureMatrix feature→最低 PlanLevel (free 默认满足不列).
+var featureMatrix = map[string]int{
+    FeatureAIAdvice:       PlanLevel(PlanPro),
+    FeatureMarketingAuto:  PlanLevel(PlanPro),
+    FeatureGroupbuy:       PlanLevel(PlanPro),
+    FeatureGroupSOP:       PlanLevel(PlanPro),
+    FeatureAttributionBI:  PlanLevel(PlanFlagship),
+    FeatureMultiStore:     PlanLevel(PlanFlagship),
+    FeatureAdvancedReport: PlanLevel(PlanFlagship),
+}
+
+// SubscriptionStore 持久化订阅状态. Memory dev/test + PG 生产.
+type SubscriptionStore interface {
+    // CurrentPlan 返租户当前 active 订阅 plan (无记录/expired → free).
+    CurrentPlan(ctx context.Context, tenantID int64) (string, error)
+    // Get 返当前 active 订阅记录 (无→nil, 不报错).
+    Get(ctx context.Context, tenantID int64) (*Subscription, error)
+    // Upsert 激活/续期: 旧 active 置 cancelled, 新建 active 记录. 返新建记录.
+    Upsert(ctx context.Context, sub *Subscription) (*Subscription, error)
+    // ListHistory 订阅流水(全部状态).
+    ListHistory(ctx context.Context, tenantID int64) ([]*Subscription, error)
+}
+type MemoryStore struct{ /* map + sync.Mutex, -race 安全 */ }
+func NewMemoryStore() *MemoryStore
+
+// FeatureGate 功能门禁 (业务侧注入检查; 纯逻辑读 store).
+type FeatureGate struct { /* store */ }
+func NewFeatureGate(store SubscriptionStore) *FeatureGate
+// Can 报告 ctx 租户当前 plan 是否允许 feature. 未知 feature→false. 读 store 失败→false+err.
+func (g *FeatureGate) Can(ctx context.Context, feature string) (bool, error)
+// Require 检查, 不允许→ErrPlanUpgradeRequired.
+func (g *FeatureGate) Require(ctx context.Context, feature string) error
+
+// Service 订阅管理.
+type Service struct { /* store, gate, now */ }
+func NewService(store SubscriptionStore, opts ...Option) *Service
+type Option func(*Service) // WithNowFunc
+// CurrentPlan ctx 租户当前 plan.
+func (s *Service) CurrentPlan(ctx context.Context) (string, error)
+// GetSubscription ctx 租户当前订阅记录.
+func (s *Service) GetSubscription(ctx context.Context) (*Subscription, error)
+// Gate 暴露 FeatureGate 给业务侧(handler/中间件注入检查).
+func (s *Service) Gate() *FeatureGate
+// Subscribe 切换/续期 plan (manual/admin). periodMonths>0 算 PeriodEndsAt; plan=free→PeriodEndsAt=nil.
+func (s *Service) Subscribe(ctx context.Context, in SubscribeInput) (*Subscription, error)
+// ConfirmPayment 支付成功激活订阅 (Fulfiller 适配口): 按 amountCents 映射 plan, source=provider, paymentRef 记录.
+// amountCents 不匹配任一 PlanPriceCents→ErrParam. 返新建 active 订阅.
+func (s *Service) ConfirmPayment(ctx context.Context, tenantID int64, amountCents int64, provider, paymentRef string) (*Subscription, error)
+
+type SubscribeInput struct {
+    Plan          string
+    PeriodMonths  int    // >0 续期; <=0 用默认(pro/flagship=1月, free=永久)
+    Source        string // manual|admin
+    PaymentRef    string
+}
+```
+
+#### 15.3.3 billing 扩展（A3，加性扩展，不 import payment）
+```go
+// 在 billing.Order struct 加字段 (不破坏现有字段顺序):
+//   PaymentRef string `json:"payment_ref,omitempty"` // 关联支付单 out_trade_no (pending→paid 推进时填; 现金单空)
+
+// 新增状态常量 (与 orderStatusPaid 并列):
+const (
+    orderStatusPending = "pending"
+    // orderStatusPaid 已有; refunded/voided 仅 schema, 后续 sprint.
+)
+
+// OrderRepo 加方法 (现有方法签名不动, 现有测试全绿):
+type OrderRepo interface {
+    // ... 现有 6 方法一字不动 ...
+
+    // UpdateStatus 推进订单状态 + 填支付字段(pending→paid 用).
+    //   tenantID 注入(ARCH-01); 跨租户订单→ErrNotFound.
+    //   status=paid 时填 paidCents/paidAt/paymentRef; 其它状态 paid* 传零值不改.
+    //   返更新后的订单(含 Items).
+    UpdateStatus(ctx context.Context, tenantID, id int64, status string, paidCents int64, paidAt *time.Time, paymentRef string) (*Order, error)
+}
+
+// Service 加方法 (现有方法不动):
+// CreatePendingOrder 建待支付订单: total=Σqty*price, paid=0, status=pending, PaymentRef 空.
+//   复用 CreateOrder 的计价/快照/stock 逻辑(stock 在 pending 阶段不扣, MarkOrderPaid 时扣 ——
+//   或简化: pending 不扣 stock, paid 推进时 best-effort 扣, 同 CreateOrder 范式; agent 选其一, 注释说明).
+func (s *Service) CreatePendingOrder(ctx context.Context, in CreateOrderInput) (*Order, error)
+
+// MarkOrderPaid 推进 pending→paid, 填 PaidCents=TotalCents, PaidAt, PaymentRef.
+//   pending → paid, 返 (order, nil)
+//   paid    → 幂等 no-op, 返 (current, nil)  (重复回调安全)
+//   refunded/voided/未知 → (nil, ErrStatusConflict)
+//   跨租户/不存在 → (nil, ErrNotFound)
+func (s *Service) MarkOrderPaid(ctx context.Context, orderID int64, paymentRef string, paidAt time.Time) (*Order, error)
+
+// 新增哨兵 (与 ErrNotFound 并列):
+var ErrStatusConflict = errors.New("billing: order status conflict")
+```
+**注意**：billing 包 A3 agent 拥有整个包，可改 `billing.go`/`service.go`/`memory_repo.go`/`service_test.go`。**现有 CreateOrder/GetOrder/DailySummary/OrderTotalByMembers/RepurchaseMembers 签名与行为一字不动**，现有测试全绿。仅加 Order.PaymentRef 字段 + orderStatusPending 常量 + OrderRepo.UpdateStatus + Service.CreatePendingOrder/MarkOrderPaid + ErrStatusConflict。
+
+#### 15.3.4 membership 扩展（A4，加性扩展，不 import payment）
+```go
+// 在 membership.BalanceAccount struct 加字段 (ch05 §5.3.4 member_balance_accounts.region_cap_cents):
+//   RegionCapCents int64 `json:"region_cap_cents"` // 地区单卡余额上限(0=不限); 上海/江苏等
+
+// 储值档位规则 (in-code seed, 计划书 §7.4 "充200送20、充500送80"): amount→gift.
+var rechargeTiers = []RechargeTier{
+    {AmountCents: 20000, GiftCents: 2000},   // 充200送20
+    {AmountCents: 50000, GiftCents: 8000},   // 充500送80
+    {AmountCents: 100000, GiftCents: 20000}, // 充1000送200
+}
+type RechargeTier struct{ AmountCents, GiftCents int64 }
+// GiftForAmount 返充值 amountCents 对应赠送(无匹配档位→0). 纯函数.
+func GiftForAmount(amountCents int64) int64
+
+// RechargeInput 储值充值请求.
+type RechargeInput struct {
+    MemberID     int64
+    AmountCents  int64  // 实付(资金经微信直清特约商户, 反二清; 平台不持有)
+    RefPaymentID int64  // 关联 payment.ID(反二清审计链路; 可 0=手动)
+    OperatorID   int64
+}
+
+// RechargeResult 充值结果.
+type RechargeResult struct {
+    MemberID       int64
+    BalanceCents   int64 // 入账后实付余额
+    GiftCents      int64 // 入账后赠送余额
+    RechargedCents int64 // 本次实付
+    GiftedCents    int64 // 本次赠送(档位规则算)
+}
+
+// Service 加方法 (现有方法不动):
+// Recharge 储值充值(反二清记账):
+//   - EnforceTenant; member 存在且 active(否则 ErrNotFound/ErrMemberBlocked)
+//   - gift = GiftForAmount(amountCents)
+//   - rechargeAtomic: load account → 校验 balance+amount+gift ≤ RegionCapCents(0=不限; 超→errcode.ErrBalanceOver) → += amount+gift → append recharge log
+//   - 返 RechargeResult
+//   amountCents<=0 → errcode.ErrParam. 不 import payment.
+func (s *Service) Recharge(ctx context.Context, in RechargeInput) (*RechargeResult, error)
+
+// SetRegionCap 设置会员账户地区单卡余额上限(admin/合规; 主线程按租户 province 种入).
+func (s *Service) SetRegionCap(ctx context.Context, memberID, regionCapCents int64) error
+
+// MemberRepo 加方法 (现有方法签名不动):
+type MemberRepo interface {
+    // ... 现有方法一字不动 ...
+
+    // rechargeAtomic 原子入账: load account(不存在→ErrNotFound) → check cap(超→errcode.ErrBalanceOver, 不改状态)
+    //   → BalanceCents+=amount, GiftCents+=gift → UpsertAccount → append recharge log → 返更新后 account.
+    rechargeAtomic(tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error)
+
+    // UpdateAccountRegionCap 设置账户 RegionCapCents(跨租户→no-op 或 ErrNotFound, agent 选后者).
+    UpdateAccountRegionCap(ctx context.Context, tenantID, memberID, regionCapCents int64) error
+}
+```
+**注意**：membership 包 A4 agent 拥有整个包。**现有 Join/GetMember/ListMembers/IssueCode/Redeem + MemberRepo 现有方法 + redeemAtomic 签名一字不动**，现有测试全绿。仅加 BalanceAccount.RegionCapCents 字段 + rechargeTiers/GiftForAmount + Service.Recharge/SetRegionCap + MemberRepo.rechargeAtomic/UpdateAccountRegionCap。memory_repo.go 的 UpsertAccount/GetAccount 实现要读写新 RegionCapCents 字段（默认 0=不限，Join 开零余额账户时 RegionCapCents=0）。
+
+### 15.4 包所有权（文件集互斥，每个 agent 拥有互斥的**包**）
+
+| agent | 拥有（**只准写这些文件**） | 禁动 |
+|---|---|---|
+| **A1 payment** | `internal/payment/*.go`（含 `*_test.go`，新包全建）**+** `migrations/000012_payment_submerchant.up.sql` + `migrations/000012_payment_submerchant.down.sql` | 其它一切 |
+| **A2 subscription** | `internal/subscription/*.go`（含 `*_test.go`，新包全建）**+** `migrations/000013_subscription.up.sql` + `migrations/000013_subscription.down.sql` | 其它一切；不碰 payments/000012 |
+| **A3 billing** | `internal/billing/*.go`（含 `*_test.go`，加性扩展） | migrations/；其它包 |
+| **A4 membership** | `internal/membership/*.go`（含 `*_test.go`，加性扩展） | migrations/；其它包 |
+| **主线程** | `CONTRACT.md` §15 / `cmd/api/main.go` / `cmd/api/payment_adapters.go`(新) / `interfaces/http/router.go` / `interfaces/http/handler/payment.go`(新) / `interfaces/http/handler/subscription.go`(新) / `interfaces/http/handler/billing.go`(加支付端点) / `interfaces/http/handler/membership.go`(加充值端点) / `interfaces/http/m4s1_test.go`(新) / `pkg/errcode/*.go`(加错误码) / `go.mod`(如需) / `configs/config.dev.yaml`(如需) | 四 agent 的包内文件 |
+
+**跨包编译约束**：agent 本地只跑 `go test ./internal/<本包>/...`（**不要** `go build ./...`——集成前整体必编译失败，那是主线程收尾职责）。
+
+### 15.5 硬约束（M4-S1 全员）
+
+1. **签名一字不差**：§15.3 的类型/方法签名是冻结的，主线程集成按此接线。返回 error 不 panic。
+2. **多租户行级隔离**：所有 Repo/Service 方法 EnforceTenant 取 tenantID，跨租户=不存在（ErrNotFound）。agent 测试须含跨租户用例（assert 返 ErrNotFound/零值/false）。
+3. **反二清（命门）**：payment 域**不持有资金**——PaymentLedger 仅审计记账，资金由微信支付直清特约商户 sub_merchant（payments.sub_merchant_id 标记清算方）。平台账户**无余额沉淀**。储值充值资金流经 payment(Subject=recharge) → 微信直清 → membership.Recharge 仅入账（book）。代码中**不得**出现「平台收款」「平台余额」概念。
+4. **回调幂等（命门）**：HandleNotify 重复回调同一 provider_tx_id：① ledger.Append 返已存记录（UNIQUE 去重，不重复入流水）；② MarkSuccess changed=false（不重复推进状态）；③ 不重 Fulfill（不重复发券/扣款/激活）。幂等性必须有用例证明（同一回调调两次，ledger/payment 各一条，履约一次）。
+5. **状态机不可逆**：payment pending→success 单向；order pending→paid 单向；已 success/paid 的重复推进返 changed=false/幂等 nil，非 refunded→paid 等逆推进返 ErrStatusConflict。
+6. **反腐端口**：payment 不 import billing/membership/subscription（Fulfiller 自声明）；billing/membership 不 import payment（支付单号作参数）；subscription 不 import payment。四包两两不互 import（无环，§15.3.0）。
+7. **双实现**：payment 三 Repo + subscription Store 均 Memory（dev/test）+ PG（pgxmock 测，生产配 PG）。pgxmock 用 `github.com/pashagolub/pgxmock/v4`（白名单 §3）。PGRepo 窄 Pool 接口（同 attribution/bandit 范式，type-assert queryer 读多行）。
+8. **V3 签名纯函数**：SignV3Authorization/VerifyV3Notify 用 stdlib crypto（rsa/sha256/x509），**不引第三方微信 SDK**（白名单不含）。确定性可测（注入私/公钥）。FakeWxPay.ParseNotify 不验签（JSON 反序列化），真实 NotifyParser 调 VerifyV3。
+9. **-race 全绿**：Memory 实现用 sync.Mutex 保护 map；`go test -race ./internal/<本包>/...` 通过。
+10. **确定性测试**：用 WithNowFunc/WithOutTradeNoFunc 注入确定性时钟/单号生成；禁 time.Now()（签名或 Option 注入）。V3 签名测试用固定 nonce/ts/key。
+11. **gofmt + go vet 干净**；包注释 `// Package xx ...`（§4 约定 7）。
+12. **加性扩展不破现有**：billing/membership 现有方法签名与行为不动，现有测试全绿（agent 跑 `go test ./internal/billing/... ./internal/membership/...` 验证）。
+13. **不引白名单外依赖**（§3）。payment 需 stdlib crypto/encoding/json；subscription 纯 stdlib；billing/membership 无新依赖。`go.mod` 预期**无需新增**。
+
+### 15.6 DoD（M4-S1 各 agent）
+
+- **A1 payment**：① 三 MemoryRepo（SubMerchant/Payment/Ledger）CRUD + MarkSuccess(changed 标志) + Append(UNIQUE 幂等) + 跨租户；② 三 PGRepo pgxmock 测（INSERT...ON CONFLICT upsert + SELECT）；③ FakeWxPay（Applier/Preparer/NotifyParser 三端口确定性实现）；④ SignV3Authorization/VerifyV3Notify 纯函数（注入 rsa key，确定性，验签失败返 ErrSignInvalid）；⑤ Service.ApplySubMerchant/QuerySubMerchant/ListSubMerchants；⑥ Service.Prepay（active 特约商户校验 + outTradeNo 唯一）；⑦ **Service.HandleNotify 幂等**（重复回调 ledger/payment 各一条、履约一次，用例证明）+ Fulfiller nil 安全 + 验签失败不动库；⑧ migration 000012 up/down 合法（三表 + 索引 + trg_set_updated_at）；⑨ `-race` 全绿。**至少 22 测试**。
+- **A2 subscription**：① MemoryStore CurrentPlan(无→free)/Get/Upsert(旧 active 置 cancelled)/ListHistory + 跨租户；② PlanLevel/PlanPriceCents/GiftForAmount 纯函数；③ FeatureGate.Can/Require（free→pro feature 拒、pro→flagship feature 拒、pro→pro feature 过、未知 feature→false）；④ Service.CurrentPlan/GetSubscription/Gate/Subscribe/ConfirmPayment(amountCents→plan 映射)；⑤ migration 000013 up/down 合法（UNIQUE active one）；⑥ `-race` 全绿。**至少 14 测试**。
+- **A3 billing**：① Order.PaymentRef 字段；② OrderRepo.UpdateStatus（pending→paid 填支付字段、跨租户 ErrNotFound）；③ Service.CreatePendingOrder（total 计算 + status=pending + paid=0）；④ **Service.MarkOrderPaid**（pending→paid、已 paid 幂等 nil、refunded/voided→ErrStatusConflict、跨租户 ErrNotFound）；⑤ 现有 CreateOrder/Redeem 等测试**全绿不破**；⑥ `-race` 全绿。**至少 +6 新测试**（累计不降）。
+- **A4 membership**：① BalanceAccount.RegionCapCents 字段 + memory_repo 读写；② rechargeTiers/GiftForAmount（档位匹配 + 无匹配→0）；③ MemberRepo.rechargeAtomic（入账 + cap 校验超→errcode.ErrBalanceOver 不改状态 + recharge log）；④ UpdateAccountRegionCap；⑤ **Service.Recharge**（active 校验 + gift 内部算 + cap 拦截 + 跨租户）；⑥ Service.SetRegionCap；⑦ 现有 Join/Redeem 测试**全绿不破**；⑧ `-race` 全绿。**至少 +8 新测试**（累计不降）。
+
+### 15.7 集成 + 配置（主线程，workflow 收尾后）
+
+- **errcode 新增**（`pkg/errcode/errcode.go`）：`ErrPlanUpgradeRequired = Err{40303, "当前套餐不支持该功能，请升级", http.StatusForbidden}`；`ErrSignInvalid = Err{40103, "支付回调验签失败", http.StatusUnauthorized}`；`ErrPaymentDuplicate = Err{40902, "支付单号重复", http.StatusConflict}`；`ErrSubMerchantNotActive = Err{60023, "特约商户未进件或未激活", http.StatusOK}`；复用 `ErrBalanceOver`(60003)/`ErrIdempotent`(40901)。
+- **main.go**：构造 `paymentSvc := payment.NewService(payment.NewMemorySubMerchantRepo(), payment.NewMemoryPaymentRepo(), payment.NewMemoryLedgerRepo(), payment.WithApplier(fakeWxPay), payment.WithPreparer(fakeWxPay), payment.WithNotifyParser(fakeWxPay), payment.WithFulfiller(paymentFulfiller{bill:billingSvc, mbr:membershipSvc, sub:subscriptionSvc}))`（`fakeWxPay := payment.NewFakeWxPay()`，dev 确定性）；`subscriptionSvc := subscription.NewService(subscription.NewMemoryStore())`（默认 free，主线程可种 demo 租户 plan）。Deps 加 `Payment *payment.Service` + `Subscription *subscription.Service`。
+- **payment_adapters.go（新）**：① `type fakeWxPay struct{}` + `NewFakeWxPay()` 实装三端口（确定性 applymentID/prepayID/notify 反序列化）；② `paymentFulfiller{bill, mbr, sub}` 实装 `Fulfill(ctx, p)` 按 `p.Subject` switch：`SubjectOrder`→`bill.MarkOrderPaid(p.RefID, p.OutTradeNo, *p.PaidAt)`；`SubjectRecharge`→`mbr.Recharge(RechargeInput{MemberID:p.RefID, AmountCents:p.AmountCents, RefPaymentID:p.ID})`；`SubjectSubscription`→`sub.ConfirmPayment(tenantID, p.AmountCents, p.Provider, p.OutTradeNo)`；默认 best-effort（err 仅日志不回滚 payment）。
+- **router.go**：Deps 加 `Payment`/`Subscription` 字段。挂载：
+  - `/v1/boss/payment/sub-merchants`（POST 进件 / GET 列表 / POST :id/query 查状态）
+  - `/v1/boss/payment/prepay`（POST 统一下单）
+  - `/v1/boss/payment/payments/:id`（GET 查支付单）
+  - `/v1/boss/payment/ledger`（GET 流水）
+  - `/v1/wxshop/payment/notify`（POST 微信回调，**无鉴权**——验签入口；handler 调 paymentSvc.HandleNotify，成功 200 返微信要求格式 `{"code":"SUCCESS","message":"成功"}`，验签失败 401）
+  - `/v1/boss/subscription`（GET 当前 / POST subscribe）
+  - `/v1/boss/billing/orders/pending`（POST 建 pending 订单）+ `/v1/boss/billing/orders/:id/pay`（GET/POST 模拟支付成功回调——dev 用，生产走 wxshop/notify）
+  - `/v1/boss/membership/members/:id/recharge`（POST 储值充值）+ `/v1/boss/membership/members/:id/region-cap`（POST 设置地区上限）
+  handler/payment.go（新）+ handler/subscription.go（新）+ handler/billing.go 加 CreatePendingOrder/SimulatePay + handler/membership.go 加 Recharge/SetRegionCap。
+- **HTTP 冒烟（主线程 `interfaces/http/m4s1_test.go`）**：① 进件（POST sub-merchant → Fake 即时 reviewing → query → active，sub_mch_id 非空）；② 下单+支付（prepay order → 模拟微信回调 POST notify → payment success + order paid + ledger 一条）；③ **回调幂等**（同一 notify POST 两次 → ledger 仍一条、payment 仍一条、order 不重复 paid）；④ 储值充值（prepay recharge → 回调 → member BalanceCents += amount、GiftCents += 档位 gift、balance_log recharge 一条）；⑤ 地区上限（SetRegionCap 后 Recharge 超 cap → 60003 ErrBalanceOver，余额不变）；⑥ 订阅付费墙（free 租户调 pro 功能 → 40303；Subscribe pro → 同功能放行）；⑦ 串户（跨 tenant GET payment/order/subscription → 404/40302）。
+
+### 15.8 显式延后（不在 M4-S1）
+
+- 支付宝 ISV 进件/下单（provider=alipay 留接口位，FakeWxPay 只实装 wxpay；alipay 延后 M4-S2/生产）。
+- payment_ledger 按月分区（PARTITION BY RANGE created_at，生产部署加；本期单表 + UNIQUE(tenant,provider,tx_id)）。
+- 微信支付 V3 真实 HTTP（api.mch.weixin.qq.com）+ 平台证书下载/轮换（本期签名纯函数 + FakeWxPay；生产配 mchid/apikey/平台证书后启用真实 NotifyParser）。
+- reconciliation_diffs 对账差异表 + 供应商/外卖对账（BE-A-11，M4-S2）。
+- 供应链联合采购 / 品牌广告（M4-S2 BE-A-12/13）。
+- 真实 PG 接入（pgx repo 生产实装 payment 三表 / subscriptions；本期 Memory 双实现）。
+- 订阅自动续费 / 到期降级 cron（本期 ConfirmPayment 激活即 active；过期检测 cron 延后）。
+- 储值退款（type=refund 流水类型留位，退款流延后）。
+- WX-01 微信支付服务商资质申请（行政，M0-S2 已启动；资质到位前代码就绪不收款）。
+- 多店功能门禁落地（FeatureMultiStore 定义在矩阵，但本期单店为主，多店 RBAC 校验延后）。

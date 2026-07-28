@@ -55,6 +55,13 @@ var (
 	ErrColdStart           = Err{60020, "数据不足，已使用冷启动剧本", http.StatusOK}
 	ErrActionBlocked       = Err{60021, "动作被合规拦截，未执行", http.StatusOK}
 	ErrActionNotExecutable = Err{60022, "该动作暂不可一键执行", http.StatusOK}
-	ErrInternal            = Err{50001, "服务器内部错误", http.StatusInternalServerError}
-	ErrUpstream            = Err{50201, "上游服务异常", http.StatusBadGateway}
+	// M4-S1 payment / subscription (CONTRACT §15.7). 40103 sign-invalid at the
+	// unauth notify entry; 40303 plan-upgrade gate; 40902 duplicate out_trade_no;
+	// 60023 sub-merchant not onboarded (business rejection, HTTP 200 + 6xxx).
+	ErrSignInvalid          = Err{40103, "支付回调验签失败", http.StatusUnauthorized}
+	ErrPlanUpgradeRequired  = Err{40303, "当前套餐不支持该功能，请升级", http.StatusForbidden}
+	ErrPaymentDuplicate     = Err{40902, "支付单号重复", http.StatusConflict}
+	ErrSubMerchantNotActive = Err{60023, "特约商户未进件或未激活", http.StatusOK}
+	ErrInternal             = Err{50001, "服务器内部错误", http.StatusInternalServerError}
+	ErrUpstream             = Err{50201, "上游服务异常", http.StatusBadGateway}
 )
