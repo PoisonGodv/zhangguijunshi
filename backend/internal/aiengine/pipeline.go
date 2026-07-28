@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/zhangguijunshi/backend/internal/aiengine/agent"
+	"github.com/zhangguijunshi/backend/internal/aiengine/bandit"
 	"github.com/zhangguijunshi/backend/internal/aiengine/cache"
 	"github.com/zhangguijunshi/backend/internal/aiengine/converge"
 	"github.com/zhangguijunshi/backend/internal/aiengine/output"
+	"github.com/zhangguijunshi/backend/internal/aiengine/playbook"
 	"github.com/zhangguijunshi/backend/internal/aiengine/rule"
 	"github.com/zhangguijunshi/backend/internal/aiengine/semantic"
 	"github.com/zhangguijunshi/backend/internal/aiengine/signal"
@@ -40,6 +42,10 @@ type Pipeline struct {
 	now       func() time.Time
 	timeout   time.Duration
 	log       *zap.Logger
+	// M3-S3 (CONTRACT §14.7): playbook cold-start injection + bandit priority
+	// boost. Both nil-safe (backward-compatible with M3-S1/S2 callers).
+	pb     *playbook.Store
+	bandit *bandit.Learner
 }
 
 // Option configures a Pipeline.
@@ -88,6 +94,26 @@ func WithLogger(l *zap.Logger) Option {
 func WithSemanticCache(sem semantic.SemanticCache) Option {
 	return func(p *Pipeline) {
 		p.sem = sem
+	}
+}
+
+// WithPlaybookStore injects the cold-start playbook library (M3-S3 §14.7).
+// When wired, a cold-start (0 routed items) injects the playbook's ColdPriority
+// actions for the configured business type instead of the hard-coded generic
+// fallback. nil keeps the M3-S1/S2 injectColdStart behaviour (backward-compat).
+func WithPlaybookStore(s *playbook.Store) Option {
+	return func(p *Pipeline) {
+		p.pb = s
+	}
+}
+
+// WithBanditLearner injects the epsilon-greedy rule-weight learner (M3-S3
+// §14.7). When wired, routed items are priority-boosted by the bandit arm
+// weight for their ReasonType (best-effort: a missing arm leaves the rule's
+// original priority). nil disables boosting (backward-compatible).
+func WithBanditLearner(l *bandit.Learner) Option {
+	return func(p *Pipeline) {
+		p.bandit = l
 	}
 }
 
@@ -181,11 +207,26 @@ func (p *Pipeline) Run(ctx context.Context) (*output.Advice, error) {
 	if routed == nil {
 		routed = &rule.Routed{TenantID: tenantID}
 	}
+	// ②a) Bandit priority boost (M3-S3 §14.7): re-rank routed items by the
+	// learner arm weight for each item's ReasonType. Best-effort — a missing
+	// arm leaves the item's original priority; errors are swallowed so the
+	// pipeline never breaks on the bandit path.
+	applyBanditBoost(ctx, routed, p.bandit, tenantID, log)
 	degrade := ""
 	if len(routed.Items) == 0 {
-		routed = injectColdStart(routed.TenantID)
-		degrade = "cold_start"
-		log.Debug("cold-start injected", zap.Int("items", len(routed.Items)))
+		// Cold-start: prefer the playbook's business-specific ColdPriority
+		// actions when a playbook store is wired; else fall back to the
+		// M3-S1/S2 generic placeholder set (CONTRACT §14.7 / §12.3.8).
+		if injected := coldStartFromPlaybook(tenantID, p.business, p.pb); injected != nil {
+			routed = injected
+			degrade = "cold_start"
+			log.Debug("playbook cold-start injected",
+				zap.String("business", p.business), zap.Int("items", len(routed.Items)))
+		} else {
+			routed = injectColdStart(routed.TenantID)
+			degrade = "cold_start"
+			log.Debug("cold-start injected", zap.Int("items", len(routed.Items)))
+		}
 	}
 
 	// ③ Agent enhance (write-once degrade: cold_start preserved on LLM miss).
@@ -251,5 +292,108 @@ func injectColdStart(tenantID int64) *rule.Routed {
 				},
 			},
 		},
+	}
+}
+
+// coldStartFromPlaybook builds a business-specific cold-start Routed set from
+// the wired playbook store (M3-S3 §14.7). Returns nil if no store is wired or
+// the business has no playbook — the caller then falls back to the generic
+// injectColdStart. The injected items mirror the playbook's ColdPriority
+// action_types (non-product-bound, cost=0 so the margin floor holds trivially)
+// and reuse the generic copy/param ranges per action so one-click execute +
+// margin guardrail behave identically to the rule-routed path.
+func coldStartFromPlaybook(tenantID int64, business string, store *playbook.Store) *rule.Routed {
+	if store == nil {
+		return nil
+	}
+	pb, ok := store.Get(business)
+	if !ok || pb == nil || len(pb.ColdPriority) == 0 {
+		return nil
+	}
+	items := make([]rule.RoutedItem, 0, len(pb.ColdPriority))
+	for rank, act := range pb.ColdPriority {
+		items = append(items, playbookColdItem(rank+1, act))
+	}
+	return &rule.Routed{TenantID: tenantID, Items: items}
+}
+
+// playbookColdItem builds one cold-start RoutedItem for an action_type, with a
+// sane per-action copy + param range. All are non-product-bound (Product "-")
+// so the margin floor is trivially satisfied on a brand-new store.
+func playbookColdItem(rank int, actionType string) rule.RoutedItem {
+	it := rule.RoutedItem{
+		RuleID:         "cold_start_" + actionType,
+		ActionType:     actionType,
+		Target:         "member_segment",
+		Product:        "-",
+		Priority:       10 - rank, // larger-first; rank1 highest
+		MarginFloorPct: 0,
+		Reason:         "冷启动兜底: " + coldReasonFor(actionType) + " (不依赖销售数据, 新店首日可用)",
+	}
+	switch actionType {
+	case rule.ActCouponWake:
+		it.ReasonType = rule.ReasonWakeDormant
+		it.ParamRange = rule.ParamRange{ThresholdCents: 3000, OffCents: 500, ExpireHours: 48}
+	case rule.ActGroupSeckill:
+		it.ReasonType = rule.ReasonClearanceCoupon
+		it.ParamRange = rule.ParamRange{DiscountMinPermille: 500, DiscountMaxPermille: 700, LimitQtyMax: 50}
+	case rule.ActGroupbuy:
+		it.ReasonType = rule.ReasonBundleSlow
+		it.ParamRange = rule.ParamRange{DiscountMinPermille: 800, DiscountMaxPermille: 900, LimitQtyMax: 20}
+	case rule.ActMomentsPost:
+		it.ReasonType = rule.ReasonHighValue
+		it.ParamRange = rule.ParamRange{DiscountMinPermille: 900, DiscountMaxPermille: 900}
+	case rule.ActRechargePromo:
+		it.ReasonType = rule.ReasonHighValue
+		it.ParamRange = rule.ParamRange{ThresholdCents: 10000, OffCents: 1000}
+	default:
+		it.ReasonType = rule.ReasonFestival
+		it.ParamRange = rule.ParamRange{ThresholdCents: 5000, OffCents: 800, ExpireHours: 72}
+	}
+	return it
+}
+
+// coldReasonFor maps a cold-start action_type to a one-line boss-readable hint.
+func coldReasonFor(actionType string) string {
+	switch actionType {
+	case rule.ActCouponWake:
+		return "沉睡唤醒券"
+	case rule.ActGroupSeckill:
+		return "群秒杀引流"
+	case rule.ActGroupbuy:
+		return "拼团裂变"
+	case rule.ActMomentsPost:
+		return "朋友圈种草"
+	case rule.ActRechargePromo:
+		return "储值锁客"
+	default:
+		return "节日满减"
+	}
+}
+
+// applyBanditBoost re-ranks routed items by the bandit arm weight (Q value) for
+// each item's ReasonType (M3-S3 §14.7). It adds a weight-scaled boost to each
+// item's Priority so the converge Top3 stage prefers rules the bandit has
+// learned perform well. Best-effort: nil learner or a read error leaves the
+// routed priorities untouched (the pipeline never breaks on the bandit path).
+// An unseen rule (cold-start prior Weight=0.5) contributes a neutral boost.
+func applyBanditBoost(ctx context.Context, routed *rule.Routed, learner *bandit.Learner, tenantID int64, log *zap.Logger) {
+	if learner == nil || routed == nil || len(routed.Items) == 0 {
+		return
+	}
+	weights, err := learner.Weights(ctx, tenantID)
+	if err != nil {
+		log.Debug("bandit weights read failed (non-fatal)", zap.Error(err))
+		return
+	}
+	for i := range routed.Items {
+		w, ok := weights[routed.Items[i].ReasonType]
+		if !ok {
+			continue // unseen rule → leave original priority
+		}
+		// Boost = (weight − 0.5 neutral prior) * 20, so a weight of 1.0 adds
+		// +10 and 0.0 subtracts 10. This nudges ranking without overriding the
+		// rule's declarative priority entirely.
+		routed.Items[i].Priority += int((w - 0.5) * 20)
 	}
 }

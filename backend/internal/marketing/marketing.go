@@ -133,6 +133,13 @@ type CouponRepo interface {
 	GetMemberCoupon(ctx context.Context, tenantID, id int64) (*MemberCoupon, error)
 	ListMemberCoupons(ctx context.Context, tenantID, memberID int64, status string) ([]*MemberCoupon, error)
 
+	// ListByStrategy returns all member-coupons attributed to one strategy
+	// (member_coupons.strategy_id, the AI attribution link). status filters by
+	// member-coupon status (unused|used|expired|revoked); "" returns all. Used
+	// by the M3-S3 attribution engine (CouponStats) to compute coupon_redeem
+	// (redeemed/sent) per strategy. Cross-tenant records are never returned.
+	ListByStrategy(ctx context.Context, tenantID, strategyID int64, status string) ([]*MemberCoupon, error)
+
 	// RedeemAtomic atomically transitions a member-coupon unused→used and stamps
 	// UsedAt / RefOrderID. A non-unused coupon yields ErrCouponUsed; an expired
 	// one yields ErrCouponExpired. No state changes on failure.

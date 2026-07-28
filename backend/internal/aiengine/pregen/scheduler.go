@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"github.com/zhangguijunshi/backend/internal/aiengine/attribution"
+	"github.com/zhangguijunshi/backend/internal/aiengine/bandit"
 	"github.com/zhangguijunshi/backend/internal/aiengine/cache"
 	"github.com/zhangguijunshi/backend/internal/aiengine/output"
 	"github.com/zhangguijunshi/backend/internal/aiengine/semantic"
@@ -89,6 +91,14 @@ type Scheduler struct {
 	cron     *cron.Cron
 	incr     chan IncrementalJob
 	now      func() time.Time
+
+	// M3-S3 attribution-backfill + bandit-update (CONTRACT §14.7). All four are
+	// nil-safe: a nil on any path makes the corresponding cron a clean no-op so
+	// the scheduler stays backward-compatible with M3-S2 callers.
+	attrComputer  *attribution.Computer
+	attrRepo      attribution.Repo
+	banditLearner *bandit.Learner
+	itemEnum      StrategyItemEnumerator
 
 	batchSize  int
 	workers    int
@@ -213,6 +223,18 @@ func (s *Scheduler) Start() error {
 	}
 	if _, err := s.cron.AddFunc(incrementalCronSpec, s.cronIncremental); err != nil {
 		return fmt.Errorf("pregen: add incremental cron (%q): %w", incrementalCronSpec, err)
+	}
+	// M3-S3 crons (CONTRACT §14.7): only register when the deps are wired, so
+	// an M3-S2-style caller (no attribution/bandit) gets no failing cron ticks.
+	if s.attrRepo != nil && s.attrComputer != nil && s.itemEnum != nil {
+		if _, err := s.cron.AddFunc(attributionCronSpec, s.cronAttribution); err != nil {
+			return fmt.Errorf("pregen: add attribution cron (%q): %w", attributionCronSpec, err)
+		}
+	}
+	if s.banditLearner != nil && s.itemEnum != nil {
+		if _, err := s.cron.AddFunc(banditCronSpec, s.cronBandit); err != nil {
+			return fmt.Errorf("pregen: add bandit cron (%q): %w", banditCronSpec, err)
+		}
 	}
 	s.started = true
 	s.cron.Start()

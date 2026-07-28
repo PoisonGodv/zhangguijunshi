@@ -247,6 +247,26 @@ func (r *MemoryCouponRepo) ListMemberCoupons(_ context.Context, tenantID, member
 	return out, nil
 }
 
+// ListByStrategy returns all member-coupons attributed to one strategy
+// (M3-S3 attribution link). status filters by member-coupon status; "" = all.
+// Cross-tenant records are never returned.
+func (r *MemoryCouponRepo) ListByStrategy(_ context.Context, tenantID, strategyID int64, status string) ([]*MemberCoupon, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []*MemberCoupon
+	for _, m := range r.mc {
+		if m.TenantID != tenantID || m.StrategyID != strategyID {
+			continue
+		}
+		if status != "" && m.Status != status {
+			continue
+		}
+		out = append(out, cloneMC(m))
+	}
+	sortMCByIDDesc(out)
+	return out, nil
+}
+
 // RedeemAtomic transitions a member-coupon unused→used atomically.
 func (r *MemoryCouponRepo) RedeemAtomic(_ context.Context, tenantID, id, refOrderID int64, now time.Time) (*MemberCoupon, error) {
 	r.mu.Lock()

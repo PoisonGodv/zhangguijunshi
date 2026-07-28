@@ -2045,3 +2045,306 @@ type AIRouteConfig struct {
 ### 13.8 显式延后（不在 M3-S2）
 
 真实 PGVector 检索（需 PG，本期 pgx 实现+pgxmock 测试，生产配 PG 启用 PGVectorCache）；真实 Redis Stream 增量重算（本期内存 channel，生产配 Redis Stream）；真实 embedding API（本期 FakeEmbedder，生产配通义 text-embedding-v3/bge-m3）；AI-10/11/12 归因/bandit/剧本库（M3-S3）；FE-ADMIN-03 归因看板（M3-S3）；pgx repo 全局替换内存（有 PG 后）；白天增量重算的真实触发器接入（inventory/weather 事件 → pregen.EnqueueIncremental，本期接口留好，触发器接 M3-S3）。
+
+## 14. M3-S3 增量契约（AI-10 效果归因回填 + AI-11 冷启动剧本库 + AI-12 规则权重 bandit + FE-ADMIN-03 归因看板读 API，2026-07-28）
+
+### 14.1 范围与裁剪（对照 ch07 §7.9-7.10 / ch00 WBS §M3-S3）
+
+M3-S3 是「自学习 + 冷启动」sprint。三个**全新** Go 包，互斥，互不 import（无环）：
+
+- **AI-10 attribution**（`internal/aiengine/attribution/`）：策略执行效果归因回填。把 strategy_items 执行后 T+24h/T+72h 的代理指标（券核销率/到店反推/拼团成团率）写入 **已存在**的 `strategy_attribution` 表（migration 000007，本期建表空，本 sprint 回填）。提供归一化 reward 给 bandit，提供读 API 给看板。
+- **AI-11 playbook**（`internal/aiengine/playbook/`）：5 业态冷启动剧本库（fruit/convenience/maternity/fresh/apparel）。每业态一份 `Playbook`（默认规则集 + 文案模板 + 社群 SOP + 损耗率/现金系数 + ColdPriority 冷启动优先动作）。新店首日无销售数据时只推 ColdPriority。
+- **AI-12 bandit**（`internal/aiengine/bandit/`）：epsilon-greedy 规则权重自学习。`Arm/Select/Update/CreditItem`，消费 attribution 的 reward + strategy_feedback 反哺，回写 `ai_rule_weight` 表（**本期新增** migration 000010）。
+
+**裁剪（对照 ch07）**：
+- ch07 §7.9.1 提议的 `ai_advice_outcome` 宽表**不建**——migration 000007 的 `strategy_attribution`（metric/value/measured_at EAV 形，5 metric CHECK）是权威，本期回填它。
+- 5 metric 中 **coupon_redeem / visit_uplift / groupbuy_success 本期真实计算**；**repurchase / moments_engage 无数据源，本期不产出**（Compute 不 emit，看板显示「—」），显式延后。
+- reward 归一化权重：ch07 `0.5*coupon+0.3*visit+0.2*revenue` → 本期 `0.7*coupon_rate + 0.3*visit_delta_norm`（revenue 延后），clip [0,1]。
+- bandit arm 粒度：以 **reason_type（7 值）为 arm key**（cold-start-safe，每业态必命中），非 rule.ID（触发稀疏）。`ItemResolver.Resolve` 返回 `item.ReasonType` 作 ruleID。
+- playbook 剧本**本期 in-code seed**（`NewStore()` 硬编码 5 业态）；DB `ai_rule` 表 + 后台 React 可视化编辑延后（M4）。
+- FE-ADMIN-03 本期交付**后端读 API**（`GET /v1/boss/aiengine/strategies/:id/attribution`）+ handler；admin-web React 看板本身延后（M4，admin-web 目录仍空）。
+
+### 14.2 迁移编号（DB-06）
+
+新增 `migrations/000010_ai_rule_weight.{up,down}.sql`（**bandit agent 拥有**，其它 agent 不动 migrations/）：
+
+```sql
+-- 000010_ai_rule_weight.up.sql
+-- 规则权重 bandit 自学习持久化 (M3-S3, AI-12). 依据 ch07 §7.9.2.
+-- arm key = reason_type (7 值) 或 rule.ID; tenant_id=0 留作平台默认(本期不用).
+CREATE TABLE ai_rule_weight (
+    id          BIGSERIAL    PRIMARY KEY,
+    tenant_id   BIGINT       NOT NULL REFERENCES tenants(id),
+    rule_id     TEXT         NOT NULL,                       -- reason_type (7 值) 或 rule.ID
+    weight      DOUBLE PRECISION NOT NULL DEFAULT 0.5,       -- 软更新后的 Q 值, 初值 0.5 中性先验
+    trials      INT          NOT NULL DEFAULT 0,
+    reward_sum  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, rule_id)
+);
+CREATE INDEX idx_ai_rule_weight_tenant ON ai_rule_weight(tenant_id);
+COMMENT ON TABLE  ai_rule_weight              IS '规则权重 bandit 自学习(M3-S3); arm=reason_type; UNIQUE(tenant_id,rule_id)';
+COMMENT ON COLUMN ai_rule_weight.weight      IS '软更新 Q 值, 初值 0.5 中性先验(未见规则 cold-start-safe)';
+-- down: DROP TABLE ai_rule_weight;
+```
+挂 `trg_set_updated_at`（bandit 每次更新 weight → 刷新 updated_at，沿用 000001-000009 触发器约定）。`strategy_attribution` 表**不动**（000007 已建）。
+
+### 14.3 领域类型与接口（**已固定，agent 必须一字不差实现签名**）
+
+#### 14.3.0 包依赖 DAG（**无环，跨包只走声明接口**）
+```
+rule        → (无 internal 依赖)
+strategy    → (无 internal 依赖)
+playbook    → rule
+attribution → strategy
+bandit      → (无 internal 依赖; RewardSource/ItemResolver 自声明, 由主线程接线)
+pipeline/pregen/handler → rule + playbook + attribution + bandit + strategy (主线程集成)
+```
+**禁止**：attribution 不 import bandit；bandit 不 import attribution（reward 走 bandit 自声明的 `RewardSource` 接口，attribution.Computer 满足之）；playbook 不 import strategy/attribution/bandit。
+
+#### 14.3.1 attribution 包（AI-10）
+```go
+package attribution // import github.com/zhangguijunshi/backend/internal/aiengine/attribution
+
+import (
+    "context"
+    "time"
+    "github.com/zhangguijunshi/backend/internal/strategy"
+)
+
+// metric 常量 — 一一对应 strategy_attribution.metric CHECK (migration 000007).
+const (
+    MetricCouponRedeem    = "coupon_redeem"     // 本期真实计算
+    MetricVisitUplift     = "visit_uplift"      // 本期真实计算
+    MetricGroupbuySuccess = "groupbuy_success"  // 本期真实计算(best-effort, 无 linkage 则不 emit)
+    MetricRepurchase      = "repurchase"        // 本期不产出(无数据源, 延后)
+    MetricMomentsEngage   = "moments_engage"    // 本期不产出(无数据源, 延后)
+)
+
+// Measurement 一条 (item, metric, value, measured_at) 事实, 1:1 映射 strategy_attribution.
+type Measurement struct {
+    ID             int64     `json:"id"`
+    TenantID       int64     `json:"tenant_id"`
+    StrategyItemID int64     `json:"strategy_item_id"`
+    Metric         string    `json:"metric"`
+    Value          float64   `json:"value"`
+    MeasuredAt     time.Time `json:"measured_at"`
+}
+
+type MeasurementFilter struct {
+    ItemIDs []int64  // 空=不限
+    Metrics []string // 空=不限
+    Limit   int      // <=0 默认 50
+}
+
+var (
+    ErrParam    = errors.New("attribution: invalid param")
+    ErrNotFound = errors.New("attribution: not found")
+)
+
+// Repo 持久化 Measurement (strategy_attribution 表). Memory dev/test + pgx 生产(pgxmock 测).
+// 跨租户记录视为不存在. Record 的 UNIQUE(tenant,item,metric,measured_at) 由实现层保证 upsert.
+type Repo interface {
+    Record(ctx context.Context, tenantID, itemID int64, metric string, value float64, measuredAt time.Time) (*Measurement, error)
+    List(ctx context.Context, tenantID int64, f MeasurementFilter) ([]Measurement, error)
+    LatestPerMetric(ctx context.Context, tenantID, itemID int64) (map[string]float64, error) // 缺失 metric 省略(非 0)
+}
+type MemoryRepo struct{ /* ... */ }
+func NewMemoryRepo() *MemoryRepo
+type PGRepo struct{ /* 窄 Pool 接口: QueryRow/Exec, 同 semantic.PGVectorSemanticCache 范式 */ }
+func NewPGRepo(pool PGPool) *PGRepo
+type PGPool interface {
+    QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+    Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// CouponStats 反腐端口 → marketing. 返回 strategyID 下发出/已核销券数.
+type CouponStats interface {
+    SentRedeemed(ctx context.Context, tenantID, strategyID int64) (sent, redeemed int, err error)
+}
+// VisitCounter 反腐端口 → billing. SinceCount=store 自 t 起支付笔数; BaselineCount=同时段历史均值.
+type VisitCounter interface {
+    SinceCount(ctx context.Context, tenantID, storeID int64, since time.Time) (int, error)
+    BaselineCount(ctx context.Context, tenantID, storeID int64, window time.Duration, before time.Time) (float64, error)
+}
+// GroupbuyStats 反腐端口 → groupbuy. 返回 strategyID 关联的发起/成团数(无 linkage 返 0,0,nil → 不 emit).
+type GroupbuyStats interface {
+    StartedSucceeded(ctx context.Context, tenantID, strategyID int64) (started, succeeded int, err error)
+}
+type Sources struct {
+    Coupons  CouponStats
+    Visits   VisitCounter
+    Groupbuy GroupbuyStats
+}
+
+// Computer 由一项已执行 strategy_item + 其 store 产出 Measurement 事实. 拥有 metric 语义与 reward 归一化.
+type Computer struct { /* Sources + WithNowFunc */ }
+func NewComputer(src Sources, opts ...Option) *Computer
+type Option func(*Computer) // WithNowFunc(func() time.Time)
+
+// Compute 在 measuredAt 评估 item, 返回可算 metric 的事实(无可算→空切片, 不报错).
+//   coupon_redeem    = redeemed/sent (sent==0 不 emit)
+//   visit_uplift     = SinceCount(executedAt) − BaselineCount(window=measuredAt−executedAt, before=executedAt)
+//   groupbuy_success = succeeded/started (started==0 不 emit)
+// tenantID 显式传(沿用 strategy memory_repo 约定); item 只读.
+func (c *Computer) Compute(ctx context.Context, tenantID int64, item *strategy.StrategyItem, storeID int64, executedAt, measuredAt time.Time) ([]Measurement, error)
+
+// Reward 返回 item 的归一化 [0,1] reward, 供 bandit 消费.
+// reward = 0.7*coupon_rate + 0.3*visit_delta_norm, clip [0,1]. 无 coupon 数据→coupon_rate=0.
+// 满足 bandit.RewardSource.Reward(ctx, tenantID, itemID, strategyID, storeID) → (float64, error).
+func (c *Computer) Reward(ctx context.Context, tenantID, itemID, strategyID, storeID int64) (float64, error)
+```
+**注意**：coupon/visit/groupbuy 三端口在 Compute 里**按 item 的 action_type 选择性调用**——非 coupon 类 item 不查 CouponStats（避免无意义查询）。reward 计算复用 Compute 的 coupon/visit 结果（不重复查库）；itemID→item 的解析由主线程接线时给 Computer 注入一个 `ItemLoader`（**或** Reward 接收已解析的 item，二选一，agent 选 Reward(ctx,...,storeID) 签名为主、内部用 strategy.Service.GetItem 解析；主线程把 strategy.Service 适配成 Computer 的 item 来源）。**为避免环依赖，Computer 不 import strategy.Service**；item 来源走 Computer 自声明的窄接口：
+```go
+type ItemLoader interface { GetItem(ctx context.Context, tenantID, itemID int64) (*strategy.StrategyItem, error) }
+```
+`NewComputer(src Sources, loader ItemLoader, opts ...Option)` —— **签名以此为准**（loader 必传，主线程用 strategy.Service 适配）。Compute 的 item 参数仍由调用方传入（backfill job 已持 item）；Reward 内部用 loader 自解析。
+
+#### 14.3.2 playbook 包（AI-11）
+```go
+package playbook // import github.com/zhangguijunshi/backend/internal/aiengine/playbook
+
+import "github.com/zhangguijunshi/backend/internal/aiengine/rule"
+
+// 5 业态常量 — 与 rule.Business 取值一致.
+const (
+    Fruit       = "fruit"
+    Convenience = "convenience"
+    Maternity   = "maternity"
+    Fresh       = "fresh"
+    Apparel     = "apparel"
+)
+
+// SOPStage 社群四阶段之一(拉群/促活/转化/裂变, ch07 §7.10.1).
+type SOPStage struct {
+    Name string `json:"name"`
+    Play string `json:"play"`
+}
+
+// Playbook 一个业态的冷启动运营手册(ch07 §7.10.1).
+type Playbook struct {
+    Business     string            `json:"business"`
+    Rules        []rule.Rule       `json:"rules"`         // 该业态默认规则集(可含 DefaultSeeds 子集 + 业态特化)
+    Prompts      map[string]string `json:"prompts"`        // action_type → 文案模板
+    SOP          [4]SOPStage       `json:"sop"`            // 拉群/促活/转化/裂变
+    LossRate     float64           `json:"loss_rate"`      // 损耗率(fruit≈0.10, convenience≈0.015)
+    CashCoef     float64           `json:"cash_coef"`      // 现金系数(客流反推, 默认 1.2)
+    ColdPriority []string          `json:"cold_priority"`  // 冷启动优先 action_type(不依赖销售反推)
+}
+
+// IsColdPriority 报告 actionType 是否在 ColdPriority 中.
+func (p *Playbook) IsColdPriority(actionType string) bool
+
+// Store 持有 5 业态剧本库(本期 in-code seed; DB/后台延后).
+type Store struct{ /* ... */ }
+func NewStore() *Store                  // 种入 5 业态
+func (s *Store) Get(business string) (*Playbook, bool)
+func (s *Store) List() []*Playbook
+
+// ColdStartFilter 冷启动期过滤: 移除非 ColdPriority 的 item. 若过滤后为空(全非冷启 或 pb 无 ColdPriority),
+// 原样返回(老板永远 ≥1 条, 计划书 6.6 / CONTRACT §12.3.8). 纯函数, 不写库.
+func ColdStartFilter(items []rule.RoutedItem, pb *Playbook) []rule.RoutedItem
+```
+**5 业态填充**（ch07 §7.10.2 表，损耗率/现金系数为待核实默认值）：fruit(LossRate 0.10/CashCoef 1.2, ColdPriority: moments_post/group_seckill/groupbuy), convenience(0.015/1.2, festival→coupon_wake/moments_post), maternity(0.02/1.2, birthday_care→coupon_wake/recharge_promo), fresh(0.10/1.2, rain→groupbuy/group_seckill), apparel(0.03/1.3, festival→coupon_wake/groupbuy)。Rules 至少含每业态 2 条（可复用 rule.DefaultSeeds 同 ID 规则 + Prompts 文案模板，模板变量用 `{product}/{price}/{member_tag}` 占位）。
+
+#### 14.3.3 bandit 包（AI-12）
+```go
+package bandit // import github.com/zhangguijunshi/backend/internal/aiengine/bandit
+
+import "context"
+
+// Arm 一条规则的习得权重(ch07 §7.9.2). rule_id = reason_type(7 值, cold-start-safe).
+type Arm struct {
+    RuleID    string  `json:"rule_id"`
+    Weight    float64 `json:"weight"`      // 软更新后 Q 值, 初值 0.5
+    Trials    int     `json:"trials"`
+    RewardSum float64 `json:"reward_sum"`
+}
+
+// Config epsilon-greedy 超参(ch07 §7.11.1).
+type Config struct {
+    Epsilon float64 // 探索率, 默认 0.1
+    LR      float64 // 学习率, 默认 0.1
+}
+func DefaultConfig() Config // {0.1, 0.1}
+
+// RewardSource 反腐端口 → attribution. 返回 item 归一化 [0,1] reward.
+type RewardSource interface {
+    Reward(ctx context.Context, tenantID, itemID, strategyID, storeID int64) (float64, error)
+}
+// ItemResolver 反腐端口 → strategy. 返回 item 的 (ruleID=ReasonType, strategyID, storeID).
+type ItemResolver interface {
+    Resolve(ctx context.Context, tenantID, itemID int64) (ruleID string, strategyID int64, storeID int64, err error)
+}
+
+// Repo 持久化 Arm (ai_rule_weight 表, migration 000010). Memory dev/test + pgx 生产(pgxmock 测).
+// 未见规则 Get 返零值 Arm{Weight:0.5}(中性先验, cold-start-safe). 跨租户=不存在.
+type Repo interface {
+    Get(ctx context.Context, tenantID int64, ruleID string) (*Arm, error)
+    Put(ctx context.Context, tenantID int64, arm *Arm) error
+    All(ctx context.Context, tenantID int64) ([]Arm, error)
+}
+type MemoryRepo struct{ /* map + sync.Mutex, -race 安全 */ }
+func NewMemoryRepo() *MemoryRepo
+type PGRepo struct{ /* 窄 Pool, 同 attribution.PGPool 范式 */ }
+func NewPGRepo(pool PGPool) *PGRepo
+type PGPool interface { // bandit 自声明, 与 attribution.PGPool 同构(主线程可共用一个 pgxpool)
+    QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+    Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// Learner epsilon-greedy 权重学习器(ch07 §7.9.2).
+type Learner struct{ /* repo + cfg + rand */ }
+func NewLearner(repo Repo, cfg Config, opts ...Option) *Learner
+type Option func(*Learner) // WithRand(func() float64) 注入确定性随机源(测试用), 默认 rand.Float64
+
+// Select 1−epsilon 选 Weight 最高 arm, epsilon 随机探索. arms 空→nil.
+func (l *Learner) Select(ctx context.Context, tenantID int64, arms []Arm) (*Arm, error)
+// Update 应用一次 reward 到 ruleID(增量均值+软更新). 未见 arm 先 seed Weight=0.5. reward clip [0,1].
+func (l *Learner) Update(ctx context.Context, tenantID int64, ruleID string, reward float64) (*Arm, error)
+// CreditItem 一站式反馈: Resolve item → 读 Reward → Update arm. pregen bandit-update 步 + feedback 反哺共用.
+func (l *Learner) CreditItem(ctx context.Context, tenantID, itemID int64) (*Arm, error)
+```
+**rand 注入**：`WithRand(func() float64)` 让 Select/Update 的探索可确定性测试（项目禁全局态，见 §4）。Reward clip 用 `math.Max(0, math.Min(1, r))`。
+
+### 14.4 包所有权（文件集互斥，每个 agent 拥有互斥的**包**）
+
+| agent | 拥有（**只准写这些文件**） | 禁动 |
+|---|---|---|
+| **A1 attribution** | `internal/aiengine/attribution/*.go`（含 `*_test.go`） | 其它一切；migrations/ |
+| **A2 playbook** | `internal/aiengine/playbook/*.go`（含 `*_test.go`） | 其它一切；migrations/ |
+| **A3 bandit** | `internal/aiengine/bandit/*.go`（含 `*_test.go`）**+** `migrations/000010_ai_rule_weight.up.sql` + `migrations/000010_ai_rule_weight.down.sql` | 其它包的 .go |
+| **主线程** | `CONTRACT.md` §14 / `internal/aiengine/pipeline.go` / `internal/aiengine/pregen/scheduler.go`(+`batch.go`/`incremental.go` 如需) / `cmd/api/main.go` / `cmd/api/aiengine_adapters.go` / `interfaces/http/router.go` / `interfaces/http/handler/aiengine.go` / `interfaces/http/m3s3_test.go` / `go.mod`(如需) / `configs/config.dev.yaml`(如需) | 三 agent 的包内文件 |
+
+**跨包编译约束**：agent 本地只跑 `go test ./internal/aiengine/<本包>/...`（**不要** `go build ./...`——集成前整体必编译失败，那是主线程收尾职责）。
+
+### 14.5 硬约束（M3-S3 全员）
+
+1. **签名一字不差**：§14.3 的类型/方法签名是冻结的，主线程集成按此接线。返回 error 不 panic。
+2. **多租户行级隔离**：所有 Repo 方法第一业务参 `tenantID int64`，跨租户=不存在（ErrNotFound/零值）。agent 测试须含跨租户用例（assert 返空/零值）。
+3. **反腐端口**：attribution/bandit/playbook **只 import 声明的窄接口 + rule/strategy**，不直 import marketing/billing/groupbuy/membership（端口由主线程适配）。无环（§14.3.0）。
+4. **双实现**：三包 Repo 均 Memory（dev/test）+ PG（pgxmock 测，生产配 PG）。pgxmock 用 `github.com/pashagolub/pgxmock/v4`（白名单 §3）。
+5. **-race 全绿**：Memory 实现用 `sync.Mutex` 保护 map；测试 `go test -race ./internal/aiengine/<本包>/...` 必须通过。
+6. **确定性测试**：bandit 用 `WithRand` 注入确定性随机源；attribution `Reward`/`Compute` 用固定 `measuredAt`/`executedAt` 输入。禁 `time.Now()`（用 `WithNowFunc` 或显式参）。
+7. **gofmt + go vet 干净**；包注释 `// Package xx ...`（§4 约定 7）。
+8. **reward clip [0,1]**；arm Weight 初值 0.5（cold-start-safe，未见规则不 panic）。
+9. **不引白名单外依赖**（§3）。三包均只需 stdlib + pgx/pgconn/pgxmock（PG repo）+ rule/strategy（internal）。`go.mod` 预期**无需新增**（pgxmock/pgx 已在）。
+
+### 14.6 DoD（M3-S3 各 agent）
+
+- **A1 attribution**：① `MemoryRepo` Record/List/LatestPerMetric + 跨租户用例；② `PGRepo` pgxmock 测（INSERT ... ON CONFLICT upsert + SELECT LatestPerMetric）；③ `Computer.Compute` coupon/visit/groupbuy 三 metric 计算（mock 端口）+ sent==0/started==0 不 emit + 跨租户；④ `Computer.Reward` 归一化 + clip + 满足 bandit.RewardSource；⑤ `-race` 全绿。**至少 18 测试**。
+- **A2 playbook**：① `NewStore` 种入 5 业态，Get/List 齐 + 未知业态 bool false；② 每 `Playbook` 字段齐（Rules≥2/Prompts/SOP[4]/LossRate/CashCoef/ColdPriority≥2）；③ `IsColdPriority`；④ `ColdStartFilter` 过滤非冷启 + 过滤后为空原样返回 + pb nil 安全；⑤ `-race` 全绿。**至少 12 测试**。
+- **A3 bandit**：① `MemoryRepo` Get(未见→0.5)/Put/All + 跨租户；② `PGRepo` pgxmock 测；③ `Select` 利用(最高 Weight)+探索(WithRand 注入 epsilon 阈值上下)+空→nil；④ `Update` 增量均值+软更新+clip+未见先 seed；⑤ `CreditItem` Resolve→Reward→Update 一站式(mock 端口)；⑥ migration 000010 up/down SQL 合法 + 挂 trg_set_updated_at；⑦ `-race` 全绿。**至少 16 测试**。
+
+### 14.7 集成 + 配置（主线程，workflow 收尾后）
+
+- **pipeline.go**：① 冷启动——`Run` 内 rule.Route 后，若 `len(routed.Items)==0` 或 data_quality<阈值，用 `playbook.Store.Get(business)` 取剧本，`ColdStartFilter` 注入剧本 ColdPriority 占位 item（替换/增强现有 `injectColdStart`，保留 degrade="cold_start"）；② bandit 加权——route 前，用 `bandit.Learner`/Repo 读当 tenant 7 reason_type arm Weight，对 seeds 按 reason_type 加 `Weight*priorityBoost` 偏置（best-effort，无 arm 时原 priority）。`NewPipeline` 加 Option `WithPlaybookStore(*playbook.Store)` + `WithBanditLearner(*bandit.Learner)`，**向后兼容**（nil 时走原 injectColdStart，现有 m3s1/m3s2 测试不破）。
+- **pregen/scheduler.go**：新增两条 cron——① `0 4 * * *` attribution 回填（`AttributionBackfill`：扫 executed≥24h 且无 attribution 的 items → Computer.Compute → Repo.Record；72h 二次回填）；② `0 2 * * *` bandit-update（`BanditUpdate`：扫昨日 executed items → Learner.CreditItem → Repo.Put）。`NewScheduler` 加参 `attrComputer *attribution.Computer` + `banditLearner *bandit.Learner`（窄接口/可 nil，向后兼容）。`Scheduler` 暴露 `AttributionBackfill(ctx)` + `BanditUpdate(ctx)` 供 m3s3_test 手动触发（同 BatchGenerate 范式）。
+- **strategy_feedback 反哺**：`RecordFeedback` 后异步 `banditLearner.CreditItem`（useful=true→reward+1 boost，best-effort，失败仅日志）。或由 `BanditUpdate` cron 统一吃 feedback——**主线程选 cron 统一吃**（避免改 strategy.Service 签名）。
+- **HTTP**：`interfaces/http/handler/aiengine.go` 加 `GetAttribution(c *gin.Context)`（`GET /v1/boss/aiengine/strategies/:id/attribution` → 拉 strategy.items → attribution.Repo.LatestPerMetric 聚合 → 返回 `{items:[{rank,action_type,metrics:{coupon_redeem:..,visit_uplift:..,groupbuy_success:..},revenue_cny:..}]}`，缺失 metric 显示 null）。router.go 挂载（deps 注入 attribution Repo/Computer）。
+- **main.go**：构造 `attrRepo := attribution.NewMemoryRepo()`（dev，无 PG）+ `attrComputer := attribution.NewComputer(src, strategySvc适配ItemLoader)` + `banditRepo := bandit.NewMemoryRepo()` + `banditLearner := bandit.NewLearner(banditRepo, bandit.DefaultConfig())` + `playbookStore := playbook.NewStore()`；接线 `pipeline`（WithPlaybookStore/WithBanditLearner）+ `scheduler`（新参）+ `handler`（attribution Repo）。src 的 CouponStats/VisitCounter/GroupbuyStats 端口由主线程写适配器（marketing/billing/groupbuy Service → 端口），**dev 可 nil**（Computer 对 nil 端口安全跳过该 metric）。
+- **HTTP 冒烟（主线程 `interfaces/http/m3s3_test.go`）**：① 冷启动（新店/空 signal → playbook ColdPriority 注入 ≥1 条，degrade=cold_start）；② 归因回填（执行 coupon_wake item → 造 marketing 券核销数据 → 手动触发 scheduler.AttributionBackfill → GET attribution 见 coupon_redeem）；③ bandit 更新（手动触发 scheduler.BanditUpdate → ai_rule_weight 权重变化 → 路由偏置变化）；④ 看板读 API（GET attribution 返回聚合 JSON）；⑤ 串户（跨 tenant GET attribution → 空/404）。
+
+### 14.8 显式延后（不在 M3-S3）
+
+repurchase/moments_engage metric（无数据源，需企微互动/复购窗口接线，M4）；revenue_cny 真实估算（本期看板返 null 或 best-effort 0，需订单金额归因）；bandit arm 粒度细化到 rule.ID（本期 reason_type 7 arm）；playbook DB 化（`ai_rule` 表 + 后台 React 可视化编辑，admin-web 仍空，M4）；FE-ADMIN-03 admin-web React 看板（本期仅后端读 API，M4）；strategy_feedback 实时反哺（本期 cron 统一吃，实时异步 M4）；groupbuy→strategy_item 真实 linkage（本期 groupbuy_success 在无 linkage 时不 emit，需 exec 执行时回填 strategy_item_id，M4）；pgx repo 全局替换内存（有 PG 后）；真实 PG/Redis 接入（生产部署前）。

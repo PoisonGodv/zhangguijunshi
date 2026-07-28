@@ -21,6 +21,7 @@ import (
 	"github.com/zhangguijunshi/backend/interfaces/http/handler"
 	"github.com/zhangguijunshi/backend/interfaces/http/middleware"
 	"github.com/zhangguijunshi/backend/internal/aiengine"
+	"github.com/zhangguijunshi/backend/internal/aiengine/attribution"
 	"github.com/zhangguijunshi/backend/internal/aiengine/exec"
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/internal/billing"
@@ -67,6 +68,9 @@ type Deps struct {
 	Strategy *strategy.Service
 	Pipeline *aiengine.Pipeline
 	Executor *exec.Executor
+	// M3-S3 attribution read API (CONTRACT §14.7). nil disables the
+	// /strategies/:id/attribution endpoint cleanly.
+	Attribution attribution.Repo
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -184,12 +188,15 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.POST("/crm/living-codes/resolve", h.ResolveCode)
 	}
 	if deps.Pipeline != nil || deps.Executor != nil || deps.Strategy != nil {
-		h := handler.NewAIEngineHandler(deps.Pipeline, deps.Executor, deps.Strategy)
+		h := handler.NewAIEngineHandler(deps.Pipeline, deps.Executor, deps.Strategy, deps.Attribution)
 		boss.POST("/aiengine/today", h.Today)
 		boss.GET("/aiengine/strategies", h.ListStrategies)
 		boss.GET("/aiengine/strategies/:id", h.GetStrategy)
 		boss.POST("/aiengine/strategies/:id/items/:itemID/execute", h.ExecuteItem)
 		boss.POST("/aiengine/strategies/:id/items/:itemID/feedback", h.RecordFeedback)
+		if deps.Attribution != nil {
+			boss.GET("/aiengine/strategies/:id/attribution", h.GetAttribution)
+		}
 	}
 }
 

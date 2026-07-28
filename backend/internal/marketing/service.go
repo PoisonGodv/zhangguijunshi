@@ -255,3 +255,17 @@ func (s *Service) ListMemberCoupons(ctx context.Context, memberID int64, status 
 	}
 	return s.repo.ListMemberCoupons(ctx, tenantID, memberID, status)
 }
+
+// ListByStrategy returns all member-coupons attributed to one strategy (M3-S3
+// attribution link, member_coupons.strategy_id). status filters by member-coupon
+// status; "" = all. Used by the attribution engine to compute coupon_redeem.
+func (s *Service) ListByStrategy(ctx context.Context, strategyID int64, status string) ([]*MemberCoupon, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if strategyID <= 0 {
+		return nil, errcode.ErrParam
+	}
+	return s.repo.ListByStrategy(ctx, tenantID, strategyID, status)
+}

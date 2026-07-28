@@ -20,11 +20,14 @@ import (
 	httpserver "github.com/zhangguijunshi/backend/interfaces/http"
 	"github.com/zhangguijunshi/backend/internal/aiengine"
 	"github.com/zhangguijunshi/backend/internal/aiengine/agent"
+	"github.com/zhangguijunshi/backend/internal/aiengine/attribution"
+	"github.com/zhangguijunshi/backend/internal/aiengine/bandit"
 	"github.com/zhangguijunshi/backend/internal/aiengine/cache"
 	"github.com/zhangguijunshi/backend/internal/aiengine/converge"
 	"github.com/zhangguijunshi/backend/internal/aiengine/exec"
 	"github.com/zhangguijunshi/backend/internal/aiengine/gateway"
 	"github.com/zhangguijunshi/backend/internal/aiengine/output"
+	"github.com/zhangguijunshi/backend/internal/aiengine/playbook"
 	"github.com/zhangguijunshi/backend/internal/aiengine/pregen"
 	"github.com/zhangguijunshi/backend/internal/aiengine/rule"
 	"github.com/zhangguijunshi/backend/internal/aiengine/semantic"
@@ -192,21 +195,49 @@ func run() error {
 		billingSvc:    billingSvc,
 	})
 	ruleEngine := rule.NewEngine(rule.DefaultSeeds(), margin.Guard{MarginFloorPct: defaultMarginFloorPct})
+	// M3-S3 attribution + bandit + playbook (CONTRACT §14.7). dev: in-memory
+	// repos; the coupon/visit/groupbuy ports adapt the real domain services
+	// (groupbuy has no strategy linkage yet → StartedSucceeded no-ops, §14.8).
+	// A nil rewardSource/itemResolver would disable crediting; here we wire
+	// them so the 02:00 BanditUpdate cron credits real rewards.
+	attrRepo := attribution.NewMemoryRepo()
+	attrComputer := attribution.NewComputer(
+		attribution.Sources{
+			Coupons:  couponStatsAdapter{marketingSvc},
+			Visits:   visitCounterAdapter{billingSvc},
+			Groupbuy: groupbuyStatsAdapter{groupbuySvc},
+		},
+		itemLoaderAdapter{strategySvc},
+	)
+	banditRepo := bandit.NewMemoryRepo()
+	banditLearner := bandit.NewLearner(banditRepo, bandit.DefaultConfig(),
+		bandit.WithRewardSource(attrComputer),
+		bandit.WithItemResolver(itemResolverAdapter{strategySvc}),
+	)
+	playbookStore := playbook.NewStore()
 	pipeline := aiengine.NewPipeline(
 		signalCollector, ruleEngine, agent.New(gw), converge.NewTop3(),
 		output.NewEncoder(strategySvc), cacheL1,
 		aiengine.WithBusinessType("fruit"),
 		aiengine.WithSemanticCache(semCache),
+		aiengine.WithPlaybookStore(playbookStore),
+		aiengine.WithBanditLearner(banditLearner),
 	)
 	executor := exec.NewExecutor(
 		strategySvc, margin.Guard{MarginFloorPct: defaultMarginFloorPct},
 		couponIssuerAdapter{marketingSvc}, msgSenderAdapter{reachSvc},
 		priceUpdaterAdapter{catalogSvc}, groupbuyOpenerAdapter{groupbuySvc},
 	)
-	// M3-S2 pregen scheduler (CONTRACT §13.3.5). dev: tenantEnumeratorAdapter
-	// returns empty so BatchGenerate is a no-op until production wires a real
-	// tenant store; the cron loop still starts (incremental channel ready).
-	scheduler := pregen.NewScheduler(pipeline, cacheL1, semCache, tenantEnumeratorAdapter{})
+	// M3-S2 pregen scheduler + M3-S3 attribution/bandit crons (CONTRACT §13.3.5
+	// / §14.7). dev: tenantEnumeratorAdapter returns empty so all cron jobs are
+	// no-ops until production wires a real tenant store; the cron loop still
+	// starts (incremental channel + attribution/bandit ready for manual calls).
+	tenEnum := tenantEnumeratorAdapter{}
+	scheduler := pregen.NewScheduler(pipeline, cacheL1, semCache, tenEnum,
+		pregen.WithAttribution(attrRepo, attrComputer),
+		pregen.WithBanditLearner(banditLearner),
+		pregen.WithItemEnumerator(strategyItemEnumeratorAdapter{strategySvc}),
+	)
 	go func() {
 		if err := scheduler.Start(); err != nil {
 			log.Warn("pregen scheduler start failed", zap.Error(err))
@@ -216,23 +247,24 @@ func run() error {
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),
 		Handler: httpserver.New(httpserver.Deps{
-			Cfg:        cfg,
-			DB:         database,
-			JWT:        jwtMgr,
-			Store:      store,
-			AuthSvc:    authSvc,
-			Catalog:    catalogSvc,
-			Billing:    billingSvc,
-			Inventory:  inventorySvc,
-			Membership: membershipSvc,
-			Marketing:  marketingSvc,
-			Reach:      reachSvc,
-			Groupbuy:   groupbuySvc,
-			CRM:        crmSvc,
-			Strategy:   strategySvc,
-			Pipeline:   pipeline,
-			Executor:   executor,
-			DevMock:    cfg.Multitenancy.DevMockHeader,
+			Cfg:         cfg,
+			DB:          database,
+			JWT:         jwtMgr,
+			Store:       store,
+			AuthSvc:     authSvc,
+			Catalog:     catalogSvc,
+			Billing:     billingSvc,
+			Inventory:   inventorySvc,
+			Membership:  membershipSvc,
+			Marketing:   marketingSvc,
+			Reach:       reachSvc,
+			Groupbuy:    groupbuySvc,
+			CRM:         crmSvc,
+			Strategy:    strategySvc,
+			Pipeline:    pipeline,
+			Executor:    executor,
+			Attribution: attrRepo,
+			DevMock:     cfg.Multitenancy.DevMockHeader,
 		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,

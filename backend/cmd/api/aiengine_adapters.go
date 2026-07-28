@@ -18,7 +18,9 @@ import (
 	"context"
 	"time"
 
+	"github.com/zhangguijunshi/backend/internal/aiengine/attribution"
 	"github.com/zhangguijunshi/backend/internal/aiengine/exec"
+	"github.com/zhangguijunshi/backend/internal/aiengine/pregen"
 	"github.com/zhangguijunshi/backend/internal/aiengine/signal"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
@@ -27,6 +29,8 @@ import (
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/internal/reach"
+	"github.com/zhangguijunshi/backend/internal/strategy"
+	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
 // signalLookuperAdapter adapts catalog/inventory/membership/billing to
@@ -182,3 +186,196 @@ type tenantEnumeratorAdapter struct{}
 func (tenantEnumeratorAdapter) ActiveTenantIDs(_ context.Context) ([]int64, error) {
 	return nil, nil
 }
+
+// strategyItemEnumeratorAdapter adapts strategy.Service onto pregen's
+// StrategyItemEnumerator port (M3-S3 §14.7). ListExecutedSince walks the
+// tenant's strategies and returns items in the executed state whose
+// ExecutedAt is at or after `since`, each annotated with its strategy's
+// StoreID (StrategyItem has no StoreID field). Cross-tenant records are never
+// returned (strategy.Service resolves tenant from ctx via EnforceTenant).
+// Limit caps the strategy scan (<=0 → 200) — a tuned pgx query replaces this
+// once the pgx repo lands (CONTRACT §14.8).
+type strategyItemEnumeratorAdapter struct{ svc *strategy.Service }
+
+func (a strategyItemEnumeratorAdapter) ListExecutedSince(ctx context.Context, tenantID int64, since time.Time, limit int) ([]pregen.ExecutedItem, error) {
+	if a.svc == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	strats, err := a.svc.List(withTenantCtx(ctx, tenantID), strategy.StrategyFilter{Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]pregen.ExecutedItem, 0, len(strats))
+	for _, s := range strats {
+		if s == nil {
+			continue
+		}
+		for _, it := range s.Items {
+			if it.ExecutionStatus != strategy.ItemExecuted || it.ExecutedAt == nil {
+				continue
+			}
+			if it.ExecutedAt.Before(since) {
+				continue
+			}
+			cp := it
+			out = append(out, pregen.ExecutedItem{Item: &cp, StoreID: s.StoreID})
+		}
+	}
+	return out, nil
+}
+
+// Compile-time: the adapters satisfy their respective anti-corruption ports.
+var (
+	_ attribution.CouponStats       = (*couponStatsAdapter)(nil)
+	_ attribution.VisitCounter      = (*visitCounterAdapter)(nil)
+	_ attribution.GroupbuyStats     = (*groupbuyStatsAdapter)(nil)
+	_ attribution.ItemLoader        = (*itemLoaderAdapter)(nil)
+	_ pregen.StrategyItemEnumerator = (*strategyItemEnumeratorAdapter)(nil)
+)
+
+// withTenantCtx injects tenantID into ctx as a system-sourced identity so the
+// anti-corruption port adapters can call domain services that resolve tenant
+// via multitenancy.EnforceTenant(ctx). The M3-S3 attribution/bandit ports pass
+// tenantID explicitly (CONTRACT §14.3 frozen signatures) AND the domain
+// services re-derive it from ctx — we align the two here (CONTRACT §14.7).
+func withTenantCtx(ctx context.Context, tenantID int64) context.Context {
+	return multitenancy.WithContext(ctx, multitenancy.Context{
+		TenantID: tenantID,
+		Source:   multitenancy.SourceSystem,
+	})
+}
+
+// couponStatsAdapter adapts marketing.Service.ListByStrategy onto
+// attribution.CouponStats. SentRedeemed returns the coupons issued
+// (sent) and redeemed (used) under one strategy_id — the AI attribution link
+// (marketing.MemberCoupon.StrategyID, M3-S3 additive). sent==0 means the
+// strategy issued no coupons (non-coupon action) → the Computer skips the
+// coupon_redeem metric. Errors degrade to (0,0,nil) (best-effort, §14.5).
+type couponStatsAdapter struct{ svc *marketing.Service }
+
+func (a couponStatsAdapter) SentRedeemed(ctx context.Context, tenantID, strategyID int64) (int, int, error) {
+	if a.svc == nil || strategyID <= 0 {
+		return 0, 0, nil
+	}
+	mcs, err := a.svc.ListByStrategy(withTenantCtx(ctx, tenantID), strategyID, "")
+	if err != nil {
+		return 0, 0, nil
+	}
+	sent := len(mcs)
+	redeemed := 0
+	for _, mc := range mcs {
+		if mc != nil && mc.Status == marketing.MCStatusUsed {
+			redeemed++
+		}
+	}
+	return sent, redeemed, nil
+}
+
+// visitCounterAdapter adapts billing.Service.DailySummary onto
+// attribution.VisitCounter. SinceCount sums paid order counts per natural day
+// across [since, now]; BaselineCount returns the 7-day-pre average daily order
+// count scaled to the same window duration (dev approximation, §14.7/§14.8 — a
+// tuned pgx query replaces this once the pgx repo lands). Errors degrade to 0.
+type visitCounterAdapter struct{ svc *billing.Service }
+
+func (a visitCounterAdapter) SinceCount(ctx context.Context, tenantID, storeID int64, since time.Time) (int, error) {
+	if a.svc == nil || storeID <= 0 {
+		return 0, nil
+	}
+	bctx := withTenantCtx(ctx, tenantID)
+	now := time.Now()
+	total := 0
+	for d := truncateDay(since); !d.After(now); d = d.AddDate(0, 0, 1) {
+		s, err := a.svc.DailySummary(bctx, storeID, d)
+		if err != nil {
+			continue
+		}
+		total += s.OrderCount
+	}
+	return total, nil
+}
+
+func (a visitCounterAdapter) BaselineCount(ctx context.Context, tenantID, storeID int64, window time.Duration, before time.Time) (float64, error) {
+	if a.svc == nil || storeID <= 0 || window <= 0 {
+		return 0, nil
+	}
+	bctx := withTenantCtx(ctx, tenantID)
+	// Average paid orders per day over the 7 days preceding `before`.
+	var sum float64
+	n := 0
+	for i := 1; i <= 7; i++ {
+		d := before.AddDate(0, 0, -i)
+		s, err := a.svc.DailySummary(bctx, storeID, d)
+		if err != nil {
+			continue
+		}
+		sum += float64(s.OrderCount)
+		n++
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	avgDaily := sum / float64(n)
+	// Scale the per-day average to the actual window duration.
+	return avgDaily * (float64(window) / float64(24*time.Hour)), nil
+}
+
+// groupbuyStatsAdapter adapts groupbuy onto attribution.GroupbuyStats.
+// M2-S2 groupbuy rows carry no strategy_id (CONTRACT §14.8 显式延后), so this
+// returns (0,0,nil) in dev → the Computer skips groupbuy_success. Production
+// wires a real count here once groupbuy→strategy_item linkage lands (M4).
+type groupbuyStatsAdapter struct{ svc *groupbuy.Service }
+
+func (a groupbuyStatsAdapter) StartedSucceeded(_ context.Context, _, _ int64) (int, int, error) {
+	return 0, 0, nil
+}
+
+// itemLoaderAdapter adapts strategy.Service.GetItem onto attribution.ItemLoader
+// (the Computer resolves an item to compute Reward without importing
+// strategy.Service, CONTRACT §14.3.0 / §14.3.1).
+type itemLoaderAdapter struct{ svc *strategy.Service }
+
+func (a itemLoaderAdapter) GetItem(ctx context.Context, tenantID, itemID int64) (*strategy.StrategyItem, error) {
+	if a.svc == nil {
+		return nil, strategy.ErrNotFound
+	}
+	return a.svc.GetItem(withTenantCtx(ctx, tenantID), itemID)
+}
+
+// itemResolverAdapter adapts strategy.Service onto bandit.ItemResolver. Resolve
+// maps an item to its arm key (ruleID = item.ReasonType), owning strategyID, and
+// storeID (via the parent strategy). bandit never imports strategy (§14.3.0).
+type itemResolverAdapter struct{ svc *strategy.Service }
+
+func (a itemResolverAdapter) Resolve(ctx context.Context, tenantID, itemID int64) (string, int64, int64, error) {
+	if a.svc == nil {
+		return "", 0, 0, nil
+	}
+	bctx := withTenantCtx(ctx, tenantID)
+	item, err := a.svc.GetItem(bctx, itemID)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	storeID := int64(0)
+	if strat, serr := a.svc.Get(bctx, item.StrategyID); serr == nil && strat != nil {
+		storeID = strat.StoreID
+	}
+	return item.ReasonType, item.StrategyID, storeID, nil
+}
+
+// truncateDay returns t truncated to its natural day in the local location.
+func truncateDay(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
+// Compile-time: the adapters satisfy their respective anti-corruption ports.
+var (
+	_ attribution.CouponStats   = (*couponStatsAdapter)(nil)
+	_ attribution.VisitCounter  = (*visitCounterAdapter)(nil)
+	_ attribution.GroupbuyStats = (*groupbuyStatsAdapter)(nil)
+	_ attribution.ItemLoader    = (*itemLoaderAdapter)(nil)
+)
