@@ -75,6 +75,83 @@ func (r *MemoryOrderRepo) ListByDate(_ context.Context, tenantID, storeID int64,
 	return out, nil
 }
 
+// OrderTotalByMembers implements OrderRepo. It sums the total_cents of the
+// tenant's PAID orders matching memberIDs within [since, until] (paid-time
+// inclusive). Empty memberIDs or since.After(until) yields 0. Only orders
+// owned by tenantID are considered (cross-tenant orders are skipped).
+func (r *MemoryOrderRepo) OrderTotalByMembers(_ context.Context, tenantID int64, memberIDs []int64, since, until time.Time) (int64, error) {
+	if len(memberIDs) == 0 || since.After(until) {
+		return 0, nil
+	}
+	set := make(map[int64]struct{}, len(memberIDs))
+	for _, id := range memberIDs {
+		set[id] = struct{}{}
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var total int64
+	for _, o := range r.byID {
+		if o.TenantID != tenantID || o.Status != orderStatusPaid {
+			continue
+		}
+		if _, ok := set[o.MemberID]; !ok {
+			continue
+		}
+		if !orderPaidInRange(o, since, until) {
+			continue
+		}
+		total += o.TotalCents
+	}
+	return total, nil
+}
+
+// RepurchaseMembers implements OrderRepo. It counts the distinct memberIDs
+// that have at least one PAID order within [since, until] (paid-time
+// inclusive) in tenantID. Empty memberIDs or since.After(until) yields 0.
+func (r *MemoryOrderRepo) RepurchaseMembers(_ context.Context, tenantID int64, memberIDs []int64, since, until time.Time) (int, error) {
+	if len(memberIDs) == 0 || since.After(until) {
+		return 0, nil
+	}
+	set := make(map[int64]struct{}, len(memberIDs))
+	for _, id := range memberIDs {
+		set[id] = struct{}{}
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	repurchased := make(map[int64]struct{})
+	for _, o := range r.byID {
+		if o.TenantID != tenantID || o.Status != orderStatusPaid {
+			continue
+		}
+		if _, ok := set[o.MemberID]; !ok {
+			continue
+		}
+		if !orderPaidInRange(o, since, until) {
+			continue
+		}
+		repurchased[o.MemberID] = struct{}{}
+	}
+	return len(repurchased), nil
+}
+
+// orderPaidInRange reports whether o was paid within [since, until]
+// (inclusive). Orders without a PaidAt are not in range (paid orders always
+// carry PaidAt, set by CreateOrder; non-paid statuses are filtered upstream).
+func orderPaidInRange(o *Order, since, until time.Time) bool {
+	if o.PaidAt == nil {
+		return false
+	}
+	t := *o.PaidAt
+	if t.Before(since) || t.After(until) {
+		return false
+	}
+	return true
+}
+
 // cloneOrder returns a deep copy of o (Items slice copied, PaidAt pointer
 // re-pointed at a fresh time value) so internal state is never aliased.
 func cloneOrder(o *Order) *Order {

@@ -269,3 +269,51 @@ func (s *Service) ListByStrategy(ctx context.Context, strategyID int64, status s
 	}
 	return s.repo.ListByStrategy(ctx, tenantID, strategyID, status)
 }
+
+// MembersByStrategy returns the deduplicated MemberIDs of every member the
+// given strategy reached — i.e. the set of members who hold at least one
+// member-coupon carrying strategy_id == strategyID (the M3-S3 AI attribution
+// link). It is the repurchase / revenue attribution feed: those counters need
+// "which members did this strategy touch" to measure post-touch repurchase rate
+// and revenue uplift, so the main thread's repurchaseCounterAdapter and revenue
+// handler will call this (M4).
+//
+// strategyID<=0 yields an empty slice (the strategy touched nobody). The
+// tenantID parameter is the strategy's owner tenant; when it disagrees with
+// the ctx tenant (resolved via multitenancy.EnforceTenant) the result is empty
+// — cross-tenant callers learn nothing (ARCH-01). An empty result is returned
+// as (nil, nil). It reuses ListByStrategy(ctx, strategyID, "") for the lookup,
+// preserving the returned order and keeping only the first occurrence of each
+// MemberID. Returns errors, never panics.
+func (s *Service) MembersByStrategy(ctx context.Context, tenantID, strategyID int64) ([]int64, error) {
+	if strategyID <= 0 {
+		return nil, nil
+	}
+	ctxTenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if tenantID != ctxTenantID {
+		return nil, nil
+	}
+	mcs, err := s.ListByStrategy(ctx, strategyID, "")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[int64]struct{}, len(mcs))
+	out := make([]int64, 0, len(mcs))
+	for _, mc := range mcs {
+		if mc == nil {
+			continue
+		}
+		if _, ok := seen[mc.MemberID]; ok {
+			continue
+		}
+		seen[mc.MemberID] = struct{}{}
+		out = append(out, mc.MemberID)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}

@@ -15,15 +15,19 @@ package handler
 import (
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/zhangguijunshi/backend/internal/aiengine"
 	"github.com/zhangguijunshi/backend/internal/aiengine/attribution"
 	"github.com/zhangguijunshi/backend/internal/aiengine/exec"
+	"github.com/zhangguijunshi/backend/internal/billing"
+	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
+	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
 // AIEngineHandler serves the AI engine endpoints.
@@ -34,12 +38,18 @@ type AIEngineHandler struct {
 	// M3-S3 attribution read API (CONTRACT §14.7). nil disables the
 	// /strategies/:id/attribution endpoint cleanly.
 	attr attribution.Repo
+	// M3-S3 收尾 best-effort revenue_cny 估算 (CONTRACT §14.9). mkt resolves the
+	// strategy-touched member set; bill sums their paid-order total in the
+	// [ExecutedAt, now] window. nil either → revenue_cny surfaces as null.
+	mkt  *marketing.Service
+	bill *billing.Service
 }
 
-// NewAIEngineHandler constructs an AIEngineHandler. Any of the four may be nil
-// in a minimal test fixture; the corresponding endpoints are then not wired.
-func NewAIEngineHandler(p *aiengine.Pipeline, ex *exec.Executor, s *strategy.Service, attrRepo attribution.Repo) *AIEngineHandler {
-	return &AIEngineHandler{pipeline: p, executor: ex, strategy: s, attr: attrRepo}
+// NewAIEngineHandler constructs an AIEngineHandler. Any of the six may be nil
+// in a minimal test fixture; the corresponding endpoints / best-effort fields
+// are then not wired.
+func NewAIEngineHandler(p *aiengine.Pipeline, ex *exec.Executor, s *strategy.Service, attrRepo attribution.Repo, mktSvc *marketing.Service, billSvc *billing.Service) *AIEngineHandler {
+	return &AIEngineHandler{pipeline: p, executor: ex, strategy: s, attr: attrRepo, mkt: mktSvc, bill: billSvc}
 }
 
 type todayRequest struct {
@@ -181,7 +191,8 @@ type attributionItemDTO struct {
 	CouponRedeem *float64 `json:"coupon_redeem,omitempty"`    // 核销率 0-1, null=无券数据
 	VisitUplift  *float64 `json:"visit_uplift,omitempty"`     // 到店反推增量, null=无数据
 	GroupbuySucc *float64 `json:"groupbuy_success,omitempty"` // 拼团成团率 0-1, null=无数据
-	RevenueCNY   *float64 `json:"revenue_cny,omitempty"`      // 增收估算, M3-S3 best-effort null
+	Repurchase   *float64 `json:"repurchase,omitempty"`       // 触达会员复购率 0-1, M3-S3 best-effort null
+	RevenueCNY   *float64 `json:"revenue_cny,omitempty"`      // 增收估算(元), M3-S3 best-effort null
 }
 
 // attributionResponseDTO is the dashboard payload for one strategy.
@@ -197,8 +208,12 @@ type attributionResponseDTO struct {
 //
 // Missing metrics surface as null (the boss sees "—" not a misleading 0);
 // cross-tenant access returns 40404 (indistinguishable from absence, ARCH-01).
-// revenue_cny is M3-S3 best-effort null — real revenue attribution needs order
-// amount linkage and lands in M4 (CONTRACT §14.8).
+// revenue_cny is M3-S3 best-effort: the handler resolves the strategy-touched
+// members via marketing.MembersByStrategy, then sums their paid-order total in
+// the [item.ExecutedAt, now] window via billing.OrderTotalByMembers. nil
+// mkt/bill, nil ExecutedAt, or any upstream error → revenue_cny is null (no
+// panic, no cross-tenant leakage — both ports resolve tenant from the verified
+// ctx via multitenancy). moments_engage remains null (no data source, M4).
 func (h *AIEngineHandler) GetAttribution(c *gin.Context) {
 	if h.strategy == nil || h.attr == nil {
 		httpx.Fail(c, errcode.ErrInternal)
@@ -209,7 +224,8 @@ func (h *AIEngineHandler) GetAttribution(c *gin.Context) {
 		httpx.Fail(c, errcode.ErrParam)
 		return
 	}
-	s, err := h.strategy.Get(c.Request.Context(), id)
+	ctx := c.Request.Context()
+	s, err := h.strategy.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, strategy.ErrNotFound) {
 			httpx.Fail(c, errcode.ErrStrategyNotFound)
@@ -218,9 +234,17 @@ func (h *AIEngineHandler) GetAttribution(c *gin.Context) {
 		httpx.FailError(c, err)
 		return
 	}
+	// System-sourced identity so the marketing/billing ports (which call
+	// multitenancy.EnforceTenant) re-derive the same tenant the boss context
+	// already verified. Aligned with the adapter wiring in cmd/api.
+	mctx := multitenancy.WithContext(ctx, multitenancy.Context{
+		TenantID: s.TenantID,
+		Source:   multitenancy.SourceSystem,
+	})
+	now := time.Now()
 	items := make([]attributionItemDTO, 0, len(s.Items))
 	for _, it := range s.Items {
-		metrics, _ := h.attr.LatestPerMetric(c.Request.Context(), s.TenantID, it.ID)
+		metrics, _ := h.attr.LatestPerMetric(ctx, s.TenantID, it.ID)
 		dto := attributionItemDTO{
 			Rank:       it.Rank,
 			ActionType: it.ActionType,
@@ -234,6 +258,20 @@ func (h *AIEngineHandler) GetAttribution(c *gin.Context) {
 		}
 		if v, ok := metrics[attribution.MetricGroupbuySuccess]; ok {
 			dto.GroupbuySucc = &v
+		}
+		if v, ok := metrics[attribution.MetricRepurchase]; ok {
+			dto.Repurchase = &v
+		}
+		// revenue_cny best-effort (M3-S3 收尾). Only computable when both
+		// ports are wired, the item was executed (ExecutedAt != nil), and the
+		// strategy touched ≥1 member. Errors degrade to null, never panic.
+		if h.mkt != nil && h.bill != nil && it.StrategyID > 0 && it.ExecutedAt != nil {
+			if memberIDs, mErr := h.mkt.MembersByStrategy(mctx, s.TenantID, it.StrategyID); mErr == nil && len(memberIDs) > 0 {
+				if totalCents, bErr := h.bill.OrderTotalByMembers(mctx, memberIDs, *it.ExecutedAt, now); bErr == nil && totalCents > 0 {
+					v := float64(totalCents) / 100.0
+					dto.RevenueCNY = &v
+				}
+			}
 		}
 		items = append(items, dto)
 	}

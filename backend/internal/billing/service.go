@@ -218,6 +218,31 @@ func (s *Service) GetOrder(ctx context.Context, id int64) (*Order, error) {
 	return s.repo.GetByID(ctx, tenantID, id)
 }
 
+// OrderTotalByMembers sums the total_cents of the ctx tenant's PAID orders
+// whose MemberID is in memberIDs and whose paid time falls in [since, until]
+// (inclusive). Empty memberIDs or since.After(until) returns 0,nil. This is
+// the best-effort revenue basis used by M3-S3 attribution revenueAdapter and
+// the repurchase metric (CONTRACT §14); errors surface to the caller, the
+// integration layer degrades rather than panicking.
+func (s *Service) OrderTotalByMembers(ctx context.Context, memberIDs []int64, since, until time.Time) (int64, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return s.repo.OrderTotalByMembers(ctx, tenantID, memberIDs, since, until)
+}
+
+// RepurchaseMembers returns the count of DISTINCT members in memberIDs with
+// at least one PAID order in [since, until] (inclusive) within the ctx
+// tenant. Empty memberIDs or since.After(until) returns 0,nil.
+func (s *Service) RepurchaseMembers(ctx context.Context, memberIDs []int64, since, until time.Time) (int, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return s.repo.RepurchaseMembers(ctx, tenantID, memberIDs, since, until)
+}
+
 // DailySummary aggregates the ctx tenant's paid orders for storeID on the
 // natural day containing day. Profit = Net - Cost; TopProducts sorted by qty
 // desc (tie: gross desc, then product id asc), capped at 5.

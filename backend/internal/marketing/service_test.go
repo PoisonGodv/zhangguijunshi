@@ -389,6 +389,141 @@ func TestListMemberCoupons_ByStatus(t *testing.T) {
 	}
 }
 
+// --- MembersByStrategy (M3-S3 repurchase/revenue attribution feed) ---
+
+// issueStrategised issues one ai_strategy coupon to memberID under strategyID
+// (helper for the MembersByStrategy tests).
+func issueStrategised(t *testing.T, s *Service, ctx context.Context, memberID, couponID, strategyID int64) {
+	t.Helper()
+	if _, err := s.Issue(ctx, IssueInput{
+		MemberID: memberID, CouponID: couponID,
+		Source: SourceAIStrategy, StrategyID: strategyID,
+	}); err != nil {
+		t.Fatalf("issue under strategy %d for member %d: %v", strategyID, memberID, err)
+	}
+}
+
+func TestMembersByStrategy_DedupPreserveOrder(t *testing.T) {
+	s := newSvc(t, WithMemberLookuper(fakeLookuper{exists: true}))
+	c := mustCreate(t, s, TypeCash, CouponParams{OffCents: 100})
+	ctx := ctxWithTenant(50021)
+	s.UpdateStatus(ctx, c.ID, StatusActive)
+
+	// strategy 9001 touches 7001 twice (dedup), plus 7002 and 7003.
+	issueStrategised(t, s, ctx, 7001, c.ID, 9001) // mc id 1
+	issueStrategised(t, s, ctx, 7001, c.ID, 9001) // mc id 2 (dup member)
+	issueStrategised(t, s, ctx, 7002, c.ID, 9001) // mc id 3
+	issueStrategised(t, s, ctx, 7003, c.ID, 9001) // mc id 4
+	// strategy 9002 must not leak into 9001's result.
+	issueStrategised(t, s, ctx, 7004, c.ID, 9002) // mc id 5
+
+	ids, err := s.MembersByStrategy(ctx, 50021, 9001)
+	if err != nil {
+		t.Fatalf("MembersByStrategy: %v", err)
+	}
+	// ListByStrategy returns ID-desc; dedup keeps first-seen → 7003,7002,7001.
+	want := []int64{7003, 7002, 7001}
+	if !equalInt64s(ids, want) {
+		t.Fatalf("expect %v (deduped, order-preserving), got %v", want, ids)
+	}
+}
+
+func TestMembersByStrategy_StrategyIsolation(t *testing.T) {
+	s := newSvc(t, WithMemberLookuper(fakeLookuper{exists: true}))
+	c := mustCreate(t, s, TypeCash, CouponParams{OffCents: 100})
+	ctx := ctxWithTenant(50021)
+	s.UpdateStatus(ctx, c.ID, StatusActive)
+
+	// Only strategy 9002 has coupons; 9001 should be empty (nil, nil).
+	issueStrategised(t, s, ctx, 7004, c.ID, 9002)
+	issueStrategised(t, s, ctx, 7001, c.ID, 9002)
+
+	empty, err := s.MembersByStrategy(ctx, 50021, 9001)
+	if err != nil {
+		t.Fatalf("MembersByStrategy empty strategy: %v", err)
+	}
+	if empty != nil {
+		t.Fatalf("strategy with no coupons: expect nil, got %v", empty)
+	}
+	// 9002 returns its two members, deduped, and 9001's members do not leak.
+	got, err := s.MembersByStrategy(ctx, 50021, 9002)
+	if err != nil {
+		t.Fatalf("MembersByStrategy 9002: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expect 2 members under strategy 9002, got %v", got)
+	}
+	for _, id := range got {
+		if id != 7001 && id != 7004 {
+			t.Errorf("unexpected member %d under strategy 9002", id)
+		}
+	}
+}
+
+func TestMembersByStrategy_NonPositiveStrategyEmpty(t *testing.T) {
+	s := newSvc(t, WithMemberLookuper(fakeLookuper{exists: true}))
+	c := mustCreate(t, s, TypeCash, CouponParams{OffCents: 100})
+	ctx := ctxWithTenant(50021)
+	s.UpdateStatus(ctx, c.ID, StatusActive)
+	issueStrategised(t, s, ctx, 7001, c.ID, 9001)
+
+	for _, sid := range []int64{0, -5} {
+		ids, err := s.MembersByStrategy(ctx, 50021, sid)
+		if err != nil {
+			t.Fatalf("strategy %d: expect nil err, got %v", sid, err)
+		}
+		if ids != nil {
+			t.Fatalf("strategy %d: expect nil slice, got %v", sid, ids)
+		}
+	}
+}
+
+func TestMembersByStrategy_CrossTenantEmpty(t *testing.T) {
+	s := newSvc(t, WithMemberLookuper(fakeLookuper{exists: true}))
+	c := mustCreate(t, s, TypeCash, CouponParams{OffCents: 100})
+	ctxA := ctxWithTenant(50021)
+	s.UpdateStatus(ctxA, c.ID, StatusActive)
+	issueStrategised(t, s, ctxA, 7001, c.ID, 9001)
+	issueStrategised(t, s, ctxA, 7002, c.ID, 9001)
+
+	// ctx carries tenant A, but the caller passes tenant B → cross-tenant →
+	// empty (no leakage of tenant A's reached-members).
+	ids, err := s.MembersByStrategy(ctxA, 50022, 9001)
+	if err != nil {
+		t.Fatalf("cross-tenant: expect nil err, got %v", err)
+	}
+	if ids != nil {
+		t.Fatalf("cross-tenant: expect nil, got %v", ids)
+	}
+}
+
+func TestMembersByStrategy_NoCtxTenantErrors(t *testing.T) {
+	s := newSvc(t, WithMemberLookuper(fakeLookuper{exists: true}))
+	c := mustCreate(t, s, TypeCash, CouponParams{OffCents: 100})
+	ctx := ctxWithTenant(50021)
+	s.UpdateStatus(ctx, c.ID, StatusActive)
+	issueStrategised(t, s, ctx, 7001, c.ID, 9001)
+
+	// No tenant in ctx → EnforceTenant fails → error (not a panic, not empty).
+	_, err := s.MembersByStrategy(context.Background(), 50021, 9001)
+	if err == nil {
+		t.Fatal("no-tenant-in-ctx should error, not return nil")
+	}
+}
+
+// equalInt64s reports whether two int64 slices are element-wise equal.
+func equalInt64s(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // --- fakes ---
 
 type fakeLookuper struct{ exists bool }

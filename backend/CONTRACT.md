@@ -2116,9 +2116,9 @@ import (
 const (
     MetricCouponRedeem    = "coupon_redeem"     // 本期真实计算
     MetricVisitUplift     = "visit_uplift"      // 本期真实计算
-    MetricGroupbuySuccess = "groupbuy_success"  // 本期真实计算(best-effort, 无 linkage 则不 emit)
-    MetricRepurchase      = "repurchase"        // 本期不产出(无数据源, 延后)
-    MetricMomentsEngage   = "moments_engage"    // 本期不产出(无数据源, 延后)
+    MetricGroupbuySuccess = "groupbuy_success"  // 本期真实计算(按 strategy_id 归因, §14.9)
+    MetricRepurchase      = "repurchase"        // 本期 best-effort 产出(coupon 类 item; 触达会员在 [executedAt,measuredAt] 内复购率, §14.9)
+    MetricMomentsEngage   = "moments_engage"    // 本期不产出(无企微互动数据源, 延后 M4)
 )
 
 // Measurement 一条 (item, metric, value, measured_at) 事实, 1:1 映射 strategy_attribution.
@@ -2171,10 +2171,16 @@ type VisitCounter interface {
 type GroupbuyStats interface {
     StartedSucceeded(ctx context.Context, tenantID, strategyID int64) (started, succeeded int, err error)
 }
+// RepurchaseCounter 反腐端口 → marketing+billing. 返回 strategyID 触达会员在 [executedAt, measuredAt] 的复购率
+// (去重会员中 ≥1 笔已付订单占比, clip [0,1]); 触达集空/上游 err → 0,nil → 不 emit. §14.9.
+type RepurchaseCounter interface {
+    Rate(ctx context.Context, tenantID, strategyID int64, executedAt, measuredAt time.Time) (float64, error)
+}
 type Sources struct {
-    Coupons  CouponStats
-    Visits   VisitCounter
-    Groupbuy GroupbuyStats
+    Coupons    CouponStats
+    Visits     VisitCounter
+    Groupbuy   GroupbuyStats
+    Repurchase RepurchaseCounter
 }
 
 // Computer 由一项已执行 strategy_item + 其 store 产出 Measurement 事实. 拥有 metric 语义与 reward 归一化.
@@ -2347,4 +2353,20 @@ func (l *Learner) CreditItem(ctx context.Context, tenantID, itemID int64) (*Arm,
 
 ### 14.8 显式延后（不在 M3-S3）
 
-repurchase/moments_engage metric（无数据源，需企微互动/复购窗口接线，M4）；revenue_cny 真实估算（本期看板返 null 或 best-effort 0，需订单金额归因）；bandit arm 粒度细化到 rule.ID（本期 reason_type 7 arm）；playbook DB 化（`ai_rule` 表 + 后台 React 可视化编辑，admin-web 仍空，M4）；FE-ADMIN-03 admin-web React 看板（本期仅后端读 API，M4）；strategy_feedback 实时反哺（本期 cron 统一吃，实时异步 M4）；groupbuy→strategy_item 真实 linkage（本期 groupbuy_success 在无 linkage 时不 emit，需 exec 执行时回填 strategy_item_id，M4）；pgx repo 全局替换内存（有 PG 后）；真实 PG/Redis 接入（生产部署前）。
+bandit arm 粒度细化到 rule.ID（本期 reason_type 7 arm）；playbook DB 化（`ai_rule` 表 + 后台 React 可视化编辑，admin-web 仍空，M4）；FE-ADMIN-03 admin-web React 看板（本期仅后端读 API，M4）；strategy_feedback 实时反哺（本期 cron 统一吃，实时异步 M4）；pgx repo 全局替换内存（有 PG 后）；真实 PG/Redis 接入（生产部署前）；moments_engage metric（无企微互动数据源，需朋友圈互动 API 接线 + exec.execMomentsPost 实发，M4）。
+
+**M3-S3 收尾交付（见 §14.9）**：groupbuy→strategy linkage（本期 migration 000011 加 `groupbuys.strategy_id` 列 + `groupbuyStatsAdapter` 实装 `StatsByStrategy` → `groupbuy_success` 按 `strategy_id` 真实 emit）；revenue_cny best-effort 估算（看板 handler 调 `marketing.MembersByStrategy` + `billing.OrderTotalByMembers`，归因窗口 `[item.ExecutedAt, now]`，缺失/未执行/null 端口 → null）；repurchase metric best-effort 产出（`RepurchaseCounter` 端口，coupon 类 item 触达会员复购率）。三项从本期延后项中移出，落入"已交付 best-effort"。
+
+### 14.9 M3-S3 收尾（2026-07-28）
+
+M3-S3 收尾三项遗留已交付（集成核心 + 主线程收尾）：
+
+1. **groupbuy → strategy linkage（A1 域）**：migration `000011_groupbuy_strategy` 给 `groupbuys` 表加 `strategy_id BIGINT NOT NULL DEFAULT 0`（0=非AI来源，与 `reach_tasks.strategy_id` nullable 语义对齐：groupbuy 无 NULL 归因场景，0 即未归因）+ `idx_groupbuys_strategy(tenant_id, strategy_id)` 索引。`GroupbuyRepo.ListByStrategy(ctx, tenantID, strategyID)` 按 (tenantID, strategyID) 过滤返回全状态 groupbuy（strategyID<=0 → 空 slice）。`Service.StatsByStrategy(ctx, strategyID)` 内部 `EnforceTenant` 取租户，返 (started, succeeded)；`groupbuyStatsAdapter.StartedSucceeded` 代理到 `StatsByStrategy`（`withTenantCtx` 对齐 ctx 租户与显式 tenantID），故 `groupbuy_success` 归因 metric 按 `strategy_id` 真实计算（不再 no-op）。归因 key 是 **strategy_id**（非 strategy_item_id）—— 端口签名冻结在 `strategy_id` 粒度（§14.3.1 `GroupbuyStats.StartedSucceeded(ctx, tenantID, strategyID)`）。
+2. **billing → revenue/repurchase 反腐能力（A2 域）**：`OrderRepo.OrderTotalByMembers(ctx, tenantID, memberIDs, since, until)` 返 `total_cents`（仅 paid、按 `PaidAt` 闭区间、跨租户排除、空 memberIDs/逆序区间 → 0,nil）；`OrderRepo.RepurchaseMembers(...)` 返去重复购人数（map 去重）。`Service.OrderTotalByMembers/RepurchaseMembers` 先 `EnforceTenant` 再调 repo，无 tenant → error（不 panic）。billing 域不 import marketing/attribution（DAG 干净，纯被动按会员汇总）。
+3. **marketing → MembersByStrategy 归因 feed（A3 域）**：`Service.MembersByStrategy(ctx, tenantID, strategyID)` 返去重（first-seen wins，保 ListByStrategy 的 ID-desc 序）的触达会员 id 列表；strategyID<=0 → nil,nil；跨租户（ctx tenant ≠ 显式 tenantID）→ nil,nil；无 ctx tenant → error（不 panic 不返空）。复用 `ListByStrategy(ctx, strategyID, "")`。
+4. **集成核心（aiengine_adapters.go + computer.go + attribution.go）**：`attribution.Computer.Sources` 加 `Repurchase RepurchaseCounter` 端口（`Rate(ctx, tenantID, strategyID, executedAt, measuredAt)(float64,error)`）；`Compute` 在 `groupbuy_success` 后对 coupon 类 item 且端口非 nil 时调 `Rate`，err==nil → append `Measurement{Metric:MetricRepurchase, Value: clip01(rate)}`。`repurchaseCounterAdapter` 组合 `marketing.MembersByStrategy` + `billing.RepurchaseMembers`，全链路 degrade（nil mkt/bill / strategyID<=0 / 空会员集 / 上游 err → 0,nil，不 panic）。`groupbuyOpenerAdapter.Launch` 第8参 `_ int64` → `strategyID int64`，`CreateInput` 字面量写 `StrategyID: strategyID`（归因链路通了）。
+5. **revenue_cny 看板 best-effort（主线程 handler）**：`GetAttribution` 对每个 item 在 `mkt/bill` 均 wired、`it.StrategyID>0`、`it.ExecutedAt != nil` 时，调 `marketing.MembersByStrategy(mctx, tenantID, strategyID)` 拿触达会员，再 `billing.OrderTotalByMembers(mctx, memberIDs, *ExecutedAt, now)` 拿已付订单 total_cents，`revenue_cny = float64(totalCents)/100.0`；任一未满足/err → `revenue_cny` 字段省略（JSON null）。`mctx` 用 `multitenancy.WithContext` 注入 system-sourced 租户，对齐两个反腐端口内部 `EnforceTenant`。handler 字段加 `mkt *marketing.Service` + `bill *billing.Service`，`NewAIEngineHandler` 第5/6参挂载；router.go `Deps.Marketing/Billing` 透传（Deps 字段无新增）；main.go 调用处补 `marketingSvc`/`billingSvc`。
+
+**moments_engage 仍延后**：本期不产出（无企微朋友圈互动 API 数据源；`exec.execMomentsPost` 当前只 audit 不实发）。归因 `Computer` 不 emit `MetricMomentsEngage`，看板 `revenue_cny` 同款 best-effort 逻辑对其不适用（无触达会员集），看板字段 null。CONTRACT §14.3.1 `MetricMomentsEngage` 注释仍标"本期不产出(无企微互动数据源, 延后 M4)"。延后项见 §14.8。
+
+**best-effort 语义**：repurchase/revenue_cny/groupbuy_success 三项均为 best-effort —— 端口未 wired（dev 最小 fixture）、strategyID<=0、无触达会员、无已付订单、上游 error 任一发生 → 对应 metric/字段省略（JSON null），不 panic、不串租、不误导看板（boss 见"—"）。归因窗口口径：repurchase = `[executedAt, measuredAt]`（Computer 调用方 pregene cron 传入）；revenue_cny = `[item.ExecutedAt, now]`（handler 用请求时刻 now）。真实 PG/Redis 接入与 pgx repo 的 `ListByStrategy/OrderTotalByMembers/RepurchaseMembers` 实装为 M4 落地项（本期 Memory 双实现）。

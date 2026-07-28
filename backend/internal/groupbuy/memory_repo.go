@@ -119,6 +119,27 @@ func (r *MemoryGroupbuyRepo) ListActive(_ context.Context, tenantID, storeID int
 	return out, nil
 }
 
+// ListByStrategy returns every groupbuy (all statuses) attributed to strategyID
+// within tenantID. strategyID<=0 yields an empty (non-nil) slice. A record owned
+// by another tenant is never returned (filtered by tenantID). Ordered by ID
+// ascending. Used by Service.StatsByStrategy.
+func (r *MemoryGroupbuyRepo) ListByStrategy(_ context.Context, tenantID, strategyID int64) ([]*Groupbuy, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := []*Groupbuy{}
+	if strategyID <= 0 {
+		return out, nil
+	}
+	for _, g := range r.groupbuys {
+		if g.TenantID != tenantID || g.StrategyID != strategyID {
+			continue
+		}
+		out = append(out, cloneGroupbuy(g))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
 // UpdateStatus transitions a groupbuy's status (matched by ID + tenant) under
 // the lock, re-validating the transition so a concurrent finaliser/cancel that
 // raced past a ListActive sweep cannot corrupt a terminal squad. ErrNotFound

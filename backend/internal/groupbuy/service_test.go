@@ -466,6 +466,153 @@ func TestJoin_ConcurrentDoesNotOvershoot(t *testing.T) {
 	}
 }
 
+// TestCreate_WithStrategyID verifies the groupbuy→strategy linkage: a
+// CreateInput.StrategyID is persisted onto Groupbuy.StrategyID so the
+// groupbuy_success 归因 metric (CONTRACT §14.3.1) can be computed.
+func TestCreate_WithStrategyID(t *testing.T) {
+	s := newSvc(t)
+	ctx := ctxWithTenant(50021)
+	g, err := s.Create(ctx, CreateInput{
+		Title:      "归因团",
+		ProductID:  7,
+		StrategyID: 9001,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if g.StrategyID != 9001 {
+		t.Errorf("expect StrategyID=9001, got %d", g.StrategyID)
+	}
+	// persisted state matches
+	got, _ := s.Get(ctx, g.ID)
+	if got.StrategyID != 9001 {
+		t.Errorf("persisted StrategyID wrong: got %d", got.StrategyID)
+	}
+	// default (omitted) → 0 = 非AI来源
+	g0, _ := s.Create(ctx, CreateInput{Title: "no-strategy", ProductID: 1})
+	if g0.StrategyID != 0 {
+		t.Errorf("omitted StrategyID should default 0, got %d", g0.StrategyID)
+	}
+}
+
+// TestStatsByStrategy builds three squads under one strategy in three states
+// (active / success / failed) over a single shared repo, then asserts
+// started=3, succeeded=1. Also covers strategyID<=0 short-circuit and unknown
+// strategy returns empty.
+func TestStatsByStrategy(t *testing.T) {
+	repo := NewMemoryGroupbuyRepo()
+	ctx := ctxWithTenant(50021)
+
+	// one shared clock; FinalizeExpired advances it to expire the failed squad
+	clock := fixedNow
+	svc := New(repo, WithNowFunc(func() time.Time { return clock }))
+
+	// active squad: 24h window, required 3, nobody joins → stays active
+	gActive, err := svc.Create(ctx, CreateInput{
+		Title: "active", ProductID: 1, RequiredCount: 3, ValidHours: 24, StrategyID: 9001,
+	})
+	if err != nil {
+		t.Fatalf("create active: %v", err)
+	}
+	// success squad: required 1, one join flips to success
+	gSuccess, err := svc.Create(ctx, CreateInput{
+		Title: "success", ProductID: 1, RequiredCount: 1, StrategyID: 9001,
+	})
+	if err != nil {
+		t.Fatalf("create success: %v", err)
+	}
+	if _, _, err := svc.Join(ctx, gSuccess.ID, 7001); err != nil {
+		t.Fatalf("join success squad: %v", err)
+	}
+	// failed squad: 1h window, required 3, one join, then expire past window
+	gFailed, err := svc.Create(ctx, CreateInput{
+		Title: "failed", ProductID: 1, RequiredCount: 3, ValidHours: 1, StrategyID: 9001,
+	})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if _, _, err := svc.Join(ctx, gFailed.ID, 7002); err != nil {
+		t.Fatalf("join failed squad: %v", err)
+	}
+	clock = clock.Add(2 * time.Hour) // past gFailed.EndAt (1h); gActive (24h) still live
+	if n, err := svc.FinalizeExpired(ctx, clock); err != nil || n != 1 {
+		t.Fatalf("FinalizeExpired expect 1 finalised, got %d (%v)", n, err)
+	}
+
+	// sanity: three distinct states
+	gotA, _ := svc.Get(ctx, gActive.ID)
+	gotS, _ := svc.Get(ctx, gSuccess.ID)
+	gotF, _ := svc.Get(ctx, gFailed.ID)
+	if gotA.Status != StatusActive {
+		t.Fatalf("active squad should stay active, got %s", gotA.Status)
+	}
+	if gotS.Status != StatusSuccess {
+		t.Fatalf("success squad should be success, got %s", gotS.Status)
+	}
+	if gotF.Status != StatusFailed {
+		t.Fatalf("failed squad should be failed, got %s", gotF.Status)
+	}
+
+	// the actual metric
+	started, succeeded, err := svc.StatsByStrategy(ctx, 9001)
+	if err != nil {
+		t.Fatalf("StatsByStrategy: %v", err)
+	}
+	if started != 3 {
+		t.Errorf("expect started=3 (active+success+failed), got %d", started)
+	}
+	if succeeded != 1 {
+		t.Errorf("expect succeeded=1, got %d", succeeded)
+	}
+
+	// strategyID<=0 → (0,0,nil) short-circuit, no repo read
+	if st, su, err := svc.StatsByStrategy(ctx, 0); err != nil || st != 0 || su != 0 {
+		t.Errorf("strategyID<=0 should (0,0,nil), got (%d,%d,%v)", st, su, err)
+	}
+	// unknown strategyID → empty (started=0)
+	if st, su, err := svc.StatsByStrategy(ctx, 9999); err != nil || st != 0 || su != 0 {
+		t.Errorf("unknown strategy should (0,0,nil), got (%d,%d,%v)", st, su, err)
+	}
+}
+
+// TestListByStrategy_CrossTenant asserts a strategy's groupbuys in tenant A are
+// invisible to tenant B (ListByStrategy is tenant-scoped), and strategyID<=0
+// returns an empty slice.
+func TestListByStrategy_CrossTenant(t *testing.T) {
+	repo := NewMemoryGroupbuyRepo()
+	ctxA := ctxWithTenant(50021)
+	ctxB := ctxWithTenant(50022)
+	svcA := New(repo, WithNowFunc(func() time.Time { return fixedNow }))
+
+	gA, _ := svcA.Create(ctxA, CreateInput{Title: "a", ProductID: 1, StrategyID: 9001})
+	// tenant A owns strategy 9001's groupbuy; tenant B must not see it
+	listA, err := repo.ListByStrategy(ctxA, 50021, 9001)
+	if err != nil {
+		t.Fatalf("ListByStrategy A: %v", err)
+	}
+	if len(listA) != 1 || listA[0].ID != gA.ID {
+		t.Fatalf("tenant A should see 1 groupbuy for strategy 9001, got %v", listA)
+	}
+	listB, err := repo.ListByStrategy(ctxB, 50022, 9001)
+	if err != nil {
+		t.Fatalf("ListByStrategy B: %v", err)
+	}
+	if len(listB) != 0 {
+		t.Fatalf("tenant B must not see tenant A's groupbuys, got %d", len(listB))
+	}
+	// strategyID<=0 → empty (non-nil) slice
+	empty, err := repo.ListByStrategy(ctxA, 50021, 0)
+	if err != nil {
+		t.Fatalf("ListByStrategy zero: %v", err)
+	}
+	if empty == nil {
+		t.Fatal("expect non-nil empty slice for strategyID<=0")
+	}
+	if len(empty) != 0 {
+		t.Fatalf("strategyID<=0 should yield empty, got %d", len(empty))
+	}
+}
+
 // --- fakes ---
 
 type fakeLookuper struct{ exists bool }

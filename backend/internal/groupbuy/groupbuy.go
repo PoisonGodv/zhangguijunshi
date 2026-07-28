@@ -26,6 +26,7 @@ import (
 // inside JoinAtomic.
 type Groupbuy struct {
 	ID, TenantID, StoreID, ProductID int64
+	StrategyID                       int64 `json:"strategy_id"` // 归因键: 自哪条 strategy_item (0=非AI来源); M3-S3 groupbuy→strategy linkage
 	Title                            string
 	Params                           GroupbuyParams
 	RequiredCount                    int // 3-4 成团
@@ -85,6 +86,11 @@ type GroupbuyRepo interface {
 	Create(ctx context.Context, g *Groupbuy) (*Groupbuy, error)
 	GetByID(ctx context.Context, tenantID, id int64) (*Groupbuy, error)
 	ListActive(ctx context.Context, tenantID, storeID int64) ([]*Groupbuy, error)
+	// ListByStrategy returns every groupbuy (all statuses) attributed to
+	// strategyID within tenantID. strategyID<=0 yields an empty slice. A record
+	// owned by another tenant is never returned (filtered by tenantID). Used by
+	// Service.StatsByStrategy to compute the groupbuy_success 归因 metric.
+	ListByStrategy(ctx context.Context, tenantID, strategyID int64) ([]*Groupbuy, error)
 	UpdateStatus(ctx context.Context, tenantID, id int64, status string, now time.Time) (*Groupbuy, error)
 
 	// JoinAtomic atomically validates (not already joined, not full, active) and
@@ -113,6 +119,7 @@ type MemberLookuper interface {
 // falls back to Params.ValidHours then 24.
 type CreateInput struct {
 	StoreID, ProductID int64
+	StrategyID         int64 // 归因键: 写入 Groupbuy.StrategyID; 0=非AI来源
 	Title              string
 	Params             GroupbuyParams
 	RequiredCount      int // <=0 时取 Params.GroupSize 或默认 3

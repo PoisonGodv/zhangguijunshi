@@ -102,6 +102,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Groupbuy, error)
 	g := &Groupbuy{
 		TenantID:      tenantID,
 		StoreID:       storeScope(ctx, in.StoreID),
+		StrategyID:    in.StrategyID,
 		ProductID:     in.ProductID,
 		Title:         in.Title,
 		Params:        in.Params,
@@ -228,4 +229,30 @@ func (s *Service) FinalizeExpired(ctx context.Context, now time.Time) (int, erro
 		n++
 	}
 	return n, nil
+}
+
+// StatsByStrategy computes the 归因 metric for the groupbuy_success attribution
+// (CONTRACT §14.3.1): started = count of all groupbuys attributed to strategyID
+// in the ctx tenant (all statuses), succeeded = count of those in StatusSuccess.
+// strategyID<=0 yields (0,0,nil). Cross-tenant rows are excluded by the repo
+// (ListByStrategy filters by tenantID). The 归因 key is strategy_id.
+func (s *Service) StatsByStrategy(ctx context.Context, strategyID int64) (started, succeeded int, err error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if strategyID <= 0 {
+		return 0, 0, nil
+	}
+	list, err := s.repo.ListByStrategy(ctx, tenantID, strategyID)
+	if err != nil {
+		return 0, 0, err
+	}
+	started = len(list)
+	for _, g := range list {
+		if g.Status == StatusSuccess {
+			succeeded++
+		}
+	}
+	return started, succeeded, nil
 }

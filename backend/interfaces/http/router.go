@@ -188,7 +188,7 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.POST("/crm/living-codes/resolve", h.ResolveCode)
 	}
 	if deps.Pipeline != nil || deps.Executor != nil || deps.Strategy != nil {
-		h := handler.NewAIEngineHandler(deps.Pipeline, deps.Executor, deps.Strategy, deps.Attribution)
+		h := handler.NewAIEngineHandler(deps.Pipeline, deps.Executor, deps.Strategy, deps.Attribution, deps.Marketing, deps.Billing)
 		boss.POST("/aiengine/today", h.Today)
 		boss.GET("/aiengine/strategies", h.ListStrategies)
 		boss.GET("/aiengine/strategies/:id", h.GetStrategy)

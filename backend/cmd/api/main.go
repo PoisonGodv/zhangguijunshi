@@ -196,16 +196,18 @@ func run() error {
 	})
 	ruleEngine := rule.NewEngine(rule.DefaultSeeds(), margin.Guard{MarginFloorPct: defaultMarginFloorPct})
 	// M3-S3 attribution + bandit + playbook (CONTRACT §14.7). dev: in-memory
-	// repos; the coupon/visit/groupbuy ports adapt the real domain services
-	// (groupbuy has no strategy linkage yet → StartedSucceeded no-ops, §14.8).
-	// A nil rewardSource/itemResolver would disable crediting; here we wire
+	// repos; the coupon/visit/groupbuy/repurchase ports adapt the real domain
+	// services (groupbuy→strategy linkage is wired via StatsByStrategy so
+	// groupbuy_success is attributed back by strategy_id, §14.9). A nil
+	// rewardSource/itemResolver would disable crediting; here we wire
 	// them so the 02:00 BanditUpdate cron credits real rewards.
 	attrRepo := attribution.NewMemoryRepo()
 	attrComputer := attribution.NewComputer(
 		attribution.Sources{
-			Coupons:  couponStatsAdapter{marketingSvc},
-			Visits:   visitCounterAdapter{billingSvc},
-			Groupbuy: groupbuyStatsAdapter{groupbuySvc},
+			Coupons:    couponStatsAdapter{marketingSvc},
+			Visits:     visitCounterAdapter{billingSvc},
+			Groupbuy:   groupbuyStatsAdapter{groupbuySvc},
+			Repurchase: repurchaseCounterAdapter{mkt: marketingSvc, bill: billingSvc},
 		},
 		itemLoaderAdapter{strategySvc},
 	)

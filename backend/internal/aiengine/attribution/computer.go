@@ -30,12 +30,23 @@ type GroupbuyStats interface {
 	StartedSucceeded(ctx context.Context, tenantID, strategyID int64) (started, succeeded int, err error)
 }
 
-// Sources bundles the three anti-corruption ports. Any may be nil (dev wires
-// none); Compute skips the corresponding metric rather than panicking.
+// RepurchaseCounter is the anti-corruption port → marketing+billing. Rate
+// returns the repurchase rate of the members a strategy touched over
+// [executedAt, measuredAt]: distinct members with ≥1 paid order in the window
+// divided by the touched-member count (clipped to [0,1] by the caller). The
+// main thread adapts marketing.Service.MembersByStrategy + billing.Service.
+// RepurchaseMembers onto it; nil means "no repurchase linkage" and is skipped.
+type RepurchaseCounter interface {
+	Rate(ctx context.Context, tenantID, strategyID int64, executedAt, measuredAt time.Time) (float64, error)
+}
+
+// Sources bundles the anti-corruption ports. Any may be nil (dev wires none);
+// Compute skips the corresponding metric rather than panicking.
 type Sources struct {
-	Coupons  CouponStats
-	Visits   VisitCounter
-	Groupbuy GroupbuyStats
+	Coupons    CouponStats
+	Visits     VisitCounter
+	Groupbuy   GroupbuyStats
+	Repurchase RepurchaseCounter
 }
 
 // ItemLoader is the anti-corruption port → strategy.Service: it resolves an
@@ -165,6 +176,21 @@ func (c *Computer) Compute(ctx context.Context, tenantID int64, item *strategy.S
 				StrategyItemID: item.ID,
 				Metric:         MetricGroupbuySuccess,
 				Value:          float64(succeeded) / float64(started),
+				MeasuredAt:     measuredAt,
+			})
+		}
+	}
+
+	// repurchase — coupon-channel items (the strategy touched members via coupon
+	// issuance), only when the repurchase port is wired. The window is
+	// [executedAt, measuredAt]; errors degrade to "no metric" (no panic).
+	if couponActions[item.ActionType] && c.src.Repurchase != nil {
+		if rate, rerr := c.src.Repurchase.Rate(ctx, tenantID, strategyID, executedAt, measuredAt); rerr == nil {
+			out = append(out, Measurement{
+				TenantID:       tenantID,
+				StrategyItemID: item.ID,
+				Metric:         MetricRepurchase,
+				Value:          clip01(rate),
 				MeasuredAt:     measuredAt,
 			})
 		}

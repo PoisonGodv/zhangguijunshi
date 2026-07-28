@@ -159,13 +159,15 @@ func (a priceUpdaterAdapter) UpdatePrice(ctx context.Context, productID, costCen
 }
 
 // groupbuyOpenerAdapter adapts groupbuy.Service.Create to exec.GroupbuyOpener.
-// M2-S2 groupbuy rows carry no strategy_id; only the GroupbuyID is returned.
+// strategyID is the attribution key written onto the Groupbuy row (M3-S3
+// groupbuy→strategy linkage), so groupbuy_success can be attributed back.
 type groupbuyOpenerAdapter struct{ svc *groupbuy.Service }
 
-func (a groupbuyOpenerAdapter) Launch(ctx context.Context, storeID, productID int64, title string, priceCents int64, requiredCount, validHours int, _ int64) (*exec.GroupbuyRef, error) {
+func (a groupbuyOpenerAdapter) Launch(ctx context.Context, storeID, productID int64, title string, priceCents int64, requiredCount, validHours int, strategyID int64) (*exec.GroupbuyRef, error) {
 	g, err := a.svc.Create(ctx, groupbuy.CreateInput{
 		StoreID:       storeID,
 		ProductID:     productID,
+		StrategyID:    strategyID,
 		Title:         title,
 		Params:        groupbuy.GroupbuyParams{PriceCents: priceCents},
 		RequiredCount: requiredCount,
@@ -232,6 +234,7 @@ var (
 	_ attribution.CouponStats       = (*couponStatsAdapter)(nil)
 	_ attribution.VisitCounter      = (*visitCounterAdapter)(nil)
 	_ attribution.GroupbuyStats     = (*groupbuyStatsAdapter)(nil)
+	_ attribution.RepurchaseCounter = (*repurchaseCounterAdapter)(nil)
 	_ attribution.ItemLoader        = (*itemLoaderAdapter)(nil)
 	_ pregen.StrategyItemEnumerator = (*strategyItemEnumeratorAdapter)(nil)
 )
@@ -324,13 +327,55 @@ func (a visitCounterAdapter) BaselineCount(ctx context.Context, tenantID, storeI
 }
 
 // groupbuyStatsAdapter adapts groupbuy onto attribution.GroupbuyStats.
-// M2-S2 groupbuy rows carry no strategy_id (CONTRACT §14.8 显式延后), so this
-// returns (0,0,nil) in dev → the Computer skips groupbuy_success. Production
-// wires a real count here once groupbuy→strategy_item linkage lands (M4).
+// StartedSucceeded proxies to Service.StatsByStrategy so the groupbuy_success
+// 归因 metric is computed from real groupbuy rows linked to the strategy_id
+// (M3-S3 groupbuy→strategy linkage). strategyID<=0 or a nil svc yields
+// (0,0,nil) → the Computer skips the metric (no panic, no leakage).
 type groupbuyStatsAdapter struct{ svc *groupbuy.Service }
 
-func (a groupbuyStatsAdapter) StartedSucceeded(_ context.Context, _, _ int64) (int, int, error) {
-	return 0, 0, nil
+func (a groupbuyStatsAdapter) StartedSucceeded(ctx context.Context, tenantID, strategyID int64) (int, int, error) {
+	if a.svc == nil || strategyID <= 0 {
+		return 0, 0, nil
+	}
+	return a.svc.StatsByStrategy(withTenantCtx(ctx, tenantID), strategyID)
+}
+
+// repurchaseCounterAdapter adapts marketing.Service.MembersByStrategy +
+// billing.Service.RepurchaseMembers onto attribution.RepurchaseCounter (the
+// M3-S3 repurchase 归因 feed). Rate returns the share of the strategy-touched
+// members who placed ≥1 paid order in [executedAt, measuredAt] (inclusive),
+// clipped to [0,1]. A nil mkt/bill, an empty touched set, or any upstream error
+// degrades to (0, nil) so the Computer's repurchase metric simply isn't
+// emitted (best-effort, §14.5 — never panics, never leaks cross-tenant).
+type repurchaseCounterAdapter struct {
+	mkt  *marketing.Service
+	bill *billing.Service
+}
+
+func (a repurchaseCounterAdapter) Rate(ctx context.Context, tenantID, strategyID int64, executedAt, measuredAt time.Time) (float64, error) {
+	if a.mkt == nil || a.bill == nil || strategyID <= 0 {
+		return 0, nil
+	}
+	mctx := withTenantCtx(ctx, tenantID)
+	memberIDs, err := a.mkt.MembersByStrategy(mctx, tenantID, strategyID)
+	if err != nil {
+		return 0, nil
+	}
+	if len(memberIDs) == 0 {
+		return 0, nil
+	}
+	n, err := a.bill.RepurchaseMembers(mctx, memberIDs, executedAt, measuredAt)
+	if err != nil {
+		return 0, nil
+	}
+	v := float64(n) / float64(len(memberIDs))
+	if v < 0 {
+		v = 0
+	}
+	if v > 1 {
+		v = 1
+	}
+	return v, nil
 }
 
 // itemLoaderAdapter adapts strategy.Service.GetItem onto attribution.ItemLoader
@@ -371,11 +416,3 @@ func truncateDay(t time.Time) time.Time {
 	y, m, d := t.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
 }
-
-// Compile-time: the adapters satisfy their respective anti-corruption ports.
-var (
-	_ attribution.CouponStats   = (*couponStatsAdapter)(nil)
-	_ attribution.VisitCounter  = (*visitCounterAdapter)(nil)
-	_ attribution.GroupbuyStats = (*groupbuyStatsAdapter)(nil)
-	_ attribution.ItemLoader    = (*itemLoaderAdapter)(nil)
-)

@@ -24,14 +24,14 @@ import (
 )
 
 // metric constants — one-to-one with the strategy_attribution.metric CHECK
-// constraint in migration 000007. repurchase / moments_engage have no data
-// source this sprint and are NOT emitted by Compute (dashboard shows "—").
+// constraint in migration 000007. moments_engage has no data source this sprint
+// and is NOT emitted by Compute (dashboard shows "—").
 const (
 	MetricCouponRedeem    = "coupon_redeem"    // 本期真实计算
 	MetricVisitUplift     = "visit_uplift"     // 本期真实计算
 	MetricGroupbuySuccess = "groupbuy_success" // 本期真实计算(best-effort, 无 linkage 则不 emit)
-	MetricRepurchase      = "repurchase"       // 本期不产出(无数据源, 延后)
-	MetricMomentsEngage   = "moments_engage"   // 本期不产出(无数据源, 延后)
+	MetricRepurchase      = "repurchase"       // 本期 best-effort 产出(coupon 类 item; 复购窗口推导: 触达会员在 [executedAt,measuredAt] 内复购率)
+	MetricMomentsEngage   = "moments_engage"   // 本期不产出(无企微互动数据源, 延后 M4)
 )
 
 // validMetrics mirrors the migration 000007 CHECK constraint for early input

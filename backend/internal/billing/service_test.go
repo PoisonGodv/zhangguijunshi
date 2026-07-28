@@ -345,3 +345,228 @@ func TestDefaultOrderNoFunc(t *testing.T) {
 		t.Errorf("OrderNo prefix = %q, want ZG", got)
 	}
 }
+
+// seedPaidOrderWithMember writes a PAID order for tenantID+memberID directly
+// into repo (bypassing CreateOrder's tenant-from-ctx path) so a test can
+// place orders in arbitrary tenants and members. PaidAt is set to paidAt.
+func seedPaidOrderWithMember(repo *MemoryOrderRepo, tenantID, memberID int64, total int64, paidAt time.Time) {
+	o := &Order{
+		TenantID:   tenantID,
+		MemberID:   memberID,
+		Status:     orderStatusPaid,
+		TotalCents: total,
+		PaidCents:  total,
+		PaidAt:     &paidAt,
+	}
+	if _, err := repo.Create(context.Background(), o); err != nil {
+		panic(err)
+	}
+}
+
+func TestOrderTotalByMembers_Numbers(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	ctx := ctxFor(100, 10, 7)
+
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+
+	// Members 1 and 2 each have paid orders inside the window.
+	seedPaidOrderWithMember(repo, 100, 1, 1000, fixedNow)
+	seedPaidOrderWithMember(repo, 100, 2, 500, fixedNow)
+	seedPaidOrderWithMember(repo, 100, 1, 250, fixedNow) // member 1 twice -> 1250 total
+	// Member 3 outside the window -> excluded.
+	seedPaidOrderWithMember(repo, 100, 3, 9999, time.Date(2026, 6, 1, 0, 0, 0, 0, time.Local))
+
+	got, err := svc.OrderTotalByMembers(ctx, []int64{1, 2, 3}, since, until)
+	if err != nil {
+		t.Fatalf("OrderTotalByMembers: %v", err)
+	}
+	if want := int64(1750); got != want { // 1000+500+250
+		t.Errorf("total = %d, want %d", got, want)
+	}
+
+	// Subsetting members still works: only member 1 -> 1250.
+	got, err = svc.OrderTotalByMembers(ctx, []int64{1}, since, until)
+	if err != nil {
+		t.Fatalf("OrderTotalByMembers subset: %v", err)
+	}
+	if want := int64(1250); got != want {
+		t.Errorf("subset total = %d, want %d", got, want)
+	}
+}
+
+func TestOrderTotalByMembers_CrossTenantExcluded(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	ctx := ctxFor(100, 10, 7)
+
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+
+	// Tenant A member 1 + a tenant B order for the SAME member id must not be
+	// counted when tenant A asks.
+	seedPaidOrderWithMember(repo, 100, 1, 1000, fixedNow)
+	seedPaidOrderWithMember(repo, 200, 1, 9999, fixedNow) // different tenant
+
+	got, err := svc.OrderTotalByMembers(ctx, []int64{1}, since, until)
+	if err != nil {
+		t.Fatalf("OrderTotalByMembers: %v", err)
+	}
+	if want := int64(1000); got != want {
+		t.Errorf("total = %d, want %d (tenant B order leaked)", got, want)
+	}
+}
+
+func TestOrderTotalByMembers_NonPaidExcluded(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	ctx := ctxFor(100, 10, 7)
+
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+
+	// A pending order (same member, same window) must not add to total.
+	pending := &Order{
+		TenantID:   100,
+		MemberID:   1,
+		Status:     "pending",
+		TotalCents: 9999,
+		PaidAt:     &fixedNow,
+	}
+	if _, err := repo.Create(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	seedPaidOrderWithMember(repo, 100, 1, 1000, fixedNow)
+
+	got, err := svc.OrderTotalByMembers(ctx, []int64{1}, since, until)
+	if err != nil {
+		t.Fatalf("OrderTotalByMembers: %v", err)
+	}
+	if want := int64(1000); got != want {
+		t.Errorf("total = %d, want %d (pending leaked)", got, want)
+	}
+}
+
+func TestOrderTotalByMembers_EmptyAndReversedRange(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	ctx := ctxFor(100, 10, 7)
+
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+	seedPaidOrderWithMember(repo, 100, 1, 1000, fixedNow)
+
+	// Empty memberIDs -> 0.
+	got, err := svc.OrderTotalByMembers(ctx, nil, since, until)
+	if err != nil || got != 0 {
+		t.Errorf("empty memberIDs: got=%d err=%v, want 0/nil", got, err)
+	}
+	// since > until -> 0.
+	got, err = svc.OrderTotalByMembers(ctx, []int64{1}, until, since)
+	if err != nil || got != 0 {
+		t.Errorf("reversed range: got=%d err=%v, want 0/nil", got, err)
+	}
+}
+
+func TestOrderTotalByMembers_NoTenant(t *testing.T) {
+	svc, _ := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+	_, err := svc.OrderTotalByMembers(context.Background(), []int64{1}, since, until)
+	if !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
+	}
+}
+
+func TestRepurchaseMembers_Count(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	ctx := ctxFor(100, 10, 7)
+
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+
+	// Members 1 and 2 have paid orders; member 3 does not; member 4 has a
+	// pending order (not a repurchase). Member 1 has TWO paid orders -> still
+	// counts once (de-duped).
+	seedPaidOrderWithMember(repo, 100, 1, 1000, fixedNow)
+	seedPaidOrderWithMember(repo, 100, 1, 500, fixedNow) // dup -> counts once
+	seedPaidOrderWithMember(repo, 100, 2, 200, fixedNow)
+	pending := &Order{TenantID: 100, MemberID: 4, Status: "pending", TotalCents: 100, PaidAt: &fixedNow}
+	if _, err := repo.Create(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.RepurchaseMembers(ctx, []int64{1, 2, 3, 4}, since, until)
+	if err != nil {
+		t.Fatalf("RepurchaseMembers: %v", err)
+	}
+	if want := 2; got != want { // members 1 and 2 only
+		t.Errorf("count = %d, want %d", got, want)
+	}
+}
+
+func TestRepurchaseMembers_CrossTenantExcluded(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	ctx := ctxFor(100, 10, 7)
+
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+
+	// Same member id, two tenants; tenant A must see only its own repurchaser.
+	seedPaidOrderWithMember(repo, 100, 1, 1000, fixedNow)
+	seedPaidOrderWithMember(repo, 200, 1, 1000, fixedNow) // tenant B
+
+	got, err := svc.RepurchaseMembers(ctx, []int64{1}, since, until)
+	if err != nil {
+		t.Fatalf("RepurchaseMembers: %v", err)
+	}
+	if want := 1; got != want {
+		t.Errorf("count = %d, want %d (tenant B leaked)", got, want)
+	}
+}
+
+func TestRepurchaseMembers_RangeExcludesOutside(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	ctx := ctxFor(100, 10, 7)
+
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+
+	// Member 1 paid before the window -> not a repurchaser in this window.
+	seedPaidOrderWithMember(repo, 100, 1, 1000, time.Date(2026, 6, 1, 0, 0, 0, 0, time.Local))
+	// Member 2 paid exactly on since boundary -> in range (inclusive).
+	seedPaidOrderWithMember(repo, 100, 2, 100, since)
+
+	got, err := svc.RepurchaseMembers(ctx, []int64{1, 2}, since, until)
+	if err != nil {
+		t.Fatalf("RepurchaseMembers: %v", err)
+	}
+	if want := 1; got != want {
+		t.Errorf("count = %d, want %d", got, want)
+	}
+}
+
+func TestRepurchaseMembers_EmptyAndReversedRange(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	ctx := ctxFor(100, 10, 7)
+
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+	seedPaidOrderWithMember(repo, 100, 1, 1000, fixedNow)
+
+	got, err := svc.RepurchaseMembers(ctx, nil, since, until)
+	if err != nil || got != 0 {
+		t.Errorf("empty memberIDs: got=%d err=%v, want 0/nil", got, err)
+	}
+	got, err = svc.RepurchaseMembers(ctx, []int64{1}, until, since)
+	if err != nil || got != 0 {
+		t.Errorf("reversed range: got=%d err=%v, want 0/nil", got, err)
+	}
+}
+
+func TestRepurchaseMembers_NoTenant(t *testing.T) {
+	svc, _ := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
+	until := time.Date(2026, 7, 31, 23, 59, 59, 0, time.Local)
+	_, err := svc.RepurchaseMembers(context.Background(), []int64{1}, since, until)
+	if !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
+	}
+}

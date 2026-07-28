@@ -67,6 +67,18 @@ type OrderRepo interface {
 	// natural day containing day (any time-of-day). storeID<=0 means all
 	// stores of the tenant.
 	ListByDate(ctx context.Context, tenantID, storeID int64, day time.Time) ([]*Order, error)
+
+	// OrderTotalByMembers sums the total_cents of the tenant's PAID orders
+	// whose MemberID is in memberIDs and whose paid time falls in [since,
+	// until] (inclusive both ends). Empty memberIDs or since.After(until)
+	// returns 0 with nil error. Cross-tenant orders are excluded by tenantID.
+	OrderTotalByMembers(ctx context.Context, tenantID int64, memberIDs []int64, since, until time.Time) (int64, error)
+
+	// RepurchaseMembers returns the count of DISTINCT members in memberIDs
+	// that have at least one PAID order in [since, until] (inclusive both
+	// ends) within tenantID. Empty memberIDs or since.After(until) returns
+	// 0 with nil error. Cross-tenant orders are excluded.
+	RepurchaseMembers(ctx context.Context, tenantID int64, memberIDs []int64, since, until time.Time) (int, error)
 }
 
 // PricedProduct is billing's minimal anti-corruption mirror of a catalog
