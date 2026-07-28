@@ -33,7 +33,8 @@ type Member struct {
 	Points                int64
 	TotalSpentCents       int64
 	LastVisitAt           *time.Time
-	Status                string // active|blocked
+	Birthday              *time.Time // 可空, YYYY-MM-DD; M3-S2 signal 当日生日枚举用
+	Status                string     // active|blocked
 	CreatedAt, UpdatedAt  time.Time
 }
 
@@ -90,6 +91,11 @@ type MemberRepo interface {
 	// "consume"/"recharge"; amountCents is the signed change; balanceAfter is
 	// the resulting account balance.
 	AppendBalanceLog(ctx context.Context, tenantID, memberID, accountID int64, typ string, amountCents, balanceAfter, refOrderID int64) error
+
+	// ListMembers enumerates members within tenantID matching f (M3-S2 signal
+	// real enumeration). Empty filter fields are not filtering; Limit<=0 defaults
+	// to 500. Cross-tenant members are never returned.
+	ListMembers(ctx context.Context, tenantID int64, f MemberFilter) ([]*Member, error)
 
 	// findMemberIDByPhone returns the id of the member registered under
 	// (tenantID, phoneHash); ok=false when none. Drives Join idempotency.
@@ -151,4 +157,24 @@ type RedeemInput struct {
 type RedeemResult struct {
 	MemberID, Points, BalanceCents int64
 	ConsumedCents                  int64
+}
+
+// MemberFilter narrows a ListMembers query (M3-S2 signal real enumeration).
+// TenantID is NOT part of the filter: it is resolved from ctx by every repo /
+// service call (ARCH-01) and injected separately. A nil/zero field means "do
+// not filter on this dimension".
+type MemberFilter struct {
+	// SleepBefore selects members whose LastVisitAt is before this value
+	// (30-day-sleeping signal). A member who never visited (LastVisitAt nil) is
+	// treated as sleeping and matches. Nil = do not filter.
+	SleepBefore *time.Time
+	// MinPoints selects members with Points >= MinPoints (high-value signal).
+	// 0 = do not filter.
+	MinPoints int64
+	// BirthdayOn selects members whose Birthday month+day equals this value's
+	// month+day (birthday-today signal). A member with nil Birthday never matches.
+	// Nil = do not filter.
+	BirthdayOn *time.Time
+	// Limit caps the result size; <=0 defaults to 500.
+	Limit int
 }

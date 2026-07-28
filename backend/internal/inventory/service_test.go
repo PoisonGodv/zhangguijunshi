@@ -514,3 +514,193 @@ func TestService_ConcurrentConsumeNoOversell(t *testing.T) {
 		t.Errorf("final stock = %d, want 0 (no oversell)", stock)
 	}
 }
+
+// --- ListNearingBatches (M3-S2) ---
+
+// purchaseExpiry stocks productID with a batch expiring at exp.
+func purchaseExpiry(t *testing.T, svc *Service, clk *clock, ctx context.Context, productID, qty int64, exp *time.Time) *Batch {
+	t.Helper()
+	b, err := svc.PurchaseIn(ctx, PurchaseInInput{ProductID: productID, Quantity: qty, InPriceCents: 100, ExpiryDate: exp})
+	if err != nil {
+		t.Fatalf("PurchaseIn(product=%d): %v", productID, err)
+	}
+	clk.advance(time.Minute)
+	return b
+}
+
+func TestListNearingBatches_CrossProduct(t *testing.T) {
+	svc, repo, clk := newService(tenantLookuper())
+	defer setNowForTest(clk.now)()
+	ctx := ctxFor(100, 10, 7)
+
+	// Pin the repo clock to the service clock so "now" is deterministic.
+	now := clk.now()
+	within3 := now.AddDate(0, 0, 3)
+	within10 := now.AddDate(0, 0, 10)
+	far := now.AddDate(0, 0, 60)
+
+	// Product 1: one batch within 3 days, one far out.
+	b1 := purchaseExpiry(t, svc, clk, ctx, 1, 5, &within3)
+	purchaseExpiry(t, svc, clk, ctx, 1, 5, &far)
+	// Product 2: one batch within 10 days (but beyond 3).
+	b2 := purchaseExpiry(t, svc, clk, ctx, 2, 8, &within10)
+	// Product 1: a batch with NO expiry -> excluded.
+	purchaseExpiry(t, svc, clk, ctx, 1, 3, nil)
+
+	// withinDays=3 -> only b1 (exp <= now+3d).
+	got, err := svc.ListNearingBatches(ctx, 10, 3)
+	if err != nil {
+		t.Fatalf("ListNearingBatches(3d): %v", err)
+	}
+	if len(got) != 1 || got[0].ID != b1.ID {
+		t.Errorf("within3d = %+v, want only b1(id=%d)", got, b1.ID)
+	}
+
+	// withinDays=10 -> b1 + b2 (both exp <= now+10d); the no-expiry batch stays out.
+	got, err = svc.ListNearingBatches(ctx, 10, 10)
+	if err != nil {
+		t.Fatalf("ListNearingBatches(10d): %v", err)
+	}
+	ids := map[int64]bool{}
+	for _, b := range got {
+		ids[b.ID] = true
+	}
+	if len(got) != 2 || !ids[b1.ID] || !ids[b2.ID] {
+		t.Errorf("within10d = %+v, want b1+b2", got)
+	}
+
+	// Sanity: the far-out batch never appears.
+	for _, b := range got {
+		if b.ExpiryDate.After(within10) {
+			t.Errorf("batch %d expiry %v beyond deadline returned", b.ID, b.ExpiryDate)
+		}
+	}
+	_ = repo
+}
+
+func TestListNearingBatches_ExcludesNoExpiryAndCleared(t *testing.T) {
+	svc, _, clk := newService(tenantLookuper())
+	defer setNowForTest(clk.now)()
+	ctx := ctxFor(100, 10, 7)
+
+	now := clk.now()
+	soon := now.AddDate(0, 0, 2)
+
+	// Batch with no expiry -> excluded from nearing list.
+	purchaseExpiry(t, svc, clk, ctx, 1, 5, nil)
+
+	// Active batch expiring soon -> included before drain.
+	keep := purchaseExpiry(t, svc, clk, ctx, 1, 5, &soon)
+	got, err := svc.ListNearingBatches(ctx, 10, 7)
+	if err != nil {
+		t.Fatalf("ListNearingBatches pre-drain: %v", err)
+	}
+	found := false
+	for _, b := range got {
+		if b.ID == keep.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("active soon-expiry batch %d missing from nearing list", keep.ID)
+	}
+
+	// Drain ALL of product 1 (FIFO drains the no-expiry lot first, then keep).
+	// After this, keep is cleared (qty=0, status=cleared) -> excluded.
+	if _, err := svc.ConsumeFIFO(ctx, 10, 1, 10, 1); err != nil {
+		t.Fatalf("ConsumeFIFO drain: %v", err)
+	}
+	got, err = svc.ListNearingBatches(ctx, 10, 7)
+	if err != nil {
+		t.Fatalf("ListNearingBatches post-drain: %v", err)
+	}
+	for _, b := range got {
+		if b.ID == keep.ID {
+			t.Errorf("cleared batch %d should not appear in nearing list", b.ID)
+		}
+		if b.Quantity <= 0 {
+			t.Errorf("zero/negative quantity batch %d returned", b.ID)
+		}
+		if b.ExpiryDate == nil {
+			t.Errorf("no-expiry batch %d returned", b.ID)
+		}
+	}
+}
+
+func TestListNearingBatches_StoreScoped(t *testing.T) {
+	svc, _, clk := newService(tenantLookuper())
+	defer setNowForTest(clk.now)()
+	ctx := ctxFor(100, 10, 7)
+
+	now := clk.now()
+	soon := now.AddDate(0, 0, 2)
+
+	// Stock in store 10 (via ctx) and store 11 (explicit).
+	purchaseExpiry(t, svc, clk, ctx, 1, 5, &soon)
+	if _, err := svc.PurchaseIn(ctx, PurchaseInInput{StoreID: 11, ProductID: 2, Quantity: 4, InPriceCents: 100, ExpiryDate: &soon}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Store 10 sees only its own batch.
+	got10, err := svc.ListNearingBatches(ctx, 10, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range got10 {
+		if b.StoreID != 10 {
+			t.Errorf("store-10 query returned batch from store %d", b.StoreID)
+		}
+	}
+	// Store 11 sees only its own.
+	got11, err := svc.ListNearingBatches(ctx, 11, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range got11 {
+		if b.StoreID != 11 {
+			t.Errorf("store-11 query returned batch from store %d", b.StoreID)
+		}
+	}
+}
+
+func TestListNearingBatches_CrossTenantInvisible(t *testing.T) {
+	svc, repo, clk := newService(tenantLookuper())
+	defer setNowForTest(clk.now)()
+	ctxA := ctxFor(100, 10, 7)
+	ctxB := ctxFor(200, 20, 8)
+
+	now := clk.now()
+	soon := now.AddDate(0, 0, 2)
+
+	// Tenant A stocks a nearing batch.
+	bA := purchaseExpiry(t, svc, clk, ctxA, 1, 5, &soon)
+
+	// Tenant B lists its store 10 -> must see nothing (cross-tenant).
+	got, err := svc.ListNearingBatches(ctxB, 10, 7)
+	if err != nil {
+		t.Fatalf("ListNearingBatches: %v", err)
+	}
+	for _, b := range got {
+		if b.TenantID == 100 {
+			t.Errorf("tenant 200 saw tenant 100 batch %d", b.ID)
+		}
+	}
+
+	// Tenant B's repo-level call also excludes tenant A's batch.
+	direct, err := repo.ListNearingBatches(ctxB, 200, 10, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range direct {
+		if b.ID == bA.ID {
+			t.Errorf("repo cross-tenant leak: tenant 200 saw batch %d", bA.ID)
+		}
+	}
+}
+
+func TestListNearingBatches_NoTenantRejected(t *testing.T) {
+	svc, _, _ := newService(tenantLookuper())
+	if _, err := svc.ListNearingBatches(context.Background(), 10, 7); !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
+	}
+}

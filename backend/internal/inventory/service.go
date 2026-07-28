@@ -247,6 +247,21 @@ func (s *Service) Stock(ctx context.Context, storeID, productID int64) (int64, e
 	return total, nil
 }
 
+// ListNearingBatches returns the ctx tenant's active lots within storeID whose
+// ExpiryDate is set and falls on or before now+withinDays — cross-product
+// (M3-S2 signal real enumeration). Lots without an ExpiryDate are excluded.
+func (s *Service) ListNearingBatches(ctx context.Context, storeID int64, withinDays int) ([]*Batch, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	batches, err := s.repo.ListNearingBatches(ctx, tenantID, storeID, withinDays)
+	if err != nil {
+		return nil, mapRepoErr(err)
+	}
+	return batches, nil
+}
+
 // ListMovements returns the ctx tenant's ledger entries matching f.
 func (s *Service) ListMovements(ctx context.Context, f MovementFilter) ([]*Movement, error) {
 	tenantID, err := multitenancy.EnforceTenant(ctx)

@@ -38,17 +38,67 @@ type signalLookuperAdapter struct {
 	billingSvc    *billing.Service
 }
 
-// Inventory returns nearing-expiry / slow-moving / high-margin items. M3-S1
-// best-effort: empty (no cross-product enumeration in M2 inventory); the
-// pipeline's cold-start seed covers the empty case.
-func (a signalLookuperAdapter) Inventory(_ context.Context, _, _ int64) ([]signal.InventorySig, error) {
-	return nil, nil
+// Inventory returns nearing-expiry items by enumerating inventory batches
+// (M3-S2: real enumeration via ListNearingBatches, replacing M3-S1's best-effort
+// empty return). Each nearing batch is enriched with the product's name / cost /
+// price via catalog.GetByID; a catalog miss leaves CostCents from the batch and
+// PriceCents=0 (rule's margin guard then skips it). SlowMoving/HighMargin stay
+// false (M3-S2 does not yet compute those tags here — dataquality integration
+// is a later milestone).
+func (a signalLookuperAdapter) Inventory(ctx context.Context, _, storeID int64) ([]signal.InventorySig, error) {
+	if a.inventorySvc == nil {
+		return nil, nil
+	}
+	batches, err := a.inventorySvc.ListNearingBatches(ctx, storeID, 3) // ≤3 天临期
+	if err != nil {
+		return nil, nil // best-effort: degrade to empty, cold-start covers
+	}
+	out := make([]signal.InventorySig, 0, len(batches))
+	for _, b := range batches {
+		if b == nil || b.Quantity <= 0 || b.ExpiryDate == nil {
+			continue
+		}
+		days := int(time.Until(*b.ExpiryDate).Hours() / 24)
+		sig := signal.InventorySig{
+			ProductID:    b.ProductID,
+			CostCents:    b.InPriceCents,
+			Stock:        float64(b.Quantity),
+			DaysToExpiry: days,
+		}
+		if a.catalogSvc != nil {
+			if p, perr := a.catalogSvc.GetByID(ctx, b.ProductID); perr == nil && p != nil {
+				sig.Name = p.Name
+				sig.CostCents = p.CostCents // catalog's cost is authoritative
+				sig.PriceCents = p.PriceCents
+			}
+		}
+		out = append(out, sig)
+	}
+	return out, nil
 }
 
-// Members returns member-aggregate stats. M3-S1 best-effort: zero (membership
-// has no List / birthday); cold-start covers.
-func (a signalLookuperAdapter) Members(_ context.Context, _ int64) (signal.MemberStats, error) {
-	return signal.MemberStats{}, nil
+// Members returns member-aggregate stats by enumerating members (M3-S2: real
+// enumeration via ListMembers, replacing M3-S1's best-effort zero). Three
+// scoped queries: sleep_30 (LastVisitAt < now-30d), birthday_today, high_value
+// (Points ≥ 1000). Errors degrade to empty (cold-start covers).
+func (a signalLookuperAdapter) Members(ctx context.Context, _ int64) (signal.MemberStats, error) {
+	if a.membershipSvc == nil {
+		return signal.MemberStats{}, nil
+	}
+	now := time.Now()
+	sleepBefore := now.AddDate(0, 0, -30)
+	sleepers, _ := a.membershipSvc.ListMembers(ctx, membership.MemberFilter{SleepBefore: &sleepBefore, Limit: 500})
+	birthdays, _ := a.membershipSvc.ListMembers(ctx, membership.MemberFilter{BirthdayOn: &now, Limit: 500})
+	highValue, _ := a.membershipSvc.ListMembers(ctx, membership.MemberFilter{MinPoints: 1000, Limit: 500})
+	hvIDs := make([]int64, 0, len(highValue))
+	for _, m := range highValue {
+		hvIDs = append(hvIDs, m.ID)
+	}
+	bdIDs := make([]int64, 0, len(birthdays))
+	for _, m := range birthdays {
+		bdIDs = append(bdIDs, m.ID)
+	}
+	return signal.MemberStats{Sleep30: len(sleepers), HighValue: hvIDs, BirthdayToday: bdIDs}, nil
 }
 
 // DailyTxn returns the daily transaction aggregate. M3-S1 best-effort: zero
@@ -121,4 +171,14 @@ func (a groupbuyOpenerAdapter) Launch(ctx context.Context, storeID, productID in
 		return nil, err
 	}
 	return &exec.GroupbuyRef{GroupbuyID: g.ID}, nil
+}
+
+// tenantEnumeratorAdapter adapts the pregen scheduler's TenantEnumerator port.
+// dev stub: ActiveTenantIDs returns nil (no real tenant store wired) so the
+// pregen BatchGenerate is a no-op in dev; production wires tenant.Service.List
+// (or a SQL enumerate) here to drive the 03:00 full-batch pre-generation.
+type tenantEnumeratorAdapter struct{}
+
+func (tenantEnumeratorAdapter) ActiveTenantIDs(_ context.Context) ([]int64, error) {
+	return nil, nil
 }

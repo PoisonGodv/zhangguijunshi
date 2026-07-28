@@ -97,6 +97,10 @@ type BatchRepo interface {
 	// ListActiveBatchesFIFO returns the active, non-empty lots of one product
 	// within (tenantID, storeID), oldest first (FIFO), ordered by CreatedAt asc.
 	ListActiveBatchesFIFO(ctx context.Context, tenantID, storeID, productID int64) ([]*Batch, error)
+	// ListNearingBatches returns all active lots within (tenantID, storeID) whose
+	// ExpiryDate is set and falls on or before now+withinDays — cross-product
+	// (M3-S2 signal real enumeration). Lots without an ExpiryDate are excluded.
+	ListNearingBatches(ctx context.Context, tenantID, storeID int64, withinDays int) ([]*Batch, error)
 	// AppendMovement appends an immutable ledger entry and returns it (with ID).
 	AppendMovement(ctx context.Context, m *Movement) (*Movement, error)
 	// ListMovements returns ledger entries within tenantID matching f.

@@ -25,7 +25,9 @@ import (
 	"github.com/zhangguijunshi/backend/internal/aiengine/exec"
 	"github.com/zhangguijunshi/backend/internal/aiengine/gateway"
 	"github.com/zhangguijunshi/backend/internal/aiengine/output"
+	"github.com/zhangguijunshi/backend/internal/aiengine/pregen"
 	"github.com/zhangguijunshi/backend/internal/aiengine/rule"
+	"github.com/zhangguijunshi/backend/internal/aiengine/semantic"
 	aisignal "github.com/zhangguijunshi/backend/internal/aiengine/signal"
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/internal/billing"
@@ -179,7 +181,10 @@ func run() error {
 	// advice. The shared margin guard (defaultMarginFloorPct) is injected into
 	// both rule and exec so the three defense-in-depth checks share one source.
 	gw, _ := gateway.NewFromConfig(cfg.AI)
+	emb := gateway.NewEmbedderFromConfig(cfg.AI)
 	strategySvc := strategy.New(strategy.NewMemoryStrategyRepo())
+	cacheL1 := cache.NewMemoryCache()
+	semCache := semantic.NewMemoryCache(emb)
 	signalCollector := aisignal.NewCollector("fruit", "", signalLookuperAdapter{
 		catalogSvc:    catalogSvc,
 		inventorySvc:  inventorySvc,
@@ -189,14 +194,24 @@ func run() error {
 	ruleEngine := rule.NewEngine(rule.DefaultSeeds(), margin.Guard{MarginFloorPct: defaultMarginFloorPct})
 	pipeline := aiengine.NewPipeline(
 		signalCollector, ruleEngine, agent.New(gw), converge.NewTop3(),
-		output.NewEncoder(strategySvc), cache.NewMemoryCache(),
+		output.NewEncoder(strategySvc), cacheL1,
 		aiengine.WithBusinessType("fruit"),
+		aiengine.WithSemanticCache(semCache),
 	)
 	executor := exec.NewExecutor(
 		strategySvc, margin.Guard{MarginFloorPct: defaultMarginFloorPct},
 		couponIssuerAdapter{marketingSvc}, msgSenderAdapter{reachSvc},
 		priceUpdaterAdapter{catalogSvc}, groupbuyOpenerAdapter{groupbuySvc},
 	)
+	// M3-S2 pregen scheduler (CONTRACT §13.3.5). dev: tenantEnumeratorAdapter
+	// returns empty so BatchGenerate is a no-op until production wires a real
+	// tenant store; the cron loop still starts (incremental channel ready).
+	scheduler := pregen.NewScheduler(pipeline, cacheL1, semCache, tenantEnumeratorAdapter{})
+	go func() {
+		if err := scheduler.Start(); err != nil {
+			log.Warn("pregen scheduler start failed", zap.Error(err))
+		}
+	}()
 
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.HTTP.Host, cfg.HTTP.Port),

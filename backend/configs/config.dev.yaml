@@ -62,6 +62,14 @@ ai:
   request_timeout: "8s"
   monthly_budget_cny: 2.0
   providers: {}
+  # Task-tier → provider+model routes (M3-S2 §13.3.7). Empty in dev → every
+  # tier falls back to defaultRoute (all lite), matching M3-S1 behavior.
+  # Staging/prod example:
+  #   routes:
+  #     lite: { provider: doubao, model: doubao-lite-32k }
+  #     v3:   { provider: deepseek, model: deepseek-chat }
+  #     r1:   { provider: deepseek, model: deepseek-reasoner }
+  routes: {}
 
 otel:
   enable: false

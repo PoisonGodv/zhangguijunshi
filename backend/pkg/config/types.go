@@ -97,6 +97,14 @@ type AIProviderConfig struct {
 	Model   string `mapstructure:"model"`
 }
 
+// AIRouteConfig binds one task tier (lite|v3|r1) to a provider+model pair
+// (M3-S2 §13.3.7). key in AIConfig.Routes is the tier name string; gateway
+// maps it to gateway.TaskTier (TierLite/TierV3/TierR1) in NewFromConfig.
+type AIRouteConfig struct {
+	Provider string `mapstructure:"provider"` // qwen|deepseek|doubao
+	Model    string `mapstructure:"model"`
+}
+
 // AIConfig configures the AI gateway (tech plan §7.8).
 type AIConfig struct {
 	// DefaultProvider selects which provider name under Providers is active.
@@ -108,6 +116,10 @@ type AIConfig struct {
 	// MonthlyBudgetCNY is the per-tenant monthly AI cost ceiling; exceeding it
 	// forces a full fallback to rules+cache (tech plan §7.8.4, plan book 6.7).
 	MonthlyBudgetCNY float64 `mapstructure:"monthly_budget_cny"`
+	// Routes binds task tiers (key "lite"|"v3"|"r1") to provider+model pairs
+	// (M3-S2 §13.3.7). Empty → gateway uses defaultRoute for every tier
+	// (M3-S1 behavior, backward compatible).
+	Routes map[string]AIRouteConfig `mapstructure:"routes"`
 }
 
 type OTelConfig struct {

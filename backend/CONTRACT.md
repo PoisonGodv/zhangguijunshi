@@ -1815,3 +1815,233 @@ ErrActionNotExecutable= Err{60022, "该动作暂不可一键执行", 200}
 ### 12.8 显式延后（不在 M3-S1）
 
 语义缓存 PGVector（AI-06，Cache 接口已留，M3-S2 实现）；凌晨预生成 cron（AI-07，M3-S2 加 pregen 包）；gateway lite/V3/R1 分层路由（AI-08，本期全 lite）；效果归因回填 + bandit（AI-10/12，表建好空，M3-S3）；剧本库后台编辑（AI-11，本期 in-code 种子，M3-S3 接 React 后台）；tool-calling LLM 循环（本期 gateway.Chat 单轮 json_object）；moments 朋友圈实发（M3-S2 依赖海报/COS）；recharge_promo 执行（M4 依赖 billing/反二清）；membership/inventory 的 List 方法补充（signal 会员/临期枚举 M3-S1 best-effort，真实枚举留 M3-S2 与 strategy_cache 同期）。
+
+---
+
+## 13. M3-S2 增量契约（AI-06 语义缓存 + AI-07 凌晨预生成 + AI-08 gateway 分层 + AI-09 成本熔断 + membership/inventory List 补充，2026-07-28）
+
+> M3-S2 是「AI 降本」sprint：语义缓存（PGVector）+ 凌晨离线预生成 cron + gateway lite/V3/R1 分层路由 + 成本熔断分层计费 + signal 真实枚举（membership/inventory List）。设计依据 ch07 §7.6-7.8 + ch05 §5.3.9。**本机无 PG/Redis/Docker**（§0 硬约束）：AI-06/07 涉及外部 infra 的部分用**双实现**（Memory dev/test + pgx/redis 生产，pgxmock 测试），生产部署配 PG/Redis/embedding API 时启用。AI-09 在 M3-S1 已基本落地（gateway.Budget + pricing），本期补分层计费 + 全局告警。
+
+### 13.1 范围与裁剪（对照 ch07 §7.6-7.8 / ch00 WBS §M3-S2）
+
+**必做**：AI-06 语义缓存（Embedder 接口 + MemorySemanticCache + PGVectorSemanticCache + migration 000008 ai_cache + 命中率 metrics）；AI-07 凌晨预生成 cron（robfig/cron + BatchGenerate + 增量重算内存 channel + 失败重试）；AI-08 gateway 分层（routes 配置化 lite/V3/R1 + ChatWithFallback 降级链已就绪）；AI-09 成本熔断分层计费（pricing 已按 tier，补全局告警 log）；membership 加 ListMembers + Member.Birthday + migration 000009；inventory 加 ListNearingBatches；signal adapter 真实枚举（替换 M3-S1 best-effort 空）；Pipeline 集成 L2 语义缓存（L1 精确 hash → L2 语义 → 生成）。
+
+**显式延后**：真实 PGVector 检索（需 PG，本期 pgx 实现/pgxmock 测试，生产配 PG 启用）；真实 Redis Stream 增量（本期内存 channel，生产配 Redis）；真实 embedding API（本期 fake/HTTP stub，生产配通义/bge-m3）；AI-10/11/12 归因/bandit/剧本库（M3-S3）；FE-ADMIN-03 归因看板（M3-S3）；pgx repo 替换内存（有 PG 后，全局）。
+
+### 13.2 迁移编号（DB-05）
+
+- `migrations/000008_ai_cache.{up,down}.sql`：`ai_cache` 表（ch07 §7.6.3 权威，注意 ch05 §5.3.9 的 `strategy_cache` 是旧命名，统一用 `ai_cache`）：id(tidentity PK)/tenant_id/business/key_text/embedding vector(1024)/advice_json(jsonb)/created_at/expires_at/hit_count int default 0。`CREATE EXTENSION IF NOT EXISTS vector`（幂等）。HNSW 索引 `ON ai_cache USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64)` + btree 索引 `(tenant_id, business, expires_at)`。down 逆序 drop 表 + `DROP EXTENSION IF EXISTS vector`（仅当无其他依赖；保守起见 down 不 drop extension，只 drop 表）。
+- `migrations/000009_member_birthday.{up,down}.sql`：`ALTER TABLE members ADD COLUMN birthday DATE`（可空，加性扩展，M3-S2 signal 用）。down `ALTER TABLE members DROP COLUMN birthday`。
+
+### 13.3 领域类型与接口（**已固定，agent 必须一字不差实现签名**）
+
+#### 13.3.1 `internal/membership` 扩展（A1，加性，不改现有契约）
+
+```go
+// Member 加 Birthday 字段（M3-S2 signal 用；migration 000009）
+type Member struct {
+    // ... 现有字段 ...
+    Birthday *time.Time // 可空，YYYY-MM-DD
+}
+// MemberRepo 加 ListMembers（加性，不改现有方法）
+type MemberRepo interface {
+    // ... 现有方法 ...
+    // ListMembers 按 filter 枚举租户内会员（M3-S2 signal 真实枚举；filter 空字段不过滤）。
+    ListMembers(ctx context.Context, tenantID int64, f MemberFilter) ([]*Member, error)
+}
+type MemberFilter struct {
+    SleepBefore *time.Time // 30天未到店（LastVisitAt < 此值）；nil 不过滤
+    MinPoints   int64      // 高价值最小积分；0 不过滤
+    BirthdayOn  *time.Time // 当天生日；nil 不过滤
+    Limit       int        // <=0 默认 500
+}
+// Service 加 ListMembers(ctx, f MemberFilter) ([]*Member, error)（首行 EnforceTenant）
+```
+> Member 需有 LastVisitAt 字段支撑 SleepBefore。若 M1-S2 Member 无此字段，A1 在 migration 000009 一并加 `last_visit_at TIMESTAMPTZ`（加性）。A1 自查现有 Member struct + migration 000004，按需补字段。
+
+#### 13.3.2 `internal/inventory` 扩展（A1，加性）
+
+```go
+// BatchRepo 加 ListNearingBatches（跨品临期枚举，M3-S2 signal 用）
+type BatchRepo interface {
+    // ... 现有方法 ...
+    // ListNearingBatches 返回 store 内所有 active 且 ExpiryDate <= now+withinDays 的批次（跨产品）。
+    ListNearingBatches(ctx context.Context, tenantID, storeID int64, withinDays int) ([]*Batch, error)
+}
+// Service 加 ListNearingBatches(ctx, storeID, withinDays int) ([]*Batch, error)（首行 EnforceTenant）
+```
+
+#### 13.3.3 `internal/aiengine/gateway` 扩展（A2，加性，不改 Provider 接口）
+
+```go
+// Embedder 是独立的 embedding 接口（不改现有 Provider；M3-S2 语义缓存用）。
+// 实现一：gateway 内置 HTTP embedder（通义/bge-m3，OpenAI 兼容 /v1/embeddings）；
+// 实现二：主线程 fake embedder（dev/test，固定向量或确定性 hash→[1024]float32）。
+type Embedder interface {
+    Embed(ctx context.Context, texts []string) ([][]float32, error)
+    Dim() int // 1024
+}
+// NewEmbedderFromConfig(cfg config.AIConfig) Embedder —— 无 API key 时返回 FakeEmbedder（确定性 hash→1024维，dev/test 用）
+// gateway.Gateway 不变（routes 已支持 WithRoute；NewFromConfig 从 cfg.AI.Routes 配 routes）
+// config.AIConfig 加 Routes map[TaskTier]AIProviderConfig? —— 见 §13.3.7
+```
+
+#### 13.3.4 `internal/aiengine/semantic`（A3，新包，import strategy + gateway Embedder）
+
+```go
+package semantic
+
+import (
+    "context"
+    "github.com/zhangguijunshi/backend/internal/aiengine/gateway"
+    "github.com/zhangguijunshi/backend/internal/strategy"
+)
+
+// SemanticCache 是 L2 语义缓存（M3-S1 的 cache.Cache 是 L1 精确 hash）。
+// TryHit 按 signalText 的 embedding 做 PGVector 余弦近邻检索（相似度>0.85 且未过期且同业态）。
+type SemanticCache interface {
+    TryHit(ctx context.Context, tenantID int64, business, signalText string) (*strategy.Strategy, bool, error)
+    Put(ctx context.Context, tenantID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error
+    // Invalidate 主动失效某 tenant 当日缓存（执行动作后调）
+    Invalidate(ctx context.Context, tenantID int64) error
+}
+
+// MemorySemanticCache：dev/test 用。fake embedding（确定性 hash→[1024]float32）+
+// 内存切片线性扫描（余弦相似度）。无 PG 依赖。命中率埋点。
+type MemorySemanticCache struct { /* embedder gateway.Embedder; mu sync.RWMutex; entries []entry; metrics */ }
+func NewMemoryCache(emb gateway.Embedder, opts ...Option) *MemorySemanticCache
+
+// PGVectorSemanticCache：生产用。pgx + pgvector-go，余弦距离 <0.15 检索。
+// 测试用 pgxmock（不连真实 PG）。主线程在无 PG 时注入 MemorySemanticCache。
+type PGVectorSemanticCache struct { /* pool *pgxpool.Pool; emb gateway.Embedder; metrics */ }
+func NewPGVectorCache(pool /* pgxpool.Pool 接口 */, emb gateway.Embedder, opts ...Option) *PGVectorSemanticCache
+
+// Metrics 命中率埋点（§7.6.5）：IncHit/IncMiss（按 tenant + global），Prometheus 暴露。
+type Metrics interface {
+    IncHit(tenantID int64)
+    IncMiss(tenantID int64)
+}
+func NewMetrics() Metrics // 内存计数 + prometheus counter
+
+// SignalText 构造缓存 key 文本（§7.6.2）：{业态 | 信号组合}，如 "fruit|weather=rain|action=clearance|days_to_expiry=2|sleep_30=18|holiday=none"。
+// 由 Pipeline 在 TryHit 前构造（或 semantic 包提供 BuildSignalText(bundle) string）。
+func BuildSignalText(b /* *signal.Bundle */ any) string
+```
+
+#### 13.3.5 `internal/aiengine/pregen`（A4，新包，import pipeline + cache + semantic + strategy）
+
+```go
+package pregen
+
+import (
+    "context"
+    "github.com/robfig/cron/v3"
+    "github.com/zhangguijunshi/backend/internal/aiengine"
+    "github.com/zhangguijunshi/backend/internal/aiengine/cache"
+    "github.com/zhangguijunshi/backend/internal/aiengine/semantic"
+)
+
+// Scheduler 凌晨预生成 + 增量重算（§7.7）。
+type Scheduler struct {
+    pipeline *aiengine.Pipeline
+    cache    cache.Cache
+    semantic semantic.SemanticCache
+    repo     TenantEnumerator // 防腐：枚举活跃租户
+    log      *zap.Logger
+    cron     *cron.Cron
+    incr     chan IncrementalJob // 内存 channel（dev）；生产换 Redis Stream（接口同）
+}
+type IncrementalJob struct {
+    TenantID int64
+    Reason   string // inventory_change|weather_change|manual_refresh|holiday_rollover
+}
+type TenantEnumerator interface {
+    ActiveTenantIDs(ctx context.Context) ([]int64, error)
+}
+// Start 启动 cron：0 3 * * * BatchGenerate（全量）+ */10 * * * * IncrementalRetry（增量重试）。
+// BatchGenerate 按 tenant 分批 50，worker pool 8 并发，调 pipeline.Run + cache.Put + semantic.Put（TTL 24h）。
+// IncrementalRetry 消费 incr channel，调 pipeline.Run 重算覆盖缓存。
+// 失败重试 ≤3（指数退避）；全量批次失败 >20% 告警 + 降级纯规则兜底。
+func (s *Scheduler) Start() error
+func (s *Scheduler) Stop() // cron.Stop()
+func (s *Scheduler) BatchGenerate(ctx context.Context) (int, error) // 返回处理条数
+func (s *Scheduler) EnqueueIncremental(job IncrementalJob)           // 非阻塞投递
+func NewScheduler(p *aiengine.Pipeline, ch cache.Cache, sem semantic.SemanticCache, repo TenantEnumerator, opts ...Option) *Scheduler
+```
+
+#### 13.3.6 `internal/aiengine/cache` L1 不变 + Pipeline 集成 L2（A5）
+
+```go
+// cache.Cache（L1 精确 hash）签名不变（M3-S1 §12.3.4）。
+// Pipeline 扩展：新增 semantic SemanticCache 字段（可选，nil 时跳过 L2）。
+// Pipeline.Run 集成顺序：
+//   0a) cache.TryHit（L1 精确 by tenant+date）→ 命中返 cache_hit
+//   0b) semantic.TryHit（L2 语义 by signalText embedding）→ 命中返 semantic_hit
+//   1-5) 生成 → cache.Put（L1）+ semantic.Put（L2，TTL 24h）
+type Pipeline struct { /* 现有字段 + semantic semantic.SemanticCache */ }
+func NewPipeline(..., ch cache.Cache, sem semantic.SemanticCache, opts ...Option) *Pipeline
+// WithSemanticCache(semantic.SemanticCache) Option（nil 跳过 L2，dev 兼容）
+// Degrade 新增值：semantic_hit（advice.degrade 字段透传前端）
+```
+
+#### 13.3.7 config AI routes（A2，加性）
+
+```go
+// config.AIConfig 加 Routes（lite/V3/R1 → provider 配置）
+type AIConfig struct {
+    // ... 现有字段 ...
+    Routes map[string]AIRouteConfig `mapstructure:"routes"` // key: "lite"|"v3"|"r1"
+}
+type AIRouteConfig struct {
+    Provider string `mapstructure:"provider"` // qwen|deepseek|doubao
+    Model    string `mapstructure:"model"`
+}
+// gateway.NewFromConfig 从 Routes 配 WithRoute(TierLite/V3/R1, Route{...})
+// config.dev.yaml 加 ai.routes 节（dev 可空→全 defaultRoute/lite）
+```
+
+### 13.4 包所有权（文件集互斥）
+
+| Agent | 只准写这些文件 |
+|---|---|
+| **M3S2-membership-inventory**（A1） | `migrations/000009_member_birthday.{up,down}.sql`；`internal/membership/{membership.go(加 Birthday+LastVisitAt+MemberFilter+ListMembers 方法签名), memory_repo.go(加 ListMembers 实现), service.go(加 ListMembers), service_test.go(加测试)}`；`internal/inventory/{inventory.go(加 ListNearingBatches 接口签名), memory_repo.go(加实现), service.go(加方法), service_test.go(加测试)}` |
+| **M3S2-gateway-config**（A2） | `internal/aiengine/gateway/{embedder.go(Embedder 接口+FakeEmbedder+HTTPEmbedder+NewEmbedderFromConfig), gateway.go(NewFromConfig 从 Routes 配 routes, 加性不改现有), embedder_test.go}`；`pkg/config/types.go(加 AIRouteConfig+Routes 字段)`；`configs/config.dev.yaml(ai.routes 节)` |
+| **M3S2-semantic**（A3） | `migrations/000008_ai_cache.{up,down}.sql`；`internal/aiengine/semantic/{cache.go(SemanticCache 接口+Metrics), memory.go(MemorySemanticCache), pgvector.go(PGVectorSemanticCache), signal_text.go(BuildSignalText), service.go, service_test.go}` |
+| **M3S2-pregen**（A4） | `internal/aiengine/pregen/{scheduler.go, batch.go, incremental.go, service.go, service_test.go}` |
+| **主线程**（A5 集成） | `internal/aiengine/cache/`（不变，只 Pipeline 集成）；`internal/aiengine/pipeline.go`（加 semantic 字段+L2 集成+WithSemanticCache）；`cmd/api/main.go`（实例化 Embedder+SemanticCache[Memory dev]+Scheduler+signalLookuperAdapter 真实枚举）；`cmd/api/aiengine_adapters.go`（signalLookuperAdapter 改真实枚举+tenantEnumeratorAdapter）；`interfaces/http/m3s2_test.go`；`go.mod`（加 pgvector-go + cron 依赖） |
+
+> **波次**：Wave 0（本 §13）→ Wave 1（A1‖A2，无跨 import）→ Wave 2（A3，依赖 A2 Embedder）→ Wave 3（A4‖A5，A4 依赖 A3；A5 依赖 A1/A3）→ 主线程集成。A1 改 membership/inventory 是**加性扩展**（不改现有方法签名），不破坏 M2 契约。
+
+### 13.5 硬约束（M3-S2 全员）
+
+1. 同 M0-M3-S1（tenant 只从 ctx/int64 分/接口+内存兜底/跨租户 ErrNotFound）。
+2. **加性扩展**：membership/inventory/gateway 的现有方法签名**不动**，只新增方法 + 字段。现有测试必须继续通过。
+3. **双实现**：semantic.SemanticCache 有 Memory + PGVector 两实现。主线程无 PG 时注入 Memory（dev/test）。PGVector 实现用 pgxmock 测试（不连真实 PG）。
+4. **Embedder 独立接口**（不破坏 gateway.Provider）：semantic 包定义 Embedder 需求，主线程注入 gateway.Embedder（fake/HTTP）。
+5. **新依赖白名单**（§3 加）：`github.com/pgvector/pgvector-go v0.3.0`、`github.com/robfig/cron/v3 v3.0.1`。其他不引。
+6. **embedding 维度固定 1024**（bge-m3/text-embedding-v3）。FakeEmbedder 返确定性 hash→[1024]float32（同文本同向量，可命中）。
+7. **语义缓存阈值**：余弦距离 <0.15（相似度 >0.85），同业态，未过期（TTL 24h）。Memory 实现用线性扫描余弦相似度。
+8. **预生成不阻断**：cron 失败/超时降级纯规则兜底，保证白天有建议。BatchGenerate 单户失败 ≤3 重试。
+9. **成本熔断**：M3-S1 已有 gateway.Budget（MonthlyLimitCNY=2.0），M3-S2 补全局告警（log + pkg/notify 若接入）。pricing 已按 tier（lite/V3/R1 不同价）。
+10. package 注释 + gofmt 干净 + `-race` 全绿。
+
+### 13.6 DoD（M3-S2）
+
+- `go build/vet/gofmt/test -race ./...` 全绿（预计 ~38 包）。
+- membership 单测：ListMembers（SleepBefore/MinPoints/BirthdayOn 过滤）+ Birthday 字段 + 串户。
+- inventory 单测：ListNearingBatches（跨品临期，withinDays 过滤）+ 串户。
+- gateway 单测：Embedder（fake 确定性 + HTTP stub）+ NewFromConfig 从 Routes 配 lite/V3/R1 + ChatWithFallback 降级链。
+- semantic 单测：MemoryCache（fake embedding，同 signalText 命中/相似命中/不相似 miss/TTL 过期/Invalidate）+ PGVectorCache（pgxmock 验证 SQL + 参数）+ Metrics（IncHit/IncMiss）+ BuildSignalText。
+- pregen 单测：Scheduler（fake pipeline+cache+semantic+TenantEnumerator）BatchGenerate 分批 + 增量 channel + 失败重试 ≤3。
+- HTTP 冒烟（主线程 m3s2_test.go）：①语义缓存命中（同 signalText 二次 /today → degrade=semantic_hit，pipeline 不重算）②预生成 cron（手动触发 BatchGenerate → cache 填充 → /today 命中）③gateway 分层降级（fake provider lite 返错→V3 成功）④真实信号（membership/inventory List → rule 命中真实建议）⑤串户。
+
+### 13.7 配置 + 依赖（主线程）
+
+- `go.mod` 加 `github.com/pgvector/pgvector-go v0.3.0` + `github.com/robfig/cron/v3 v3.0.1`（`go mod tidy`）。
+- `config.dev.yaml` 加 `ai.routes` 节（dev 空→全 defaultRoute/lite）。
+- main.go：`emb := gateway.NewEmbedderFromConfig(cfg.AI)`（dev→FakeEmbedder）；`semCache := semantic.NewMemoryCache(emb)`（dev，无 PG）；`pipeline := aiengine.NewPipeline(..., cacheL1, semCache, aiengine.WithSemanticCache(semCache))`；`scheduler := pregen.NewScheduler(pipeline, cacheL1, semCache, tenantEnumeratorAdapter{...})` + `scheduler.Start()`（goroutine）；signalLookuperAdapter 改真实枚举（用 membership.ListMembers + inventory.ListNearingBatches）。
+- HTTP：不新增端点（M3-S1 的 /aiengine/today 等不变，degrade 新增 semantic_hit 值）。
+
+### 13.8 显式延后（不在 M3-S2）
+
+真实 PGVector 检索（需 PG，本期 pgx 实现+pgxmock 测试，生产配 PG 启用 PGVectorCache）；真实 Redis Stream 增量重算（本期内存 channel，生产配 Redis Stream）；真实 embedding API（本期 FakeEmbedder，生产配通义 text-embedding-v3/bge-m3）；AI-10/11/12 归因/bandit/剧本库（M3-S3）；FE-ADMIN-03 归因看板（M3-S3）；pgx repo 全局替换内存（有 PG 后）；白天增量重算的真实触发器接入（inventory/weather 事件 → pregen.EnqueueIncremental，本期接口留好，触发器接 M3-S3）。

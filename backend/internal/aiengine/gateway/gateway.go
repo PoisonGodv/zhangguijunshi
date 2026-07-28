@@ -157,6 +157,10 @@ func (g *Gateway) resolve(tier TaskTier) (Provider, string, error) {
 // NewFromConfig builds a Gateway from the AI section of app config. Providers
 // with an empty APIKey are skipped (so the gateway still builds in dev without
 // keys; callers get ErrNoProvider when they hit an unconfigured tier).
+//
+// M3-S2 §13.3.7: when cfg.Routes is non-empty, each key ("lite"|"v3"|"r1") is
+// mapped to the corresponding TaskTier and bound via WithRoute. Empty Routes
+// preserves the M3-S1 behavior (every tier falls back to defaultRoute).
 func NewFromConfig(cfg config.AIConfig, opts ...Option) (*Gateway, error) {
 	var providers []Provider
 	for name, pc := range cfg.Providers {
@@ -180,16 +184,56 @@ func NewFromConfig(cfg config.AIConfig, opts ...Option) (*Gateway, error) {
 	}
 	if def == "" {
 		// No providers configured: build a placeholder gateway so the binary
-		// still boots; Chat will return ErrNoProvider.
-		return &Gateway{
+		// still boots; Chat will return ErrNoProvider. Routes (if any) are
+		// still wired so a later config reload only needs to add providers.
+		g := &Gateway{
 			providers: map[string]Provider{},
 			routes:    map[TaskTier]Route{},
 			budget:    NewMemoryBudget(cfg.MonthlyBudgetCNY),
 			timeout:   timeoutOr(cfg.RequestTimeout, 8*time.Second),
-		}, nil
+		}
+		for _, opt := range routeOptionsFromConfig(cfg) {
+			opt(g)
+		}
+		return g, nil
 	}
 	extra := append([]Option{WithBudget(NewMemoryBudget(cfg.MonthlyBudgetCNY)), WithTimeout(timeoutOr(cfg.RequestTimeout, 8*time.Second))}, opts...)
+	extra = append(extra, routeOptionsFromConfig(cfg)...)
 	return New(providers, Route{Provider: def, Model: defModel}, extra...)
+}
+
+// routeOptionsFromConfig translates cfg.Routes (key "lite"|"v3"|"r1") into
+// WithRoute Options. Unknown keys are skipped (forward-compatible with future
+// tiers). Returns nil when Routes is empty so NewFromConfig stays
+// backward-compatible with M3-S1 configs.
+func routeOptionsFromConfig(cfg config.AIConfig) []Option {
+	if len(cfg.Routes) == 0 {
+		return nil
+	}
+	opts := make([]Option, 0, len(cfg.Routes))
+	for key, rc := range cfg.Routes {
+		tier, ok := tierFromKey(key)
+		if !ok {
+			continue
+		}
+		opts = append(opts, WithRoute(tier, Route{Provider: rc.Provider, Model: rc.Model}))
+	}
+	return opts
+}
+
+// tierFromKey maps the config string key to a TaskTier. Returns ok=false for
+// unknown keys.
+func tierFromKey(key string) (TaskTier, bool) {
+	switch key {
+	case "lite":
+		return TierLite, true
+	case "v3":
+		return TierV3, true
+	case "r1":
+		return TierR1, true
+	default:
+		return "", false
+	}
 }
 
 func buildProvider(name string, pc config.AIProviderConfig) (Provider, error) {

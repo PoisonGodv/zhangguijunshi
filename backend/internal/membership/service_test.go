@@ -3,6 +3,7 @@ package membership
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -549,5 +550,233 @@ func TestMemoryMemberRepo_DefensiveCopy(t *testing.T) {
 	// Idempotency index still keyed by the original phone.
 	if _, ok := repo.findMemberIDByPhone(100, "ph"); !ok {
 		t.Error("phone idempotency index lost after input mutation")
+	}
+}
+
+// --- ListMembers (M3-S2) ---
+
+// seedMember inserts a member directly via the repo under tenant 100 (and
+// optional extra tenants) and returns its id. Birthday/LastVisitAt/Points are
+// set from the given fields.
+func seedMember(t *testing.T, repo *MemoryMemberRepo, tenantID int64, phone string, pts int64, lastVisit, birthday *time.Time) *Member {
+	t.Helper()
+	m := &Member{
+		TenantID:  tenantID,
+		StoreID:   10,
+		PhoneHash: phone,
+		Level:     memberLevelNormal,
+		Points:    pts,
+		Status:    memberStatusActive,
+		CreatedAt: baseNow,
+		UpdatedAt: baseNow,
+	}
+	if lastVisit != nil {
+		lv := *lastVisit
+		m.LastVisitAt = &lv
+	}
+	if birthday != nil {
+		bd := *birthday
+		m.Birthday = &bd
+	}
+	created, err := repo.CreateMember(context.Background(), m)
+	if err != nil {
+		t.Fatalf("seedMember %s: %v", phone, err)
+	}
+	return created
+}
+
+func TestListMembers_NoFilterReturnsAll(t *testing.T) {
+	r := newRig()
+	seedMember(t, r.repo, 100, "p1", 0, nil, nil)
+	seedMember(t, r.repo, 100, "p2", 500, nil, nil)
+	seedMember(t, r.repo, 200, "p3", 0, nil, nil) // other tenant
+
+	got, err := r.svc.ListMembers(ctxFor(100, 10, 7), MemberFilter{})
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2 (tenant 100 only)", len(got))
+	}
+	for _, m := range got {
+		if m.TenantID != 100 {
+			t.Errorf("cross-tenant leak: member tenant=%d", m.TenantID)
+		}
+	}
+}
+
+func TestListMembers_SleepBefore(t *testing.T) {
+	r := newRig()
+	cutoff := time.Date(2026, 6, 28, 0, 0, 0, 0, time.Local) // 30 days before baseNow-ish
+	old := baseNow.AddDate(0, -2, 0)                         // 2 months ago -> sleeping
+	recent := baseNow.AddDate(0, 0, -3)                      // 3 days ago -> not sleeping
+	seedMember(t, r.repo, 100, "sleep", 0, &old, nil)
+	seedMember(t, r.repo, 100, "recent", 0, &recent, nil)
+	neverVisited := seedMember(t, r.repo, 100, "never", 0, nil, nil) // nil LastVisitAt -> sleeping
+
+	got, err := r.svc.ListMembers(ctxFor(100, 10, 7), MemberFilter{SleepBefore: &cutoff})
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	ids := map[int64]bool{}
+	for _, m := range got {
+		ids[m.ID] = true
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2 (sleep + never)", len(got))
+	}
+	if !ids[neverVisited.ID] {
+		t.Error("never-visited member (nil LastVisitAt) should match SleepBefore")
+	}
+}
+
+func TestListMembers_MinPoints(t *testing.T) {
+	r := newRig()
+	seedMember(t, r.repo, 100, "low", 100, nil, nil)
+	seedMember(t, r.repo, 100, "mid", 500, nil, nil)
+	seedMember(t, r.repo, 100, "high", 2000, nil, nil)
+
+	got, err := r.svc.ListMembers(ctxFor(100, 10, 7), MemberFilter{MinPoints: 500})
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2 (mid+high)", len(got))
+	}
+	for _, m := range got {
+		if m.Points < 500 {
+			t.Errorf("member points=%d below floor 500", m.Points)
+		}
+	}
+}
+
+func TestListMembers_BirthdayOn(t *testing.T) {
+	r := newRig()
+	today := time.Date(2026, 7, 27, 0, 0, 0, 0, time.Local)
+	bdMatch := time.Date(1990, 7, 27, 0, 0, 0, 0, time.Local)  // same month+day
+	bdOther := time.Date(1988, 12, 25, 0, 0, 0, 0, time.Local) // different
+	bdMatch2 := time.Date(2000, 7, 27, 0, 0, 0, 0, time.Local) // same month+day, different year
+	noBd := seedMember(t, r.repo, 100, "nobd", 0, nil, nil)    // nil birthday -> never matches
+	m1 := seedMember(t, r.repo, 100, "match", 0, nil, &bdMatch)
+	seedMember(t, r.repo, 100, "other", 0, nil, &bdOther)
+	m2 := seedMember(t, r.repo, 100, "match2", 0, nil, &bdMatch2)
+
+	got, err := r.svc.ListMembers(ctxFor(100, 10, 7), MemberFilter{BirthdayOn: &today})
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	ids := map[int64]bool{}
+	for _, m := range got {
+		ids[m.ID] = true
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2 (match + match2)", len(got))
+	}
+	if !ids[m1.ID] || !ids[m2.ID] {
+		t.Errorf("expected m1+m2, got ids=%v", ids)
+	}
+	if ids[noBd.ID] {
+		t.Error("nil-birthday member should not match BirthdayOn")
+	}
+}
+
+func TestListMembers_CombinedFilters(t *testing.T) {
+	r := newRig()
+	cutoff := time.Date(2026, 6, 28, 0, 0, 0, 0, time.Local)
+	today := time.Date(2026, 7, 27, 0, 0, 0, 0, time.Local)
+	bd := time.Date(1995, 7, 27, 0, 0, 0, 0, time.Local)
+	old := baseNow.AddDate(0, -2, 0)
+
+	// Matches all three filters.
+	win := seedMember(t, r.repo, 100, "win", 800, &old, &bd)
+	// Fails MinPoints.
+	seedMember(t, r.repo, 100, "lowpts", 100, &old, &bd)
+	// Fails SleepBefore (recent visit).
+	seedMember(t, r.repo, 100, "recent", 800, &baseNow, &bd)
+	// Fails BirthdayOn.
+	otherBd := time.Date(1995, 1, 1, 0, 0, 0, 0, time.Local)
+	seedMember(t, r.repo, 100, "otherbd", 800, &old, &otherBd)
+
+	got, err := r.svc.ListMembers(ctxFor(100, 10, 7), MemberFilter{
+		SleepBefore: &cutoff,
+		MinPoints:   500,
+		BirthdayOn:  &today,
+	})
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != win.ID {
+		t.Errorf("expected only win, got %d members: %+v", len(got), got)
+	}
+}
+
+func TestListMembers_LimitDefaultAndCap(t *testing.T) {
+	r := newRig()
+	for i := 0; i < 3; i++ {
+		seedMember(t, r.repo, 100, "p"+strconv.Itoa(i), 0, nil, nil)
+	}
+	// Explicit limit=2 caps the result.
+	got, err := r.svc.ListMembers(ctxFor(100, 10, 7), MemberFilter{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2 (Limit=2)", len(got))
+	}
+}
+
+func TestListMembers_CrossTenantInvisible(t *testing.T) {
+	r := newRig()
+	ma := seedMember(t, r.repo, 100, "a", 0, nil, nil)
+	seedMember(t, r.repo, 200, "b", 0, nil, nil)
+
+	// Tenant 200 lists -> sees only its own, never tenant 100's.
+	got, err := r.svc.ListMembers(ctxFor(200, 20, 8), MemberFilter{})
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	for _, m := range got {
+		if m.TenantID == 100 {
+			t.Errorf("tenant 200 saw tenant 100 member %d", m.ID)
+		}
+	}
+	// Tenant 100's member is not in tenant 200's result.
+	for _, m := range got {
+		if m.ID == ma.ID {
+			t.Error("tenant 200 enumerated tenant 100's member")
+		}
+	}
+}
+
+func TestListMembers_NoTenantRejected(t *testing.T) {
+	r := newRig()
+	if _, err := r.svc.ListMembers(context.Background(), MemberFilter{}); !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
+	}
+}
+
+func TestListMembers_BirthdayFieldRoundTrip(t *testing.T) {
+	repo := NewMemoryMemberRepo()
+	ctx := context.Background()
+	bd := time.Date(1992, 3, 15, 0, 0, 0, 0, time.Local)
+	created, err := repo.CreateMember(ctx, &Member{
+		TenantID: 100, StoreID: 10, PhoneHash: "bd", Level: "normal",
+		Status: "active", Birthday: &bd, CreatedAt: baseNow, UpdatedAt: baseNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.GetMember(ctx, 100, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Birthday == nil || !got.Birthday.Equal(bd) {
+		t.Errorf("Birthday = %v, want %v", got.Birthday, bd)
+	}
+	// Mutating the caller's birthday pointer must not corrupt the stored record.
+	*got.Birthday = baseNow
+	again, _ := repo.GetMember(ctx, 100, created.ID)
+	if again.Birthday == nil || !again.Birthday.Equal(bd) {
+		t.Errorf("stored birthday mutated via alias: got %v, want %v", again.Birthday, bd)
 	}
 }

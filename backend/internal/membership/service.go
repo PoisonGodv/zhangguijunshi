@@ -158,6 +158,17 @@ func (s *Service) GetMember(ctx context.Context, id int64) (*Member, error) {
 	return s.repo.GetMember(ctx, tenantID, id)
 }
 
+// ListMembers enumerates the ctx tenant's members matching f (M3-S2 signal real
+// enumeration). Empty filter fields are not filtering; Limit<=0 defaults to 500.
+// Cross-tenant members are never visible (repo enforces this).
+func (s *Service) ListMembers(ctx context.Context, f MemberFilter) ([]*Member, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.ListMembers(ctx, tenantID, f)
+}
+
 // IssueCode issues a short-lived (60s) dynamic member code for an existing,
 // active member of the ctx tenant. A blocked member is rejected with
 // ErrMemberBlocked; an unknown / cross-tenant member with ErrNotFound.

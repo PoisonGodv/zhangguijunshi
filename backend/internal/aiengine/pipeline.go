@@ -15,6 +15,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/aiengine/converge"
 	"github.com/zhangguijunshi/backend/internal/aiengine/output"
 	"github.com/zhangguijunshi/backend/internal/aiengine/rule"
+	"github.com/zhangguijunshi/backend/internal/aiengine/semantic"
 	"github.com/zhangguijunshi/backend/internal/aiengine/signal"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 	"go.uber.org/zap"
@@ -34,6 +35,7 @@ type Pipeline struct {
 	conv      converge.Top3
 	enc       output.Encoder
 	ch        cache.Cache
+	sem       semantic.SemanticCache
 	business  string
 	now       func() time.Time
 	timeout   time.Duration
@@ -76,6 +78,16 @@ func WithLogger(l *zap.Logger) Option {
 		if l != nil {
 			p.log = l
 		}
+	}
+}
+
+// WithSemanticCache injects the L2 semantic cache (M3-S2 §13.3.6). nil or unset
+// disables L2 — this keeps NewPipeline backward-compatible with M3-S1 callers
+// (which pass no semantic cache) so main.go / m3s1_test / pipeline_test need no
+// change for the signature alone.
+func WithSemanticCache(sem semantic.SemanticCache) Option {
+	return func(p *Pipeline) {
+		p.sem = sem
 	}
 }
 
@@ -153,6 +165,17 @@ func (p *Pipeline) Run(ctx context.Context) (*output.Advice, error) {
 		}
 	}
 
+	// ①b) L2 semantic cache short-circuit (needs the bundle to build signalText).
+	// Fires only when L1 missed and a semantic cache is wired; a hit returns the
+	// cached strategy with Degrade="semantic_hit" without re-running the pipeline.
+	if p.sem != nil {
+		signalText := semantic.BuildSignalText(bundle)
+		if strat, ok, _ := p.sem.TryHit(ctx, tenantID, bundle.BusinessType, signalText); ok && strat != nil {
+			log.Debug("pipeline semantic cache hit", zap.String("degrade", "semantic_hit"))
+			return &output.Advice{Strategy: strat, Degrade: "semantic_hit"}, nil
+		}
+	}
+
 	// ② Rule route — never errors (empty Routed on panic); cold-start inject.
 	routed, _ := p.router.Route(ctx, bundle)
 	if routed == nil {
@@ -180,6 +203,10 @@ func (p *Pipeline) Run(ctx context.Context) (*output.Advice, error) {
 	}
 	if p.ch != nil && advice != nil && advice.Strategy != nil {
 		p.ch.Put(ctx, tenantID, storeID, date, advice.Strategy)
+	}
+	if p.sem != nil && advice != nil && advice.Strategy != nil {
+		signalText := semantic.BuildSignalText(bundle)
+		_ = p.sem.Put(ctx, tenantID, bundle.BusinessType, signalText, advice.Strategy, 24*time.Hour)
 	}
 	return advice, nil
 }

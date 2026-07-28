@@ -166,6 +166,40 @@ func (r *MemoryBatchRepo) ListActiveBatchesFIFO(_ context.Context, tenantID, sto
 	return out, nil
 }
 
+// ListNearingBatches implements BatchRepo (M3-S2). It scans every batch in the
+// repo under a read lock and returns the active, positive-quantity lots of
+// (tenantID, storeID) whose ExpiryDate is set and falls on or before
+// now+withinDays. Cross-tenant / cross-store lots are invisible. Results are
+// defensive copies ordered by batch id (deterministic for tests).
+func (r *MemoryBatchRepo) ListNearingBatches(_ context.Context, tenantID, storeID int64, withinDays int) ([]*Batch, error) {
+	deadline := now().AddDate(0, 0, withinDays)
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Collect matching ids in ascending order so output is deterministic.
+	ids := make([]int64, 0)
+	for id, b := range r.batches {
+		if b.TenantID != tenantID || b.StoreID != storeID {
+			continue
+		}
+		if b.Status != BatchStatusActive || b.Quantity <= 0 {
+			continue
+		}
+		if b.ExpiryDate == nil || b.ExpiryDate.After(deadline) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	out := make([]*Batch, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, cloneBatch(r.batches[id]))
+	}
+	return out, nil
+}
+
 // AppendMovement implements BatchRepo. The movement is deep-copied and assigned
 // an id; CreatedAt is stamped by the caller (service) so it can share the
 // injected clock.

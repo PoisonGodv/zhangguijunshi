@@ -17,11 +17,15 @@ package membership
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// defaultListMembersLimit is used when MemberFilter.Limit <= 0.
+const defaultListMembersLimit = 500
 
 // pointsFlow is one member_points_log row (audit, no soft delete).
 type pointsFlow struct {
@@ -228,6 +232,61 @@ func (r *MemoryMemberRepo) AppendBalanceLog(_ context.Context, tenantID, memberI
 	return nil
 }
 
+// ListMembers implements MemberRepo (M3-S2). It scans the member table under a
+// read lock and applies the filter dimensions in turn: SleepBefore (members who
+// never visited count as sleeping), MinPoints, BirthdayOn (month+day match), and
+// Limit (default 500). Only members of tenantID are ever visible. Results are
+// defensive copies ordered by member id (deterministic for tests).
+func (r *MemoryMemberRepo) ListMembers(_ context.Context, tenantID int64, f MemberFilter) ([]*Member, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultListMembersLimit
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Collect candidate ids in ascending order so output is deterministic.
+	ids := make([]int64, 0)
+	for id, m := range r.membersByID {
+		if m.TenantID != tenantID {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	out := make([]*Member, 0, limit)
+	for _, id := range ids {
+		m := r.membersByID[id]
+		if m.TenantID != tenantID { // defence-in-depth
+			continue
+		}
+		if f.SleepBefore != nil {
+			// A member who never visited is treated as sleeping (matches).
+			if m.LastVisitAt != nil && !m.LastVisitAt.Before(*f.SleepBefore) {
+				continue
+			}
+		}
+		if f.MinPoints > 0 && m.Points < f.MinPoints {
+			continue
+		}
+		if f.BirthdayOn != nil {
+			if m.Birthday == nil {
+				continue
+			}
+			if m.Birthday.Month() != f.BirthdayOn.Month() || m.Birthday.Day() != f.BirthdayOn.Day() {
+				continue
+			}
+		}
+		out = append(out, cloneMember(m))
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 // findMemberIDByPhone implements MemberRepo.
 func (r *MemoryMemberRepo) findMemberIDByPhone(tenantID int64, phoneHash string) (int64, bool) {
 	r.mu.RLock()
@@ -376,8 +435,8 @@ func (r *MemoryMemberRepo) lastBalanceAfter(tenantID, memberID int64) (int64, bo
 	return 0, false
 }
 
-// cloneMember returns a deep copy of m (LastVisitAt pointer re-pointed) so
-// internal state is never aliased.
+// cloneMember returns a deep copy of m (LastVisitAt / Birthday pointers
+// re-pointed at fresh time values) so internal state is never aliased.
 func cloneMember(m *Member) *Member {
 	if m == nil {
 		return nil
@@ -386,6 +445,10 @@ func cloneMember(m *Member) *Member {
 	if m.LastVisitAt != nil {
 		t := *m.LastVisitAt
 		cp.LastVisitAt = &t
+	}
+	if m.Birthday != nil {
+		t := *m.Birthday
+		cp.Birthday = &t
 	}
 	return &cp
 }
