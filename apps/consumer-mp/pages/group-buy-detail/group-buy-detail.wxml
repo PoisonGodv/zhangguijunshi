@@ -1,0 +1,49 @@
+<!-- pages/group-buy-detail/group-buy-detail.wxml — 拼团详情 -->
+<view class="container">
+  <block wx:if="{{loading}}">
+    <view class="loading">加载中…</view>
+  </block>
+
+  <block wx:elif="{{detail}}">
+    <!-- 拼团主卡片 (渐变橙金, 复用 member-header 风格) -->
+    <view class="gb-detail-header">
+      <view class="gb-detail-status">{{detail.statusText}}</view>
+      <view class="gb-detail-title">{{detail.title}}</view>
+      <view class="gb-detail-price-row">
+        <text class="gb-detail-price">¥{{detail.priceYuan}}</text>
+        <text class="gb-detail-original">¥{{detail.originalYuan}}</text>
+      </view>
+      <view class="gb-detail-desc">{{detail.desc}}</view>
+    </view>
+
+    <!-- 成团进度 -->
+    <view class="section">
+      <view class="section-title">成团进度</view>
+      <view class="gb-progress">
+        <view class="gb-progress-bar">
+          <view class="gb-progress-inner" style="width:{{detail.progress}}%"/>
+        </view>
+        <view class="gb-progress-text">{{detail.joined}}/{{detail.required}} 人</view>
+      </view>
+      <view class="gb-detail-meta">需 {{detail.required}} 人成团 · 已 {{detail.joined}} 人参团</view>
+    </view>
+
+    <!-- 截止时间 -->
+    <view class="section">
+      <view class="section-title">活动详情</view>
+      <view class="gb-detail-row"><view class="gb-detail-row-label">活动状态</view><view class="gb-detail-row-val">{{detail.statusText}}</view></view>
+      <view class="gb-detail-row"><view class="gb-detail-row-label">截止时间</view><view class="gb-detail-row-val">{{detail.expire || '—'}}</view></view>
+    </view>
+
+    <!-- 参团按钮 -->
+    <view class="gb-detail-footer">
+      <button
+        class="btn-primary gb-join-btn"
+        disabled="{{!detail.canJoin || joining}}"
+        bindtap="onJoin"
+      >{{joining ? '参团中...' : (detail.canJoin ? '立即参团' : detail.joinDisabledReason)}}</button>
+    </view>
+  </block>
+
+  <empty-state wx:else icon="🛒" text="拼团不存在"/>
+</view>

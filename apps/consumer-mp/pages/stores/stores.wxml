@@ -1,0 +1,38 @@
+<!-- pages/stores/stores.wxml — 门店列表 -->
+<view class="container">
+  <block wx:if="{{loading}}">
+    <view class="loading">加载中…</view>
+  </block>
+
+  <block wx:elif="{{list.length}}">
+    <view
+      wx:for="{{list}}"
+      wx:key="id"
+      class="store-card"
+    >
+      <view class="store-name">{{item.name}}</view>
+      <view class="store-addr">{{item.address}}</view>
+      <view class="store-row store-contact" wx:if="{{item.phone}}">
+        <view class="store-contact-label">电话</view>
+        <view class="store-contact-val">{{item.phone}}</view>
+      </view>
+      <button
+        wx:if="{{item.hasQR}}"
+        class="store-group-btn"
+        data-id="{{item.id}}"
+        bindtap="onTapGroup"
+      >进群</button>
+    </view>
+  </block>
+
+  <empty-state wx:else icon="🏪" text="暂无门店"/>
+
+  <!-- 进群二维码预览浮层 (图片 URL) -->
+  <view wx:if="{{qrPreview}}" class="qr-modal" bindtap="onPreviewImageTap">
+    <view class="qr-modal-card" catchtap>
+      <view class="qr-modal-title">长按或截图扫码进群</view>
+      <image class="qr-modal-img" src="{{qrPreview}}" mode="aspectFit"/>
+      <view class="qr-modal-tip">点击空白处关闭</view>
+    </view>
+  </view>
+</view>

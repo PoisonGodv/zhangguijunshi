@@ -44,7 +44,13 @@ Page({
     this.load(status)
   },
 
-  onTapCoupon() {
-    wx.showToast({ title: '券详情即将上线', icon: 'none' })
+  onTapCoupon(e: { detail: { coupon?: Coupon } }) {
+    // coupon-card 组件 catchtap 内部捕获原生冒泡, 仅 triggerEvent('tap',{coupon}) 到达此处
+    const id = e.detail.coupon && e.detail.coupon.id
+    if (!id) {
+      wx.showToast({ title: '券不存在', icon: 'none' })
+      return
+    }
+    wx.navigateTo({ url: `/pages/coupon-detail/coupon-detail?id=${id}` })
   },
 })

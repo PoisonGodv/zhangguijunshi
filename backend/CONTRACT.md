@@ -3072,7 +3072,7 @@ authed.GET("/orders", h.Orders)
 
 C 端 JWT 不带 memberID（只带 openid/tenant/store）。**每个 C 端接口都先调 `membership.Join(ctx, JoinInput{WxOpenID: claims.OpenID, PhoneHash: ...})` 幂等拿 member**：Join 按 (tenant, wx_openid) 去重，首次访问自动开户（含零余额储值账户），后续复用同一 member 行。这是拿到 memberID 的**唯一推荐方式**——不改 MemberRepo 私有方法（`findMemberIDByOpenID` 等），不新增"按 openid 查 member"的公开方法。openid 为空 → 40101。
 
-### 16.3 端点契约（7 个）
+### 16.3 端点契约（7 + 5 = 12 个；FE-MP-02 补 5 个）
 
 统一响应信封 `{code,message,data,trace_id}`。字段全部 snake_case，与 `apps/consumer-mp/types/api.d.ts` 对齐。
 
@@ -3122,10 +3122,47 @@ C 端 JWT 不带 memberID（只带 openid/tenant/store）。**每个 C 端接口
 - **本期降级**：billing 无"按 member 查询"公开方法，返回空数组 `data: []`（不硬塞散客/全店订单，防越权）。TODO §16.8。
 - 仍先 Join 幂等拿 member 以证明身份+租户。
 
+**8) `GET /v1/wxshop/groupbuys/:id` — 拼团详情（FE-MP-02）**
+- 流程：`groupbuy.Get(ctx, id)` + `ListParticipants(ctx, id)` 计权威 joined。memberID 不取(参团前浏览,仅 verified tenant 从 ctx)。
+- 响应 `data`（隐藏 tenant_id/store_id/product_id/strategy_id/joined_count）：
+```json
+{"id":1,"title":"3人团 新鲜草莓 2斤装","desc":"3人团 新鲜草莓 2斤装","price_cents":1990,"original_cents":1990,"required":3,"joined":2,"status":"active","expire":"2026-07-30T10:00:00+08:00"}
+```
+- `status`: active|success|failed|cancelled; `expire`=EndAt(倒计时用); `original_cents` 仍降级=团购价(无原价字段)。
+- errcode：40404 拼团不存在(含串户)/ 40001 id 非法。
+
+**9) `GET /v1/wxshop/coupons/:id` — 券详情（FE-MP-02）**
+- 流程：`marketing.GetCoupon(ctx, id)` 取模板; member 经 memberFromClaims 幂等取; 若该 member 持有此券(ListMemberCoupons 匹配 CouponID) 则带真实 status+expire, 否则 status="available"+available=true。
+- 响应 `data`（隐藏 quota/issued/strategy_id）：
+```json
+{"id":1,"title":"新人见面礼 满30减10","type":"cash","value_text":"¥10","threshold_text":"满¥30可用","scope_text":"全场通用","expire_text":"2027-01-05 到期","status":"unused","detail":{"threshold_text":"满¥30可用","scope_text":"全场通用","value_text":"¥10","valid_from":"2026-07-29","valid_to":"2027-01-05"},"available":false,"expire":"2026-08-05"}
+```
+- errcode：40403 券不存在(含串户)/ 40001 id 非法。
+
+**10) `GET /v1/wxshop/member/points?limit=` — 积分明细（FE-MP-02）**
+- 流程：member 经 memberFromClaims 取; `membership.ListPointsLog(ctx, member.ID, limit)` 读 member_points_log(memory+pg 双实现)。limit 默认 50, 上限 200。
+- 响应 `data`：
+```json
+{"points":50,"logs":[{"type":"earn","delta":50,"points_after":50,"ref_order_id":700,"created_at":"2026-07-29T18:25:08+08:00"}]}
+```
+- `type`: earn|redeem|expire|adjust; logs 按 created_at DESC; 串户→空 logs+0 points(member 行 tenant 隔离)。
+
+**11) `GET /v1/wxshop/stores` — 门店列表（FE-MP-02, 独立装配）**
+- 新建轻量 `internal/store/` 域: Store{id,tenant_id,name,address,phone,group_qr,active}; MemoryStoreRepo(种子 tenant_id=1 两条 demo) + PGStoreRepo(读 000001 stores 表 + 000016 phone/group_qr/active 列); service.ListStores(ctx) 按 tenant 过滤。
+- 流程：`store.ListStores(ctx)`(EnforceTenant; 无 tenant→40302)。store 服务独立装配(`deps.StoreSvc`), 不依赖 Membership+Marketing+Groupbuy。
+- 响应 `data`（隐藏 tenant_id/active/created_at）：
+```json
+[{"id":7001,"name":"总店 · 阳光水果行","address":"上海市浦东新区阳光路1号","phone":"021-50000001","group_qr":"group_qr_seed_1"}]
+```
+- 串户→空数组(非 404); store 服务未装配(nil)→空数组降级(不 404)。
+
+**5-修) `GET /v1/wxshop/member/profile` — balance_cents 修复（FE-MP-02, 退役 §16.4 TODO）**
+- balance_cents 从硬编码 0 改为调 `membership.GetAccount(ctx, m.ID)`: account 不存在返 0(与 Balance handler 一致), 存在返真实 BalanceCents。phone_masked 仍空。其余字段不变。
+
 ### 16.4 已知 TODO 降级（不阻塞接通）
-- **`balance_cents` 恒 0**：membership 未暴露 `GetAccount` 公开方法（只有 repo 接口的 `GetAccount`，Service 无对应公开读）。硬约束不改共享签名，故 profile 的储值余额降级为 0；待 membership 加公开读方法后接真实余额。
-- **`GET /orders` 空数组**：见 §16.3(7)。待 billing 加 `ListByMember(ctx, memberID)` 后返回真实订单。
-- **`original_cents` = 团购价**：Groupbuy 无原价字段。
+- ~~**`balance_cents` 恒 0**~~: **FE-MP-02 退役** —— Profile 已接 `membership.GetAccount(ctx, m.ID)` 返回真实储值余额(§16.3(5-修))。
+- **`GET /orders` 空数组**：见 §16.3(7)。MVP 已接 billing 加 `ListByMember`（M4-S2 §17.4），返回真实订单（MVP 冒烟已证）。
+- **`original_cents` = 团购价**：Groupbuy 无原价字段；拼团详情(§16.3(8))继承同降级。
 - **`phone_masked` 空**：member 只存 phone_hash，无法回显明文/掩码；C 端档案不展示手机号。
 
 ### 16.5 默认新人券模板
@@ -3158,6 +3195,58 @@ C 端 JWT 不带 memberID（只带 openid/tenant/store）。**每个 C 端接口
 - `TestMVP_EndToEnd`: B 端 建品→扫码查品→入库20→现金开单2件(扣库存20→18)→挂单3件→收款(→15)→当日流水(2单/NetCents=9950); C 端 JWT→领新人券(幂等)→券包1→档案→动态码→建拼团→列表→参团→重复参团60015→订单空。双端在同一 fixture(同一 tenant 50021/store 9)共享 catalog/inventory/billing/membership/marketing/groupbuy 状态,端到端证明 MVP 闭环。
 - `TestMVP_CrossTenant`: tenant A 建品+开单+领券后, tenant B(同 openid)商品列表空/流水0/券包空/拼团空 —— ARCH-01 串户隔离端到端证明。
 - 退出码: `go test ./interfaces/http/ -run TestMVP_ -count=1`=0(连续5次稳定)。
+
+### 16.11 FE-MP-02 / FE-ADMIN 后端配套（2026-07-29）：C 端缺口接口 + boss 会员列表
+
+本期补齐 C 端消费者缺口接口 + boss 端会员列表, 端到端真实(不再降级 mock)。**纯加性**：不改既有域服务签名(memory_repo.go/service.go 仅加性新增方法); 新建 `internal/store/` 域 + migration 000016(stores 表加 phone/group_qr/active 列)。
+
+**新增接口路径清单（C 端 `/v1/wxshop/*` authed 组 + boss `/v1/boss/*`）**:
+- `GET /v1/wxshop/groupbuys/:id` — 拼团详情(§16.3(8))。
+- `GET /v1/wxshop/coupons/:id` — 券详情(§16.3(9))。
+- `GET /v1/wxshop/member/points?limit=` — 积分明细(§16.3(10))。
+- `GET /v1/wxshop/stores` — 门店列表(§16.3(11), 独立装配 deps.StoreSvc)。
+- `GET /v1/boss/membership/members?page=&size=&level=&q=` — boss 会员列表(§17.11)。
+- 修 `GET /v1/wxshop/member/profile` balance_cents(§16.3(5-修), 退役 §16.4 TODO)。
+- boss `GET /v1/boss/membership/members/:id` 调整为 memberDTO 形态(隐藏 phone hash/openid, 加 balance_cents)。
+
+**新建域 `internal/store/`**:
+- `store.go`: Store struct{id,tenant_id,name,address,phone,group_qr,active,created_at} + StoreRepo 接口{ListStores(ctx,tenantID)}。
+- `memory_repo.go`: MemoryStoreRepo(种子 tenant_id=1 两条 demo: 总店+分店; StoreID 从 7000 起; Seed() 测试用); ListStores 按 tenant 过滤 + active 过滤 + id 升序; 防御性拷贝。
+- `pg_repo.go`: PGStoreRepo(读 000001 stores 表 + 000016 phone/group_qr/active 列; `SELECT id,tenant_id,COALESCE(address,''),COALESCE(phone,''),COALESCE(group_qr,''),status='active',created_at FROM stores WHERE tenant_id=$1 AND deleted_at IS NULL ORDER BY id`; nil-pool→空; queryer type-assert)。
+- `service.go`: Service.ListStores(ctx)(EnforceTenant; 无 tenant→40302)。
+- `pg_repo_test.go` + `service_test.go`: pgxmock happy/empty/null-cols/nil-pool/query-error + service happy/cross-tenant/inactive-hidden/no-tenant/clone。
+
+**membership 新增（加性, 不改既有方法签名）**:
+- `PointsLog` struct(public 读 shape) + `ListMembersResult{Items,Total}` struct。
+- `MemberFilter` 加字段: `Level string`(equality) + `Query string`(name/phone_hash 子串, pg 用 ILIKE) + `Offset int`(分页)。既有 SleepBefore/MinPoints/BirthdayOn/Limit 不变 → M3-S2 signal 调用方零值不受影响。
+- `MemberRepo` 加方法: `ListPointsLog(ctx,tenantID,memberID,limit)`(memory 倒序扫 pointsLog, limit 默认 50; pg `SELECT ... FROM member_points_log WHERE tenant_id=$1 AND member_id=$2 ORDER BY created_at DESC,id DESC LIMIT $3`) + `ListMembersPage(ctx,tenantID,f)`(memory countLocked + 分页; pg COUNT(*) + 分页 SELECT, total=0 短路)。
+- `Service` 加方法: `ListPointsLog(ctx,memberID,limit)` + `ListMembersPage(ctx,f)`(均 EnforceTenant)。
+- `pg_repo_test.go` 加测: ListMembersPage happy/level-filter/empty + ListPointsLog happy/empty + NilPool 降级扩展。
+- `service_test.go` 加测: ListMembersPage 服务层(Level/Query/pagination/total/cross-tenant) + ListPointsLog 服务层(earn log + cross-tenant)。
+
+**boss membership list handler**(`handler/membership.go`):
+- `ListMembers`: query `?page=&size=&level=&q=`; page 默认 1, size 默认 20(上限 200); 构 MemberFilter{Level,Query,Limit:size,Offset:(page-1)*size}; `svc.ListMembersPage` → `{items: memberDTO[], total}`; 逐 member best-effort `GetAccount` 取 balance_cents。
+- `memberDTO` 字段: `id/level/level_name/name?/points/balance_cents/total_spent_cents/created_at/block`(status=='blocked'→block=true)。**不暴露** phone_hash/wx_openid/tenant_id/store_id。
+- `GetMember`(:id) 调整为 memberDTO 形态(原返 raw *Member PascalCase; 现返 memberDTO snake_case, 隐藏敏感字段; balance_cents best-effort)。POST `/membership/members`(Join) 仍返 raw *Member(PascalCase, boss 域约定 + m1s2/m2s1 测试依赖)。
+
+**migration 000016_store_cside**: `ALTER TABLE stores ADD COLUMN IF NOT EXISTS phone TEXT / group_qr TEXT / active BOOLEAN NOT NULL DEFAULT TRUE`(加性, 不改 000001 既有列/约束/触发器; active 与既有 status 并存, 互不耦合)。down 删三列。
+
+**串户隔离（ARCH-01）**: 全部新接口 tenant 取自 verified ctx(EnforceTenant); member 用 claims.OpenID 在本租户内 Join 幂等。串户结果: 拼团详情→40404; 券详情→40403; 积分明细→空 logs+0 points; 门店→空数组; boss 会员列表→空+total 0。绝不返回他租户资源。
+
+**测试（`interfaces/http/fe_mp02_test.go`, memory repo + 真实 dev-key JWT + DevMock boss）**:
+- `TestWxshop_GroupbuyDetail`: 详情 happy + bad-id 400 + cross-tenant 40404 + 无内部字段泄漏。
+- `TestWxshop_CouponDetail`: held 券 status=unused/available=false + absent 40403 + bad-id 400。
+- `TestWxshop_Points`: fresh 0/empty + earn log(delta=50/after=50) + cross-tenant 空。
+- `TestWxshop_Stores`: seeded tenant 1 → 2 店(无内部字段泄漏) + 非 seeded tenant → 空。
+- `TestWxshop_ProfileBalance`: fresh 0 + Recharge 后 20000(退役 §16.4 TODO)。
+- `TestBoss_MembersList`: 分页(page1/2 size2 total4) + level 过滤(normal=4 / vip=0) + q 过滤(Member1=1) + cross-tenant 空 + memberDTO 无 phone_hash/openid 泄漏。
+- `TestWxshop_NoToken` 扩展: 新 5 端点无 token 全部 401/40101。
+- 退出码: `go build ./...`=0; `go test -race ./...`=0(41 包全绿, 含 10 域 pgxmock + store 新包 + membership 新测)。
+
+### 17.11 FE-MP-02 / FE-ADMIN boss membership list 增量（2026-07-29）
+- boss `GET /v1/boss/membership/members?page=&size=&level=&q=` 列表(分页+过滤+total), 见 §16.11 详契。
+- membership 加 `ListMembersPage(ctx, MemberFilter)`(repo 接口加性新增, §17.10 表 membership 方法数 13→15); `MemberFilter` 加 `Level/Query/Offset` 字段(加性, M3-S2 signal 零值调用方不受影响); memory + pg 双实现, pg 用 COUNT(*) + 分页 SELECT, total=0 短路跳过分页 SELECT。
+- memberDTO 形态给后台用(隐藏 phone_hash/wx_openid), GetMember(:id) 同步调整为 memberDTO(Join 仍返 raw *Member PascalCase)。
 
 ## 17. M4-S2 增量契约（pgx 全局替换：10 域 memory→pg，2026-07-29）
 
@@ -3267,3 +3356,74 @@ CREATE INDEX idx_wx_sessions_tenant_openid ON wx_sessions (tenant_id, openid);
 - **pgx 实现亮点**：跨表原子（inventory `ConsumeFIFOAtomic`、membership `Redeem`/`recharge`、groupbuy `JoinAtomic`）用各域包内本地 `txBeginner` interface（领域包不耦合 pkg/db）+ 条件 UPDATE / `SELECT...FOR UPDATE`；并发原子（payment `MarkSuccess`、marketing 配额自增、reach 订阅计数、billing 状态机）用条件 UPDATE 的 `ErrNoRows` 检测；哨兵优先级严格对齐 memory；nil-pool 安全降级（审计写返回 nil 对齐 memory "审计不可失败"语义）；显式 RETURNING 列（非 `*`，对齐 payment 样板 + 兼容 pgxmock）。
 - **固有特性（非 bug，已记录）**：JSONB 数字经 `map[string]any` 往返 int64→float64（strategy 测试记录）；memory↔pg 切换时这是固有不对称，真接 PG 时下游需注意。
 - **显式延后**（仍不在本期）：真 PG/Redis 联调（验证均 pgxmock）；membership.Join 回填 wx_sessions.member_id；切换后真 PG 端到端冒烟。
+
+---
+
+## 18. FE-MP-02 / FE-ADMIN-01+02 双端落地（消费者小程序业务页补全 + 管理后台，2026-07-29）
+
+本轮在 M4-S2 pgx 全局替换基础上，**双端并行**补全消费者小程序业务页与新建管理后台，配套补齐后端 C端缺口接口与 boss 端会员列表接口（端到端真实，不再降级 mock）。技术栈决策：admin-web 用 **Vite + React 18 + TS strict + Ant Design 5 + @ant-design/pro-components + ECharts**（技术方案 09 §9.4 原定 Umi Max，计划书指定 Vite，本轮采 Vite 更轻）。
+
+### 18.1 后端配套（B1，见 §16.11 / §17.11 详契）
+
+**C端新增 4 接口**（挂在 `/v1/wxshop` authed 组，JWT 鉴权，member 由 claims 经幂等 `membership.Join` 取，ARCH-01）：
+- `GET /v1/wxshop/groupbuys/:id` — 拼团详情（groupbuyDetailDTO：id/title/desc/price_cents/original_cents/required/joined/status/expire）。跨租户 40404。
+- `GET /v1/wxshop/coupons/:id` — 券详情（couponDetailDTO：couponDTO + detail{threshold_text/scope_text/value_text/valid_from/valid_to} + available + expire；member 持有时合并真实 status）。跨租户 40403。
+- `GET /v1/wxshop/member/points?limit=` — 积分明细（{points, logs:[PointLog]}，读 member_points_log；limit 默认 50/上限 200）。
+- `GET /v1/wxshop/stores` — 门店列表（storeDTO[]；新建轻量 internal/store 域：Store struct + StoreRepo + Service.ListStores + MemoryStoreRepo 种子 tenant_id=1 两条 + PGStoreRepo 读 stores 表 + migration 000016_store_cside）。
+
+**修复**：`GET /v1/wxshop/member/profile` 的 `balance_cents` 从硬编码 0 改为调 `membership.GetAccount` 返真实值（退役 §16.4 TODO）。
+
+**boss 端新增**（给 admin-web 会员页用）：`GET /v1/boss/membership/members?page=&size=&level=&q=` — 会员分页列表（{items:memberDTO[], total}）；`GET /v1/boss/membership/members/:id` 改返 memberDTO（隐藏 phone_hash/wx_openid，加 balance_cents）。memberDTO 全 snake_case。
+
+**新增 repo 方法双实现**（memory + pgxmock）：`ListPointsLog` / `ListMembersPage` / `countMembersLocked`（membership）；`ListStores`（store 新域）。migration 000016 给 stores 表加 phone/group_qr/active 列。
+
+**验证**：`go build ./...` + `gofmt`/`go vet` clean + `go test -race ./...` **41 包全绿**（新增 internal/store 包、membership 新测、6 新 HTTP 测 GroupbuyDetail/CouponDetail/Points/Stores/ProfileBalance/Boss_MembersList、10 域 pgxmock）。
+
+### 18.2 消费者小程序 consumer-mp（FE-MP-02，原生小程序 + TS）
+
+骨架 FE-MP-01 原有 5 页（index/coupons/profile/join/member-code）基础上**新增 6 业务页**，全部接通真实后端接口（services 层 USE_MOCK=false，失败降级占位但写操作不降级）：
+- `pages/orders` — 我的订单（GET /v1/wxshop/orders，billing.ListByMember 真实返单；status 中文映射；下拉刷新；空态）
+- `pages/balance` — 储值余额（GET /v1/wxshop/member/balance，balance_cents+gift_cents；充值入口占位）
+- `pages/group-buy` — 拼团列表（GET /v1/wxshop/groupbuys/active）
+- `pages/group-buy-detail` — 拼团详情+参团（GET /v1/wxshop/groupbuys/:id + POST /:id/join；errcode 60013/60015 映射）
+- `pages/coupon-detail` — 券详情（GET /v1/wxshop/coupons/:id）
+- `pages/points` — 积分明细（GET /v1/wxshop/member/points）
+- `pages/stores` — 门店列表+进群二维码（GET /v1/wxshop/stores）
+
+services 层新增：`getBalance/getGroupBuyDetail/getCouponDetail/getPoints`（group-buy/coupon/member.ts）+ 新建 `services/store.ts`（listStores）。types/api.d.ts 补 GroupBuyDetail/CouponDetail/PointsResult/PointLog/Order/OrderItem/Balance/Store 扩展。app.json pages 共 **15 页**。profile 九宫格 orders/balance/points/stores 接通跳转；首页拼团入口→group-buy 列表；coupons 券卡→coupon-detail（coupon-card bindtap→catchtap 防双触发）。
+
+**验证**：临时装 typescript@5.5.4 + miniprogram-api-typings，strict noEmit 类型检查全 32 个 .ts **0 错**（含注入错误测试验证活跃度）。
+
+### 18.3 管理后台 admin-web（FE-ADMIN-01 骨架 + FE-ADMIN-02 业务页，Vite + React 18 + TS + AntD5 + ProComponents + ECharts）
+
+从空目录新建。**骨架（A1）**：package.json/vite.config.ts（dev proxy /v1→:8080）/tsconfig(strict, @/ 别名)/index.html/src/main.tsx/App.tsx。src/services/request.ts（axios baseURL /v1，dev 注入 X-Mock-Tenant=1/X-Mock-Store=0/X-Mock-User=dev/X-Mock-Role=owner，解 envelope code===0 取 data，errcode 中文映射；prod 预留 Authorization 注入位，BE-A-01 真登录延后）。src/layouts/BasicLayout.tsx（ProLayout 侧边栏）。src/routes/menu.tsx（8 菜单）。src/types/api.ts（全域类型骨架，PascalCase/snake_case 已标注）。src/components/{PageLoading,ErrorBoundary,EmptyState,Money,PlaceholderCard}。src/utils/format.ts。10 占位页。
+
+**业务页（A2a + A2b 并行填充）**：
+- `pages/catalog/products` — 商品 ProTable + 新增 ModalForm + 改价 PATCH + 条码精确查/名称模糊（Product PascalCase）。
+- `pages/inventory/stock` — 批次库存|出入库流水双 Tab + 入库 ModalForm + FIFO 消耗扣减 + 临期标记（从 Movement.Note 解析；后端无 list-batches 接口，流水侧面还原批次，临期看板待后端补）。
+- `pages/membership/members` — 会员 ProTable 后端真分页（B1 ListMembers）+ 画像 Drawer（getMember）+ 储值充值 ModalForm + 会员码下发/核销（memberDTO snake_case）。
+- `pages/dashboard` — 经营看板：DatePicker + 4 Statistic 卡（营业额 GrossCents/订单数 OrderCount/实收 NetCents/客单价）+ ECharts 热销 Top5 条形图 + 近 7 日营业额趋势（并发 7 次 dailySummary）。
+- `pages/marketing/coupons` — 券模板 ProTable + 新建券 ModalForm（按 Type 动态字段）+ 上线/下线/终止（PATCH status）+ 发券（issue；毛利护栏 60001 toast）。
+- `pages/aiengine/strategies` — 今日 3 件事（today）+ 策略 ProTable + 策略 Drawer（items）+ 一键执行（execute，200-as-data 按 ExecResult.status 三分支 executed/blocked[reason 中文归因]/failed）+ 归因看板 ECharts（核销率/成团率/复购率/到店增量）。
+
+services 层：catalog.ts/inventory.ts/membership.ts（A2a）+ billing.ts/marketing.ts/aiengine.ts（A2b），各 service 局部类型自包含（不改公共 types/api.ts 避免并行冲突）。
+
+**验证**：`npx tsc --noEmit` **0 错**（strict + noUnusedLocals/Parameters 全开）+ `npm run build` 成功（4725 模块）。A2a/A2b 合并后 tsc 0 错（A2a 报告的 Money import 隐患在 A2b 最终文件中已 import 齐全）。
+
+### 18.4 端到端冒烟（主线程）
+
+后端 `go run ./cmd/api/` 起服（dev，无 PG/Redis 走 memory）：
+- `GET /healthz` → {status:alive}
+- `GET /v1/boss/whoami`（X-Mock-Tenant:1）→ source=merchant, tenant_id=1
+- `POST /v1/boss/membership/members`（创建会员）→ memberID 9001
+- `GET /v1/boss/membership/members?page=1&size=10` → {items:[memberDTO], total:1}（B1 新接口闭环）
+- `GET /v1/boss/catalog/products` → {count:0, items:[]}（admin-web 商品页用）
+- `GET /v1/boss/billing/summary/today` → DailySummary（GrossCents/NetCents/TopProducts，admin-web 看板字段对齐）
+
+### 18.5 显式延后（不在本轮）
+- **BE-A-01 真实登录 + RBAC**：admin-web 仍走 dev `X-Mock-*` 头（与 merchant-mp 一致）；prod 改读 localStorage admin_token 注入 Authorization；菜单 RBAC 下发（`GET /v1/admin/me` 返 permissions.menus）待 BE-A-01。
+- **平台运营跨租户管理后台**：`/v1/admin/*` 仍只有 /whoami 空壳；`internal/tenant/` 空目录；跨租户商户入驻/审核/封禁/对账需新建独立 `/v1/admin/*` 路由 + `platform_ops` 角色中间件 + 跨租户 service（不能简单绕过 EnforceTenant，破坏 ARCH-01）。
+- **后端缺口**：inventory `GET /boss/inventory/batches`（批次列表，临期看板真闭环）；groupbuy 独立 desc/原价字段（现降级 desc=title、original=团购价）；C端储值充值接口（balance 页充值入口）；C端订单详情单条接口；catalog 真分页 total（现 count=本次条数）。
+- **真 PG/Redis 联调**：全 pgxmock + memory，main.go 切换已就位。
+- **admin-web 构建优化**：单 chunk 3.2MB（echarts+antd 全量），待 manualChunks 拆分。
+- consumer-mp `member-qr` 组件仍文本占位 nonce（后端返二维码图片 URL 后改 image）。

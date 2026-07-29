@@ -4,7 +4,7 @@
 // MOCK_COUPONS 保留作离线演示与降级兜底,不删。
 
 import { http } from '../utils/request'
-import type { Coupon } from '../types/api'
+import type { Coupon, CouponDetail } from '../types/api'
 
 const USE_MOCK = false // 后端 GET /v1/wxshop/coupons 已就绪 (CONTRACT §16)
 
@@ -36,4 +36,32 @@ export function listCoupons(status?: 'unused' | 'used' | 'expired'): Promise<Cou
     console.warn('[coupon] listCoupons 真接口失败,降级 mock', err)
     return MOCK_COUPONS.filter((c) => c.status === want)
   })
+}
+
+/**
+ * 券详情 (GET /v1/wxshop/coupons/:id; CONTRACT §16.3(9))。
+ * 读操作: 真接口失败降级回 null, 页面 toast 退回 (不阻断)。
+ */
+export async function getCouponDetail(id: number): Promise<CouponDetail | null> {
+  if (USE_MOCK) {
+    return {
+      ...MOCK_COUPONS[0],
+      detail: {
+        threshold_text: MOCK_COUPONS[0].threshold_text,
+        scope_text: MOCK_COUPONS[0].scope_text,
+        value_text: MOCK_COUPONS[0].value_text,
+        valid_from: '2026-07-01',
+        valid_to: '2026-08-31',
+      },
+      available: true,
+      expire: '2026-08-31',
+    }
+  }
+  try {
+    return await http.get<CouponDetail>(`/v1/wxshop/coupons/${id}`)
+  } catch (err) {
+    // 降级: 真接口失败 → 返回 null (页面 toast 退回, 不阻断)
+    console.warn('[coupon] getCouponDetail 真接口失败,降级 null', err)
+    return null
+  }
 }

@@ -1,0 +1,51 @@
+/* pages/balance/balance.wxss — 储值余额页特有布局 */
+.balance-total-label {
+  font-size: 26rpx;
+  opacity: 0.92;
+  margin-bottom: 8rpx;
+}
+.balance-total-num {
+  font-size: 72rpx;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-bottom: 32rpx;
+}
+.balance-split {
+  display: flex;
+  align-items: center;
+}
+.balance-split-item {
+  flex: 1;
+  text-align: center;
+}
+.balance-split-num {
+  font-size: 40rpx;
+  font-weight: 700;
+}
+.balance-split-label {
+  font-size: 24rpx;
+  opacity: 0.9;
+  margin-top: 4rpx;
+}
+.balance-split-divider {
+  width: 2rpx;
+  height: 56rpx;
+  background: rgba(255, 255, 255, 0.25);
+}
+.balance-tips {
+  display: flex;
+  flex-direction: column;
+  gap: 8rpx;
+}
+.balance-tip {
+  font-size: 26rpx;
+  color: #595959;
+  line-height: 1.6;
+}
+.login-btn {
+  margin-top: 40rpx;
+  width: 300rpx;
+}
+.recharge-btn {
+  margin-top: 32rpx;
+}

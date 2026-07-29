@@ -1,0 +1,42 @@
+<!-- pages/balance/balance.wxml — 储值余额 -->
+<view class="container">
+  <!-- 未登录态 -->
+  <view wx:if="{{!isLoggedIn}}" class="empty">
+    <view class="empty-icon">🔒</view>
+    <view>请先登录</view>
+    <button class="btn-primary login-btn" bindtap="onTapLogin">去登录</button>
+  </view>
+
+  <block wx:else>
+    <!-- 余额卡片 (渐变橙金, 复用 profile 会员卡风格) -->
+    <view class="member-header">
+      <view class="grade-badge">{{levelName}}</view>
+      <view class="balance-total-label">储值余额合计 (元)</view>
+      <view class="balance-total-num">¥{{totalYuan}}</view>
+      <view class="balance-split">
+        <view class="balance-split-item">
+          <view class="balance-split-num">¥{{balanceYuan}}</view>
+          <view class="balance-split-label">本金</view>
+        </view>
+        <view class="balance-split-divider"/>
+        <view class="balance-split-item">
+          <view class="balance-split-num">¥{{giftYuan}}</view>
+          <view class="balance-split-label">赠送</view>
+        </view>
+      </view>
+    </view>
+
+    <!-- 储值说明 -->
+    <view class="section">
+      <view class="section-title">储值说明</view>
+      <view class="section-body balance-tips">
+        <view class="balance-tip">· 储值余额可在收银台出示会员码直接抵扣消费金额。</view>
+        <view class="balance-tip">· 本金为实际充值金额，赠送为门店活动赠送金额。</view>
+        <view class="balance-tip">· 余额以分(cent)为单位精确计费，多退少补。</view>
+      </view>
+    </view>
+
+    <!-- 充值入口 (C 端充值接口未就绪, 占位) -->
+    <button class="btn-primary recharge-btn" bindtap="onTapRecharge">充值</button>
+  </block>
+</view>

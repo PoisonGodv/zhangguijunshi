@@ -1,0 +1,63 @@
+/* pages/coupon-detail/coupon-detail.wxss — 券详情页特有布局 */
+.cp-detail-header {
+  background: linear-gradient(135deg, #FF6B35 0%, #FFB627 100%);
+  border-radius: 20rpx;
+  padding: 48rpx 32rpx;
+  color: #FFFFFF;
+  margin-bottom: 24rpx;
+  text-align: center;
+  box-shadow: 0 4rpx 16rpx rgba(255, 107, 53, 0.25);
+}
+.cp-detail-type {
+  display: inline-block;
+  background: rgba(255, 255, 255, 0.25);
+  color: #FFFFFF;
+  font-size: 24rpx;
+  padding: 6rpx 20rpx;
+  border-radius: 20rpx;
+  margin-bottom: 24rpx;
+}
+.cp-detail-value {
+  font-size: 80rpx;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-bottom: 12rpx;
+}
+.cp-detail-title {
+  font-size: 32rpx;
+  font-weight: 600;
+  margin-bottom: 16rpx;
+}
+.cp-detail-status {
+  font-size: 26rpx;
+  opacity: 0.92;
+}
+.cp-detail-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 14rpx 0;
+}
+.cp-detail-row-label {
+  font-size: 28rpx;
+  color: #8C8C8C;
+}
+.cp-detail-row-val {
+  font-size: 28rpx;
+  color: #1F1F1F;
+  text-align: right;
+  flex: 1;
+  margin-left: 24rpx;
+}
+.cp-detail-footer {
+  margin-top: 40rpx;
+  padding-bottom: 40rpx;
+}
+.cp-claim-btn {
+  width: 100%;
+}
+.cp-claim-tip {
+  text-align: center;
+  font-size: 28rpx;
+  color: #BFBFBF;
+  padding: 32rpx 0;
+}

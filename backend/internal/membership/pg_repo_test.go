@@ -13,6 +13,7 @@ package membership
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -490,6 +491,17 @@ func TestPGRepo_NilPoolIsSafe(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, out)
 
+	// ListMembersPage degrades to an empty page with total 0.
+	page, err := repo.ListMembersPage(context.Background(), 1, MemberFilter{})
+	require.NoError(t, err)
+	require.Empty(t, page.Items)
+	require.Equal(t, int64(0), page.Total)
+
+	// ListPointsLog degrades to an empty slice.
+	logs, err := repo.ListPointsLog(context.Background(), 1, 1, 50)
+	require.NoError(t, err)
+	require.Empty(t, logs)
+
 	// Identity lookups degrade to (0, false).
 	id, ok := repo.findMemberIDByPhone(1, "ph")
 	require.False(t, ok)
@@ -508,4 +520,108 @@ func TestPGRepo_NilPoolIsSafe(t *testing.T) {
 	_, err = nilRepo.GetMember(context.Background(), 1, 1)
 	require.ErrorIs(t, err, ErrNotFound)
 	require.NoError(t, nilRepo.AppendPointsLog(context.Background(), 1, 1, "earn", 1, 1, 0))
+}
+
+// ===== ListMembersPage (FE-MP-02 / FE-ADMIN boss list) =====
+
+// pointsLogColumns mirrors scanPointsLog's Scan order exactly.
+func pointsLogColumns() []string {
+	return []string{"id", "tenant_id", "member_id", "type", "delta", "points_after", "ref_order_id", "created_at"}
+}
+
+func TestPGMemberRepo_ListMembersPage(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGMemberRepo(mock)
+
+	// 1) COUNT(*) returns 2.
+	countSQL := strings.Replace(sqlMemberListPrefix,
+		`SELECT id, tenant_id, store_id, phone_hash, wx_openid, name, level, points, total_spent_cents, last_visit_at, birthday, status, created_at, updated_at FROM members`,
+		`SELECT COUNT(*) FROM members`, 1)
+	mock.ExpectQuery(countSQL).
+		WithArgs(int64(1)).
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(2)))
+
+	// 2) Paged SELECT (default limit 20, offset 0) returns the 2 rows.
+	pageSQL := sqlMemberListPrefix + ` ORDER BY id LIMIT $2 OFFSET $3`
+	mock.ExpectQuery(pageSQL).
+		WithArgs(int64(1), defaultListMembersPageLimit, 0).
+		WillReturnRows(pgxmock.NewRows(memberColumns()).
+			AddRow(int64(42), int64(1), int64(10), "ph_1", nil, "Alice", "normal", int64(0), int64(0), nil, nil, "active", fixedTime, fixedTime).
+			AddRow(int64(43), int64(1), int64(10), nil, "oABC", "Bob", "vip", int64(500), int64(0), nil, nil, "active", fixedTime, fixedTime))
+
+	page, err := repo.ListMembersPage(context.Background(), 1, MemberFilter{})
+	require.NoError(t, err)
+	require.Len(t, page.Items, 2)
+	require.Equal(t, int64(2), page.Total)
+	require.Equal(t, "Alice", page.Items[0].Name)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGMemberRepo_ListMembersPage_LevelFilter(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGMemberRepo(mock)
+	countSQL := strings.Replace(sqlMemberListPrefix,
+		`SELECT id, tenant_id, store_id, phone_hash, wx_openid, name, level, points, total_spent_cents, last_visit_at, birthday, status, created_at, updated_at FROM members`,
+		`SELECT COUNT(*) FROM members`, 1) + ` AND level = $2`
+	mock.ExpectQuery(countSQL).
+		WithArgs(int64(1), "vip").
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(1)))
+	pageSQL := sqlMemberListPrefix + ` AND level = $2 ORDER BY id LIMIT $3 OFFSET $4`
+	mock.ExpectQuery(pageSQL).
+		WithArgs(int64(1), "vip", defaultListMembersPageLimit, 0).
+		WillReturnRows(pgxmock.NewRows(memberColumns()).
+			AddRow(int64(43), int64(1), int64(10), nil, "oABC", "Bob", "vip", int64(500), int64(0), nil, nil, "active", fixedTime, fixedTime))
+	page, err := repo.ListMembersPage(context.Background(), 1, MemberFilter{Level: "vip"})
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	require.Equal(t, int64(1), page.Total)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGMemberRepo_ListMembersPage_Empty(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGMemberRepo(mock)
+	countSQL := strings.Replace(sqlMemberListPrefix,
+		`SELECT id, tenant_id, store_id, phone_hash, wx_openid, name, level, points, total_spent_cents, last_visit_at, birthday, status, created_at, updated_at FROM members`,
+		`SELECT COUNT(*) FROM members`, 1)
+	mock.ExpectQuery(countSQL).
+		WithArgs(int64(1)).
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(0)))
+	page, err := repo.ListMembersPage(context.Background(), 1, MemberFilter{})
+	require.NoError(t, err)
+	require.Empty(t, page.Items)
+	require.Equal(t, int64(0), page.Total)
+	// total 0 short-circuits the paged SELECT.
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// ===== ListPointsLog (FE-MP-02 CONTRACT §16.3(8)) =====
+
+func TestPGMemberRepo_ListPointsLog(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGMemberRepo(mock)
+	mock.ExpectQuery(sqlPointsLogList).
+		WithArgs(int64(1), int64(42), 50).
+		WillReturnRows(pgxmock.NewRows(pointsLogColumns()).
+			AddRow(int64(10), int64(1), int64(42), "earn", int64(50), int64(50), int64(700), fixedTime).
+			AddRow(int64(9), int64(1), int64(42), "redeem", int64(-20), int64(30), int64(701), fixedTime))
+	logs, err := repo.ListPointsLog(context.Background(), 1, 42, 50)
+	require.NoError(t, err)
+	require.Len(t, logs, 2)
+	require.Equal(t, "earn", logs[0].Type)
+	require.Equal(t, int64(50), logs[0].Delta)
+	require.Equal(t, int64(30), logs[1].PointsAfter)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGMemberRepo_ListPointsLog_Empty(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGMemberRepo(mock)
+	mock.ExpectQuery(sqlPointsLogList).
+		WithArgs(int64(1), int64(99), 50).
+		WillReturnRows(pgxmock.NewRows(pointsLogColumns()))
+	logs, err := repo.ListPointsLog(context.Background(), 1, 99, 50)
+	require.NoError(t, err)
+	require.Empty(t, logs)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

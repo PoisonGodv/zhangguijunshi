@@ -1,0 +1,53 @@
+<!-- pages/orders/orders.wxml — 我的订单 -->
+<view class="container">
+  <!-- 未登录态 -->
+  <view wx:if="{{!isLoggedIn}}" class="empty">
+    <view class="empty-icon">🔒</view>
+    <view>请先登录</view>
+  </view>
+
+  <block wx:else>
+    <block wx:if="{{loading}}">
+      <view class="loading">加载中…</view>
+    </block>
+
+    <block wx:elif="{{orders.length}}">
+      <view
+        wx:for="{{orders}}"
+        wx:key="id"
+        class="order-card"
+        data-id="{{item.id}}"
+        bindtap="onTapOrder"
+      >
+        <view class="order-head">
+          <view class="order-no">单号 {{item.order_no}}</view>
+          <view class="{{item.status_cls}}">{{item.status_text}}</view>
+        </view>
+
+        <view class="order-items">
+          <view
+            wx:for="{{item.items}}"
+            wx:for-item="it"
+            wx:key="key"
+            class="order-item-row"
+          >
+            <view class="order-item-name">{{it.line}}</view>
+            <view class="order-item-price">¥{{it.price}}</view>
+          </view>
+          <view wx:if="{{!item.items.length}}" class="order-item-row order-item-empty">
+            <view class="order-item-name">—</view>
+          </view>
+        </view>
+
+        <view class="order-foot">
+          <view class="order-date">{{item.created}}</view>
+          <view class="order-total">
+            合计 <text class="order-total-num">¥{{item.total}}</text>
+          </view>
+        </view>
+      </view>
+    </block>
+
+    <empty-state wx:else icon="📋" text="暂无订单"/>
+  </block>
+</view>

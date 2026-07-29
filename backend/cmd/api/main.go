@@ -45,6 +45,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/internal/payment"
 	"github.com/zhangguijunshi/backend/internal/reach"
+	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/internal/subscription"
 	"github.com/zhangguijunshi/backend/pkg/config"
@@ -109,7 +110,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("init jwt: %w", err)
 	}
-	store := buildSessionStore(context.Background(), cfg, log)
+	sessStore := buildSessionStore(context.Background(), cfg, log)
 
 	var authSvc *auth.AuthService
 	if jwtMgr != nil {
@@ -129,7 +130,7 @@ func run() error {
 			Secret:     cfg.WX.Secret,
 			AccessTTL:  cfg.JWT.AccessTTL,
 			RefreshTTL: cfg.JWT.RefreshTTL,
-		}, wxsdk.New(wxOpts...), jwtMgr, store, consumerRepo)
+		}, wxsdk.New(wxOpts...), jwtMgr, sessStore, consumerRepo)
 	}
 
 	// M1-S1 domain services (CONTRACT §8). Repositories are in-memory until
@@ -213,6 +214,16 @@ func run() error {
 		crmRepo = crm.NewPGRepo(database.Pool())
 	}
 	crmSvc := crm.New(crmRepo)
+
+	// FE-MP-02 store domain (CONTRACT §16.11). C-side 门店列表 read model over
+	// the stores table (migration 000001 + 000016 phone/group_qr/active). dev:
+	// in-memory repo seeds two demo stores under tenant_id=1; production reads
+	// the real stores rows.
+	var storeRepo store.StoreRepo = store.NewMemoryStoreRepo()
+	if database != nil {
+		storeRepo = store.NewPGStoreRepo(database.Pool())
+	}
+	storeSvc := store.New(storeRepo)
 
 	// M3-S1 AI engine (CONTRACT §12). Five-stage pipeline + ActionExecutor.
 	// gateway.NewFromConfig builds a placeholder (empty-providers) gateway when
@@ -328,7 +339,7 @@ func run() error {
 			Cfg:          cfg,
 			DB:           database,
 			JWT:          jwtMgr,
-			Store:        store,
+			Store:        sessStore,
 			AuthSvc:      authSvc,
 			Catalog:      catalogSvc,
 			Billing:      billingSvc,
@@ -344,6 +355,7 @@ func run() error {
 			Attribution:  attrRepo,
 			Payment:      paymentSvc,
 			Subscription: subscriptionSvc,
+			StoreSvc:     storeSvc,
 			DevMock:      cfg.Multitenancy.DevMockHeader,
 		}),
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
@@ -370,8 +382,8 @@ func run() error {
 	if database != nil {
 		database.Close()
 	}
-	if store != nil {
-		_ = store.Close()
+	if sessStore != nil {
+		_ = sessStore.Close()
 	}
 	log.Info("shutdown complete")
 	return nil

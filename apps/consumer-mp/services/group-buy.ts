@@ -4,7 +4,7 @@
 // 参团失败不降级 (参团是写操作,降级会造成"假参团"误导,直接抛错由页面 toast)。
 
 import { http } from '../utils/request'
-import type { GroupBuyBrief } from '../types/api'
+import type { GroupBuyBrief, GroupBuyDetail } from '../types/api'
 
 const USE_MOCK = false // 后端 GET /v1/wxshop/groupbuys/active 已就绪 (CONTRACT §16)
 
@@ -35,4 +35,31 @@ export function joinGroupBuy(id: number): Promise<unknown> {
     return Promise.resolve({ ok: true, mock: true })
   }
   return http.post<unknown>(`/v1/wxshop/groupbuys/${id}/join`)
+}
+
+/**
+ * 拼团详情 (GET /v1/wxshop/groupbuys/:id; CONTRACT §16.3(8))。
+ * 读操作: 真接口失败降级回 null, 页面 toast 退回列表 (不抛错阻断)。
+ */
+export async function getGroupBuyDetail(id: number): Promise<GroupBuyDetail | null> {
+  if (USE_MOCK) {
+    return {
+      id,
+      title: '3人团 新鲜草莓 2斤装',
+      desc: '3人团 新鲜草莓 2斤装',
+      price_cents: 1990,
+      original_cents: 2990,
+      required: 3,
+      joined: 2,
+      status: 'active',
+      expire: new Date(Date.now() + 2 * 24 * 3600 * 1000).toISOString(),
+    }
+  }
+  try {
+    return await http.get<GroupBuyDetail>(`/v1/wxshop/groupbuys/${id}`)
+  } catch (err) {
+    // 降级: 真接口失败 → 返回 null (页面 toast 退回, 不阻断)
+    console.warn('[group-buy] getGroupBuyDetail 真接口失败,降级 null', err)
+    return null
+  }
 }

@@ -1,0 +1,43 @@
+<!-- pages/coupon-detail/coupon-detail.wxml — 券详情 -->
+<view class="container">
+  <block wx:if="{{loading}}">
+    <view class="loading">加载中…</view>
+  </block>
+
+  <block wx:elif="{{detail}}">
+    <!-- 券主卡片 (渐变橙金, 复用 member-header 风格) -->
+    <view class="cp-detail-header">
+      <view class="cp-detail-type">{{detail.typeText}}</view>
+      <view class="cp-detail-value">{{detail.valueText}}</view>
+      <view class="cp-detail-title">{{detail.title}}</view>
+      <view class="cp-detail-status">{{detail.statusText}}</view>
+    </view>
+
+    <!-- 使用规则 -->
+    <view class="section">
+      <view class="section-title">使用规则</view>
+      <view class="cp-detail-row"><view class="cp-detail-row-label">面额</view><view class="cp-detail-row-val">{{detail.valueTextDetail}}</view></view>
+      <view class="cp-detail-row"><view class="cp-detail-row-label">使用门槛</view><view class="cp-detail-row-val">{{detail.thresholdText}}</view></view>
+      <view class="cp-detail-row"><view class="cp-detail-row-label">可用范围</view><view class="cp-detail-row-val">{{detail.scopeText}}</view></view>
+    </view>
+
+    <!-- 有效期 -->
+    <view class="section">
+      <view class="section-title">有效期</view>
+      <view class="cp-detail-row"><view class="cp-detail-row-label">生效时间</view><view class="cp-detail-row-val">{{detail.validFrom || '—'}}</view></view>
+      <view class="cp-detail-row"><view class="cp-detail-row-label">过期时间</view><view class="cp-detail-row-val">{{detail.validTo || '—'}}</view></view>
+    </view>
+
+    <!-- 领取/核销入口 -->
+    <view class="cp-detail-footer">
+      <button
+        wx:if="{{detail.available}}"
+        class="btn-primary cp-claim-btn"
+        bindtap="onClaim"
+      >到店核销领取</button>
+      <view wx:else class="cp-claim-tip">本券不可领取/已持有</view>
+    </view>
+  </block>
+
+  <empty-state wx:else icon="🧧" text="券不存在"/>
+</view>

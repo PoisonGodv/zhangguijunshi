@@ -33,6 +33,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/internal/payment"
 	"github.com/zhangguijunshi/backend/internal/reach"
+	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/internal/subscription"
 	"github.com/zhangguijunshi/backend/pkg/config"
@@ -76,6 +77,8 @@ type Deps struct {
 	// M4-S1 payment / subscription (nil in the minimal test fixture).
 	Payment      *payment.Service
 	Subscription *subscription.Service
+	// FE-MP-02 store domain (C-side 门店列表; nil in the minimal test fixture).
+	StoreSvc *store.Service
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -159,6 +162,7 @@ func wireBoss(r *gin.Engine, deps Deps) {
 	if deps.Membership != nil {
 		h := handler.NewMembershipHandler(deps.Membership)
 		boss.POST("/membership/members", h.Join)
+		boss.GET("/membership/members", h.ListMembers)
 		boss.GET("/membership/members/:id", h.GetMember)
 		boss.POST("/membership/members/:id/code", h.IssueCode)
 		boss.POST("/membership/redeem", h.Redeem)
@@ -253,18 +257,23 @@ func wireWxshop(r *gin.Engine, deps Deps) {
 	}
 
 	// M-C-01 C 端业务接口 (CONTRACT §16): member profile / 余额 / 券包 / 动态会员码 /
-	// 新人券 / 拼团 / 订单。Membership+Marketing+Groupbuy are required to wire the
-	// group; Billing may be nil (→ /orders degrades to an empty list, §16.8).
+	// 新人券 / 拼团 / 订单 / 拼团详情 / 券详情 / 积分明细 / 门店列表 (FE-MP-02 §16.11).
+	// Membership+Marketing+Groupbuy are required to wire the group; Billing / Store
+	// may be nil (→ /orders / /stores degrade to an empty list, §16.8).
 	if deps.Membership != nil && deps.Marketing != nil && deps.Groupbuy != nil {
-		h := handler.NewWxshopHandler(deps.Membership, deps.Marketing, deps.Groupbuy, deps.Billing)
+		h := handler.NewWxshopHandler(deps.Membership, deps.Marketing, deps.Groupbuy, deps.Billing, deps.StoreSvc)
 		authed.GET("/coupons", h.Coupons)
+		authed.GET("/coupons/:id", h.CouponDetail)
 		authed.GET("/member/profile", h.Profile)
 		authed.GET("/member/balance", h.Balance)
+		authed.GET("/member/points", h.Points)
 		authed.POST("/member/code", h.MemberCode)
 		authed.POST("/member/claim-newcomer", h.ClaimNewcomer)
 		authed.GET("/groupbuys/active", h.GroupbuysActive)
+		authed.GET("/groupbuys/:id", h.GroupbuyDetail)
 		authed.POST("/groupbuys/:id/join", h.GroupbuyJoin)
 		authed.GET("/orders", h.Orders)
+		authed.GET("/stores", h.Stores)
 	}
 }
 

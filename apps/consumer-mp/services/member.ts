@@ -6,7 +6,7 @@
 // 注意: claimNewMemberCoupon 传原始 11 位手机号 (后端自己 hash 存储,前端勿传掩码)。
 
 import { http } from '../utils/request'
-import type { MemberInfo, MemberCode, Coupon } from '../types/api'
+import type { MemberInfo, MemberCode, Coupon, Balance, PointsResult } from '../types/api'
 
 const USE_MOCK = false // 后端 /v1/wxshop/member/* 已就绪 (CONTRACT §16)
 
@@ -26,8 +26,7 @@ export function genMemberCode(): Promise<MemberCode> {
  * 我的会员信息 (GET /v1/wxshop/member/profile) → MemberInfo。
  * 降级: 真接口失败回 mock 占位 (member_id 999, 不再用 auth/me subject 伪造)。
  */
-export async function getMyProfile(): Promise<MemberInfo> {
-  if (USE_MOCK) {
+export async function getMyProfile(): Promise<MemberInfo> {  if (USE_MOCK) {
     return {
       member_id: 999,
       phone_masked: '',
@@ -98,4 +97,48 @@ export function claimNewMemberCoupon(phone: string): Promise<{ coupon: Coupon; a
         },
       }
     })
+}
+
+/**
+ * 我的储值余额 (GET /v1/wxshop/member/balance) → {balance_cents, gift_cents}。
+ * 后端: membership.GetAccount 真实返; 新会员 (无 account 行) 返 0/0, 不 404。
+ * 降级: 真接口失败 → 回 0/0 (页面空态展示, 不阻断)。
+ */
+export async function getBalance(): Promise<Balance> {
+  if (USE_MOCK) {
+    return { balance_cents: 6600, gift_cents: 600 }
+  }
+  try {
+    return await http.get<Balance>('/v1/wxshop/member/balance')
+  } catch (err) {
+    // 降级: 真接口失败 → 回 0/0 (页面展示空余额, 不阻断)
+    console.warn('[member] getBalance 真接口失败,降级 0/0', err)
+    return { balance_cents: 0, gift_cents: 0 }
+  }
+}
+
+/**
+ * 积分明细 (GET /v1/wxshop/member/points?limit=; CONTRACT §16.3(10))。
+ * points: 当前积分(权威运行余额); logs: 流水(倒序, limit 默认 50, ≤200)。
+ * 降级: 真接口失败 → 回 {points:0, logs:[]} (页面空态, 不阻断)。
+ */
+export async function getPoints(limit?: number): Promise<PointsResult> {
+  if (USE_MOCK) {
+    return {
+      points: 320,
+      logs: [
+        { type: 'earn', delta: 50, points_after: 320, ref_order_id: 1001, created_at: '2026-07-28T10:20:00+08:00' },
+        { type: 'redeem', delta: -100, points_after: 270, created_at: '2026-07-20T15:00:00+08:00' },
+        { type: 'earn', delta: 150, points_after: 370, ref_order_id: 980, created_at: '2026-07-10T09:30:00+08:00' },
+      ],
+    }
+  }
+  try {
+    const qs = limit && limit > 0 ? `?limit=${limit}` : ''
+    return await http.get<PointsResult>(`/v1/wxshop/member/points${qs}`)
+  } catch (err) {
+    // 降级: 真接口失败 → 回空积分 (页面空态, 不阻断)
+    console.warn('[member] getPoints 真接口失败,降级 0/[]', err)
+    return { points: 0, logs: [] }
+  }
 }

@@ -1,0 +1,80 @@
+/* pages/stores/stores.wxss — 门店列表页特有布局 */
+.store-card {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  margin-bottom: 20rpx;
+  padding: 24rpx;
+  box-shadow: 0 2rpx 12rpx rgba(255, 107, 53, 0.08);
+}
+.store-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.store-contact {
+  margin-top: 16rpx;
+  padding-top: 16rpx;
+  border-top: 2rpx dashed #F0E6DE;
+}
+.store-contact-label {
+  font-size: 26rpx;
+  color: #8C8C8C;
+}
+.store-contact-val {
+  font-size: 28rpx;
+  color: #1F1F1F;
+}
+.store-group-btn {
+  margin-top: 24rpx;
+  width: 100%;
+  background: #FFF3EB;
+  color: #FF6B35;
+  font-size: 28rpx;
+  font-weight: 600;
+  border-radius: 44rpx;
+  height: 72rpx;
+  line-height: 72rpx;
+  border: none;
+}
+.store-group-btn::after {
+  border: none;
+}
+
+/* 进群二维码预览浮层 */
+.qr-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.qr-modal-card {
+  background: #FFFFFF;
+  border-radius: 20rpx;
+  padding: 40rpx;
+  width: 76%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.qr-modal-title {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+  margin-bottom: 24rpx;
+}
+.qr-modal-img {
+  width: 400rpx;
+  height: 400rpx;
+  background: #FFF9F5;
+}
+.qr-modal-tip {
+  font-size: 26rpx;
+  color: #BFBFBF;
+  margin-top: 24rpx;
+}

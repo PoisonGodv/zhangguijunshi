@@ -1,0 +1,84 @@
+/* pages/orders/orders.wxss — 我的订单页特有布局 */
+.order-card {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  margin-bottom: 20rpx;
+  padding: 24rpx;
+  box-shadow: 0 2rpx 12rpx rgba(255, 107, 53, 0.08);
+}
+.order-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 16rpx;
+  border-bottom: 2rpx dashed #F0E6DE;
+}
+.order-no {
+  font-size: 26rpx;
+  color: #8C8C8C;
+}
+.order-status {
+  font-size: 24rpx;
+  padding: 4rpx 16rpx;
+  border-radius: 20rpx;
+}
+.order-status-pending {
+  color: #FF6B35;
+  background: rgba(255, 107, 53, 0.1);
+}
+.order-status-paid {
+  color: #2ECC71;
+  background: rgba(46, 204, 113, 0.1);
+}
+.order-status-refunded {
+  color: #FF4D4F;
+  background: rgba(255, 77, 79, 0.1);
+}
+.order-status-voided {
+  color: #BFBFBF;
+  background: rgba(191, 191, 191, 0.12);
+}
+.order-items {
+  padding: 16rpx 0;
+}
+.order-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8rpx 0;
+}
+.order-item-name {
+  font-size: 30rpx;
+  color: #1F1F1F;
+  flex: 1;
+  min-width: 0;
+}
+.order-item-price {
+  font-size: 28rpx;
+  color: #595959;
+  margin-left: 16rpx;
+}
+.order-item-empty {
+  color: #BFBFBF;
+}
+.order-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 16rpx;
+  border-top: 2rpx dashed #F0E6DE;
+}
+.order-date {
+  font-size: 24rpx;
+  color: #BFBFBF;
+}
+.order-total {
+  font-size: 26rpx;
+  color: #8C8C8C;
+}
+.order-total-num {
+  font-size: 34rpx;
+  font-weight: 700;
+  color: #FF6B35;
+  margin-left: 8rpx;
+}

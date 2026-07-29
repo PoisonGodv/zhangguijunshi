@@ -23,6 +23,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/margin"
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
+	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
 	"github.com/zhangguijunshi/backend/pkg/jwt"
@@ -82,11 +83,13 @@ var (
 	wxBillingSvc    *billing.Service
 	wxCatalogSvc    *catalog.Service
 	wxMembershipSvc *membership.Service
+	wxStoreSvc      *store.Service
 )
 
 func bilSvcOf(_ *gin.Engine) *billing.Service    { return wxBillingSvc }
 func catSvcOf(_ *gin.Engine) *catalog.Service    { return wxCatalogSvc }
 func memSvcOf(_ *gin.Engine) *membership.Service { return wxMembershipSvc }
+func storeSvcOf(_ *gin.Engine) *store.Service    { return wxStoreSvc }
 
 // newWxshopRouter builds a router with membership+marketing+groupbuy+billing
 // wired over in-memory repos and a real JWT stack, returning the manager so
@@ -97,8 +100,8 @@ func newWxshopRouter(t *testing.T) (*gin.Engine, *jwt.Manager) {
 	require.NoError(t, err)
 	mgr, err := jwt.New(jwt.Config{PrivateKey: priv, Issuer: "zgjs-test", AccessTTL: time.Minute})
 	require.NoError(t, err)
-	store := jwt.NewMemorySessionStore()
-	t.Cleanup(func() { _ = store.Close() })
+	sessStore := jwt.NewMemorySessionStore()
+	t.Cleanup(func() { _ = sessStore.Close() })
 
 	catSvc := catalog.NewService(catalog.NewMemoryProductRepo())
 	bilSvc := billing.New(billing.NewMemoryOrderRepo(), testPricer{catSvc})
@@ -109,20 +112,24 @@ func newWxshopRouter(t *testing.T) (*gin.Engine, *jwt.Manager) {
 		marketing.WithMarginGuard(wxMarginGuard{guard: margin.Guard{MarginFloorPct: 10}, catalogSvc: catSvc}),
 	)
 	gbSvc := groupbuy.New(groupbuy.NewMemoryGroupbuyRepo(), groupbuy.WithMemberLookuper(wxMembershipLookuper{memSvc}))
+	storeSvc := store.New(store.NewMemoryStoreRepo())
 	wxGroupbuySvc = gbSvc
 	wxBillingSvc = bilSvc
 	wxCatalogSvc = catSvc
 	wxMembershipSvc = memSvc
+	wxStoreSvc = storeSvc
 
 	return New(Deps{
 		Cfg:        &config.Config{App: config.AppConfig{Env: "test"}},
 		JWT:        mgr,
-		Store:      store,
+		Store:      sessStore,
 		Catalog:    catSvc,
 		Billing:    bilSvc,
 		Membership: memSvc,
 		Marketing:  mktSvc,
 		Groupbuy:   gbSvc,
+		StoreSvc:   storeSvc,
+		DevMock:    true, // boss surface exercised via X-Mock-Tenant (FE-MP-02 member list)
 	}), mgr
 }
 
@@ -356,13 +363,17 @@ func TestWxshop_NoToken(t *testing.T) {
 	r, _ := newWxshopRouter(t)
 	for _, p := range []struct{ method, path string }{
 		{http.MethodGet, "/v1/wxshop/coupons"},
+		{http.MethodGet, "/v1/wxshop/coupons/1"},
 		{http.MethodGet, "/v1/wxshop/member/profile"},
 		{http.MethodGet, "/v1/wxshop/member/balance"},
+		{http.MethodGet, "/v1/wxshop/member/points"},
 		{http.MethodPost, "/v1/wxshop/member/code"},
 		{http.MethodPost, "/v1/wxshop/member/claim-newcomer"},
 		{http.MethodGet, "/v1/wxshop/groupbuys/active"},
+		{http.MethodGet, "/v1/wxshop/groupbuys/1"},
 		{http.MethodPost, "/v1/wxshop/groupbuys/1/join"},
 		{http.MethodGet, "/v1/wxshop/orders"},
+		{http.MethodGet, "/v1/wxshop/stores"},
 	} {
 		w := doJSON(t, r, p.method, p.path, nil, "")
 		assert.Equal(t, http.StatusUnauthorized, w.Code, "%s %s should 401", p.method, p.path)

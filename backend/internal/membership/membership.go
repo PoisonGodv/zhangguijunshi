@@ -97,10 +97,21 @@ type MemberRepo interface {
 	// the resulting account balance.
 	AppendBalanceLog(ctx context.Context, tenantID, memberID, accountID int64, typ string, amountCents, balanceAfter, refOrderID int64) error
 
+	// ListPointsLog returns the points-flow rows for (tenantID, memberID), newest
+	// first. limit<=0 defaults to 50 (FE-MP-02 CONTRACT §16.3(8): C 端积分明细).
+	// Cross-tenant rows are never returned. PointsLog is the public read shape.
+	ListPointsLog(ctx context.Context, tenantID, memberID int64, limit int) ([]PointsLog, error)
+
 	// ListMembers enumerates members within tenantID matching f (M3-S2 signal
 	// real enumeration). Empty filter fields are not filtering; Limit<=0 defaults
 	// to 500. Cross-tenant members are never returned.
 	ListMembers(ctx context.Context, tenantID int64, f MemberFilter) ([]*Member, error)
+
+	// ListMembersPage returns one page of tenantID's members matching f plus
+	// the total matching count (FE-MP-02 / FE-ADMIN boss list, CONTRACT §17.11).
+	// Limit<=0 defaults to 20; Offset<=0 starts at 0. Total is independent of
+	// Offset/Limit. Cross-tenant members are never returned.
+	ListMembersPage(ctx context.Context, tenantID int64, f MemberFilter) (ListMembersResult, error)
 
 	// findMemberIDByPhone returns the id of the member registered under
 	// (tenantID, phoneHash); ok=false when none. Drives Join idempotency.
@@ -235,10 +246,10 @@ type RechargeResult struct {
 	GiftedCents    int64 // 本次赠送(档位规则算)
 }
 
-// MemberFilter narrows a ListMembers query (M3-S2 signal real enumeration).
-// TenantID is NOT part of the filter: it is resolved from ctx by every repo /
-// service call (ARCH-01) and injected separately. A nil/zero field means "do
-// not filter on this dimension".
+// MemberFilter narrows a ListMembers query (M3-S2 signal real enumeration +
+// FE-MP-02 boss membership list). TenantID is NOT part of the filter: it is
+// resolved from ctx by every repo / service call (ARCH-01) and injected
+// separately. A nil/zero field means "do not filter on this dimension".
 type MemberFilter struct {
 	// SleepBefore selects members whose LastVisitAt is before this value
 	// (30-day-sleeping signal). A member who never visited (LastVisitAt nil) is
@@ -251,6 +262,40 @@ type MemberFilter struct {
 	// month+day (birthday-today signal). A member with nil Birthday never matches.
 	// Nil = do not filter.
 	BirthdayOn *time.Time
-	// Limit caps the result size; <=0 defaults to 500.
+	// Level filters by member level (normal|vip|blackcard). Empty = do not
+	// filter (FE-MP-02 boss list query). Memory repo applies it post-scan; the
+	// pg repo applies it as a SQL equality predicate.
+	Level string
+	// Query is a loose substring match against the member's Name OR PhoneHash
+	// (FE-MP-02 boss list ?q=). Empty = do not filter. The match is
+	// case-sensitive substring (phone hash is a fixed string; names are short).
+	Query string
+	// Offset skips the first Offset matches (pager). <=0 = start at 0.
+	Offset int
+	// Limit caps the result size; <=0 defaults to 500 (M3-S2 signal) / 20
+	// (boss list, when called via ListMembersPage).
 	Limit int
+}
+
+// PointsLog is one member_points_log row, the C-side 积分明细 read shape
+// (FE-MP-02 CONTRACT §16.3(8)). It is the public mirror of the unexported
+// pointsFlow audit row: typ (earn/redeem/expire/adjust), the signed delta,
+// the resulting pointsAfter, the optional ref_order_id and the created_at.
+type PointsLog struct {
+	ID          int64     `json:"id"`
+	TenantID    int64     `json:"tenant_id"`
+	MemberID    int64     `json:"member_id"`
+	Type        string    `json:"type"` // earn | redeem | expire | adjust
+	Delta       int64     `json:"delta"`
+	PointsAfter int64     `json:"points_after"`
+	RefOrderID  int64     `json:"ref_order_id"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// ListMembersResult carries a ListMembers page plus the total count of
+// matching members (FE-MP-02 / FE-ADMIN, CONTRACT §17.11 boss membership list).
+// Total is independent of Limit/Offset so the pager can render "共 N 条".
+type ListMembersResult struct {
+	Items []*Member `json:"items"`
+	Total int64     `json:"total"`
 }

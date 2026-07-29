@@ -182,6 +182,35 @@ func (s *Service) ListMembers(ctx context.Context, f MemberFilter) ([]*Member, e
 	return s.repo.ListMembers(ctx, tenantID, f)
 }
 
+// ListMembersPage returns one page of the ctx tenant's members matching f plus
+// the total matching count (FE-MP-02 / FE-ADMIN boss list, CONTRACT §17.11).
+// Limit<=0 defaults to 20; Offset<=0 starts at 0. Total is independent of
+// Offset/Limit so the pager can render "共 N 条". Cross-tenant members are
+// never visible (repo enforces this). tenantID is resolved from ctx (ARCH-01),
+// NEVER trusted from the caller.
+func (s *Service) ListMembersPage(ctx context.Context, f MemberFilter) (ListMembersResult, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return ListMembersResult{}, err
+	}
+	return s.repo.ListMembersPage(ctx, tenantID, f)
+}
+
+// ListPointsLog returns the ctx tenant's points-flow rows for memberID, newest
+// first (FE-MP-02 CONTRACT §16.3(8): C 端积分明细). limit<=0 defaults to 50.
+// Cross-tenant rows are never visible (repo enforces this). tenantID is
+// resolved from ctx (ARCH-01), NEVER trusted from the caller.
+func (s *Service) ListPointsLog(ctx context.Context, memberID int64, limit int) ([]PointsLog, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if memberID <= 0 {
+		return nil, errcode.ErrParam
+	}
+	return s.repo.ListPointsLog(ctx, tenantID, memberID, limit)
+}
+
 // IssueCode issues a short-lived (60s) dynamic member code for an existing,
 // active member of the ctx tenant. A blocked member is rejected with
 // ErrMemberBlocked; an unknown / cross-tenant member with ErrNotFound.

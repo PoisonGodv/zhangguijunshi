@@ -1,0 +1,55 @@
+/* pages/group-buy/group-buy.wxss — 拼团列表页特有布局 */
+.gb-card {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  margin-bottom: 20rpx;
+  padding: 24rpx;
+  box-shadow: 0 2rpx 12rpx rgba(255, 107, 53, 0.08);
+}
+.gb-title {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+  margin-bottom: 12rpx;
+}
+.gb-price-row {
+  display: flex;
+  align-items: baseline;
+  margin-bottom: 20rpx;
+}
+.gb-price-row .price-now {
+  font-size: 40rpx;
+}
+.gb-price-row .price-old {
+  font-size: 26rpx;
+}
+.gb-progress {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12rpx;
+}
+.gb-progress-bar {
+  flex: 1;
+  height: 12rpx;
+  background: #F0E6DE;
+  border-radius: 6rpx;
+  overflow: hidden;
+  margin-right: 16rpx;
+}
+.gb-progress-inner {
+  height: 100%;
+  background: linear-gradient(90deg, #FF6B35 0%, #FFB627 100%);
+  border-radius: 6rpx;
+  transition: width 0.3s;
+}
+.gb-progress-text {
+  font-size: 24rpx;
+  color: #8C8C8C;
+  white-space: nowrap;
+}
+.gb-cta {
+  text-align: right;
+  font-size: 26rpx;
+  color: #FF6B35;
+  font-weight: 600;
+}

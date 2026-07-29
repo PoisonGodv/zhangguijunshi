@@ -780,3 +780,120 @@ func TestListMembers_BirthdayFieldRoundTrip(t *testing.T) {
 		t.Errorf("stored birthday mutated via alias: got %v, want %v", again.Birthday, bd)
 	}
 }
+
+// TestListMembersPage_ServiceAndFilter exercises the FE-MP-02 boss list
+// service path: Level + Query filter, pagination, and the total count.
+func TestListMembersPage_ServiceAndFilter(t *testing.T) {
+	repo := NewMemoryMemberRepo()
+	svc := New(repo, NewMemoryMemberCoder(nil))
+	ctx := ctxFor(200, 10, 0)
+
+	// Seed: 3 normals + 1 vip. Names: Alice, Bob, Carol (normal), Vip (vip).
+	for _, m := range []*Member{
+		{TenantID: 200, StoreID: 10, Name: "Alice", PhoneHash: "pa", Level: "normal", Status: "active", CreatedAt: baseNow, UpdatedAt: baseNow},
+		{TenantID: 200, StoreID: 10, Name: "Bob", PhoneHash: "pb", Level: "normal", Status: "active", CreatedAt: baseNow, UpdatedAt: baseNow},
+		{TenantID: 200, StoreID: 10, Name: "Carol", PhoneHash: "pc", Level: "normal", Status: "active", CreatedAt: baseNow, UpdatedAt: baseNow},
+		{TenantID: 200, StoreID: 10, Name: "VipAlice", PhoneHash: "pv", Level: "vip", Status: "active", CreatedAt: baseNow, UpdatedAt: baseNow},
+	} {
+		if _, err := repo.CreateMember(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// All members, page size 2, page 1 (offset 0) → 2 items, total 4.
+	page, err := svc.ListMembersPage(ctx, MemberFilter{Limit: 2, Offset: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.Total != 4 {
+		t.Fatalf("page1: items=%d total=%d, want 2/4", len(page.Items), page.Total)
+	}
+	// Page 2 (offset 2) → remaining 2 items.
+	page, err = svc.ListMembersPage(ctx, MemberFilter{Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.Total != 4 {
+		t.Fatalf("page2: items=%d total=%d, want 2/4", len(page.Items), page.Total)
+	}
+
+	// Level filter: vip only → 1 item, total 1.
+	page, err = svc.ListMembersPage(ctx, MemberFilter{Level: "vip"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Total != 1 || page.Items[0].Name != "VipAlice" {
+		t.Fatalf("vip filter: items=%d total=%d name=%s", len(page.Items), page.Total, page.Items[0].Name)
+	}
+
+	// Query filter: name contains "Alice" → Alice + VipAlice = 2.
+	page, err = svc.ListMembersPage(ctx, MemberFilter{Query: "Alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.Total != 2 {
+		t.Fatalf("query Alice: items=%d total=%d, want 2/2", len(page.Items), page.Total)
+	}
+}
+
+// TestListMembersPage_CrossTenantEmpty proves a tenant only sees its own members
+// (ARCH-01): tenant 201 sees none of tenant 200's seeded members.
+func TestListMembersPage_CrossTenantEmpty(t *testing.T) {
+	repo := NewMemoryMemberRepo()
+	svc := New(repo, NewMemoryMemberCoder(nil))
+	ctx200 := ctxFor(200, 10, 0)
+	repo.CreateMember(ctx200, &Member{TenantID: 200, StoreID: 10, Name: "A", Level: "normal", Status: "active", CreatedAt: baseNow, UpdatedAt: baseNow})
+
+	ctx201 := ctxFor(201, 10, 0)
+	page, err := svc.ListMembersPage(ctx201, MemberFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 0 || page.Total != 0 {
+		t.Fatalf("cross-tenant: items=%d total=%d, want 0/0", len(page.Items), page.Total)
+	}
+}
+
+// TestListPointsLog_Service exercises the C 端 积分明细 service path: redeem
+// accrues points + appends an earn log, then ListPointsLog returns it newest
+// first.
+func TestListPointsLog_Service(t *testing.T) {
+	repo := NewMemoryMemberRepo()
+	svc := New(repo, NewMemoryMemberCoder(nil))
+	ctx := ctxFor(300, 10, 0)
+
+	created, err := svc.Join(ctx, JoinInput{WxOpenID: "oABC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Accrue 50 points via a Redeem (earn-only, no consume).
+	if _, err := svc.Redeem(ctx, RedeemInput{Code: mustIssueCode(t, svc, created.ID), EarnPoints: 50}); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := svc.ListPointsLog(ctx, created.ID, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Delta != 50 || logs[0].PointsAfter != 50 || logs[0].Type != "earn" {
+		t.Fatalf("logs=%+v, want 1 earn row delta=50 after=50", logs)
+	}
+	// Cross-tenant reads nothing.
+	otherCtx := ctxFor(301, 10, 0)
+	otherLogs, err := svc.ListPointsLog(otherCtx, created.ID, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(otherLogs) != 0 {
+		t.Fatalf("cross-tenant points log leak: %d rows", len(otherLogs))
+	}
+}
+
+// mustIssueCode issues a member code or fails the test (test helper).
+func mustIssueCode(t *testing.T, svc *Service, memberID int64) string {
+	t.Helper()
+	code, err := svc.IssueCode(ctxFor(300, 10, 0), memberID)
+	if err != nil {
+		t.Fatalf("issue code: %v", err)
+	}
+	return code
+}

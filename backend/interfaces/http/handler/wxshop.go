@@ -26,6 +26,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/margin"
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
+	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
 )
@@ -36,13 +37,14 @@ type WxshopHandler struct {
 	marketing  *marketing.Service
 	groupbuy   *groupbuy.Service
 	billing    *billing.Service // optional; nil → /orders degrades to empty list (minimal fixture)
+	store      *store.Service   // optional; nil → /stores degrades to empty list
 	now        func() time.Time
 }
 
 // NewWxshopHandler constructs a WxshopHandler. membership/marketing/groupbuy
-// are required for the endpoints that are wired; billing may be nil.
-func NewWxshopHandler(mem *membership.Service, mkt *marketing.Service, gb *groupbuy.Service, bil *billing.Service) *WxshopHandler {
-	return &WxshopHandler{membership: mem, marketing: mkt, groupbuy: gb, billing: bil, now: time.Now}
+// are required for the endpoints that are wired; billing/store may be nil.
+func NewWxshopHandler(mem *membership.Service, mkt *marketing.Service, gb *groupbuy.Service, bil *billing.Service, st *store.Service) *WxshopHandler {
+	return &WxshopHandler{membership: mem, marketing: mkt, groupbuy: gb, billing: bil, store: st, now: time.Now}
 }
 
 // memberCodeTTL mirrors the membership domain's dynamic-code ttl (60s). It is
@@ -179,13 +181,22 @@ func (h *WxshopHandler) Coupons(c *gin.Context) {
 	httpx.OK(c, out)
 }
 
-// Profile returns the caller's member profile. balance_cents 降级为 0（见
-// CONTRACT §16.4 TODO: membership 未暴露 GetAccount 公开方法，储值余额待补）.
+// Profile returns the caller's member profile. balance_cents reflects the real
+// stored-value balance via membership.GetAccount (a member with no account yet
+// reads 0, matching the Balance handler). phone_masked stays empty (the member
+// only stores a hash, never the raw number).
 // GET /v1/wxshop/member/profile
 func (h *WxshopHandler) Profile(c *gin.Context) {
 	m := h.memberFromClaims(c, "")
 	if m == nil {
 		return
+	}
+	// Real stored-value balance (CONTRACT §16.4: the GetAccount path is wired
+	// in FE-MP-02 — the §16.4 TODO is retired). A member whose account open was
+	// bypassed reads 0, matching the /member/balance handler.
+	var balance int64
+	if acc, err := h.membership.GetAccount(c.Request.Context(), m.ID); err == nil && acc != nil {
+		balance = acc.BalanceCents
 	}
 	httpx.OK(c, gin.H{
 		"member_id":         m.ID,
@@ -193,23 +204,11 @@ func (h *WxshopHandler) Profile(c *gin.Context) {
 		"level":             m.Level,
 		"level_name":        memberLevelName(m.Level),
 		"points":            m.Points,
-		"balance_cents":     0, // TODO(CONTRACT §16.4): 接 membership.GetAccount 后返回真实储值余额
+		"balance_cents":     balance,
 		"total_spent_cents": m.TotalSpentCents,
 		"tenant_id":         m.TenantID,
 		"store_id":          m.StoreID,
 	})
-}
-
-// memberLevelName maps the domain level to a display name.
-func memberLevelName(level string) string {
-	switch level {
-	case "vip":
-		return "银卡会员"
-	case "blackcard":
-		return "金卡会员"
-	default:
-		return "普通会员"
-	}
 }
 
 // MemberCode issues a short-lived dynamic member code (nonce) for the caller.
@@ -538,4 +537,273 @@ func (h *WxshopHandler) failWxGroupbuy(c *gin.Context, err error) {
 	default:
 		httpx.FailError(c, err)
 	}
+}
+
+// groupbuyDetailDTO is the C-side 拼团详情, the extended shape of groupbuyDTO
+// used by the detail endpoint. It adds the C 端-visible fields (status / 描述 /
+// 参团人数 / 成团门槛 / 团购价/原价 / 截止时间) and hides every internal field
+// (StrategyID / ProductID / TenantID / StoreID / Joined counter / timestamps
+// beyond EndAt). The participant count comes from ListParticipants (authoritative).
+type groupbuyDetailDTO struct {
+	ID            int64     `json:"id"`
+	Title         string    `json:"title"`
+	Desc          string    `json:"desc"` // 描述(C 端文案; 本期=Title, TODO 补独立desc)
+	PriceCents    int64     `json:"price_cents"`
+	OriginalCents int64     `json:"original_cents"`
+	Required      int       `json:"required"` // 成团门槛
+	Joined        int       `json:"joined"`   // 权威参团人数(ListParticipants 计数)
+	Status        string    `json:"status"`   // active|success|failed|cancelled
+	Expire        time.Time `json:"expire"`   // EndAt, C 端倒计时用
+}
+
+// GroupbuyDetail returns the C-side 拼团详情 (CONTRACT §16.3(8)). It loads the
+// squad via groupbuy.Get (cross-tenant → 40404, indistinguishable from
+// absence) and the authoritative participant count via ListParticipants. The
+// response hides every internal field; a caller without a verified member
+// identity still GETs the detail (参团前浏览), so memberFromClaims is NOT
+// required here — only the verified tenant from ctx (the groupbuy service
+// EnforceTenant's the call). status maps the squad's terminal state.
+// GET /v1/wxshop/groupbuys/:id
+func (h *WxshopHandler) GroupbuyDetail(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	g, err := h.groupbuy.Get(c.Request.Context(), id)
+	if err != nil {
+		h.failWxGroupbuy(c, err)
+		return
+	}
+	joined := g.Joined
+	if parts, perr := h.groupbuy.ListParticipants(c.Request.Context(), g.ID); perr == nil {
+		joined = len(parts)
+	}
+	httpx.OK(c, groupbuyDetailDTO{
+		ID:            g.ID,
+		Title:         g.Title,
+		Desc:          g.Title, // 本期 desc = title (TODO 独立 desc 字段)
+		PriceCents:    g.Params.PriceCents,
+		OriginalCents: g.Params.PriceCents, // 无原价字段,降级=团购价 (CONTRACT §16.4 TODO)
+		Required:      g.RequiredCount,
+		Joined:        joined,
+		Status:        g.Status,
+		Expire:        g.EndAt,
+	})
+}
+
+// couponDetailDTO extends couponDTO with the C-side 券详情 fields: the usage
+// rule text (threshold / scope / value) and the validity window. The member's
+// holding status + expire are merged in when the caller holds the coupon;
+// otherwise status defaults to "available" (the template is claimable).
+type couponDetailDTO struct {
+	couponDTO
+	Detail    couponDetail `json:"detail"`
+	Available bool         `json:"available"` // true = caller may still claim/use
+	Expire    string       `json:"expire"`    // ISO date or "" when none
+}
+
+// couponDetail is the C-side 券详情: the human-readable usage rule + validity.
+type couponDetail struct {
+	ThresholdText string `json:"threshold_text,omitempty"` // 满¥N可用 / 无门槛
+	ScopeText     string `json:"scope_text,omitempty"`     // 全场通用 / 指定商品
+	ValueText     string `json:"value_text,omitempty"`     // ¥N / N折 / 赠品
+	ValidFrom     string `json:"valid_from,omitempty"`     // ISO date
+	ValidTo       string `json:"valid_to,omitempty"`       // ISO date
+}
+
+// CouponDetail returns the C-side 券详情 (CONTRACT §16.3(9)). The template is
+// loaded via marketing.GetCoupon (cross-tenant → 40403, indistinguishable from
+// absence). The caller's member row is resolved via memberFromClaims (idempotent
+// Join) so the holding status + expire can be merged: if the member holds this
+// coupon (ListMemberCoupons matches CouponID) the response carries its real
+// status + expire; otherwise status="available" and available=true (the
+// template is claimable). Internal fields (quota / issued / strategy_id) are
+// hidden.
+// GET /v1/wxshop/coupons/:id
+func (h *WxshopHandler) CouponDetail(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	tpl, err := h.marketing.GetCoupon(c.Request.Context(), id)
+	if err != nil {
+		h.failWxMarketing(c, err)
+		return
+	}
+	// The caller's member identity (idempotent Join) — merged in best-effort:
+	// a caller with no verified identity still GETs the template (available=true).
+	var memberID int64
+	if m := h.memberFromClaims(c, ""); m != nil {
+		memberID = m.ID
+	}
+	now := h.now()
+	detail := couponDetail{
+		ValueText: templateValueText(tpl),
+		ValidFrom: tpl.ValidFrom.Local().Format("2006-01-02"),
+		ValidTo:   tpl.ValidTo.Local().Format("2006-01-02"),
+	}
+	switch tpl.Type {
+	case marketing.TypeDiscount:
+		detail.ThresholdText = "无门槛"
+		detail.ScopeText = "全场通用"
+	case marketing.TypeGift:
+		detail.ScopeText = "指定商品"
+	default: // full_reduction | cash
+		if tpl.Params.ThresholdCents > 0 {
+			detail.ThresholdText = "满" + formatYuan(tpl.Params.ThresholdCents) + "可用"
+		} else {
+			detail.ThresholdText = "无门槛"
+		}
+		detail.ScopeText = "全场通用"
+	}
+
+	out := couponDetailDTO{
+		couponDTO: couponDTO{
+			ID:         tpl.ID,
+			Title:      tpl.Name,
+			Type:       couponType(tpl),
+			ValueText:  templateValueText(tpl),
+			ExpireText: tpl.ValidTo.Local().Format("2006-01-02") + " 到期",
+			Status:     "available",
+		},
+		Detail:    detail,
+		Available: tpl.Status == marketing.StatusActive && now.Before(tpl.ValidTo),
+		Expire:    tpl.ValidTo.Local().Format("2006-01-02"),
+	}
+
+	// Merge the member's holding status + expire when they hold this coupon.
+	if memberID > 0 {
+		if list, lerr := h.marketing.ListMemberCoupons(c.Request.Context(), memberID, ""); lerr == nil {
+			for _, mc := range list {
+				if mc.CouponID == tpl.ID {
+					out.couponDTO.Status = toCouponDTO(mc, tpl, now).Status
+					out.Available = false // they already hold it
+					if mc.ExpireAt != nil {
+						out.Expire = mc.ExpireAt.Local().Format("2006-01-02")
+					}
+					break
+				}
+			}
+		}
+	}
+	httpx.OK(c, out)
+}
+
+// couponType maps a coupon template to the C-side type set (cash|discount|gift).
+func couponType(tpl *marketing.Coupon) string {
+	switch tpl.Type {
+	case marketing.TypeDiscount:
+		return "discount"
+	case marketing.TypeGift:
+		return "gift"
+	default: // full_reduction | cash → "cash"
+		return "cash"
+	}
+}
+
+// templateValueText renders the value text for a coupon template (¥N / N折 /
+// 赠品) — the same shape toCouponDTO produces, factored so the detail endpoint
+// can render a template the caller does not yet hold.
+func templateValueText(tpl *marketing.Coupon) string {
+	switch tpl.Type {
+	case marketing.TypeDiscount:
+		return formatDiscount(tpl.Params.DiscountPermille)
+	case marketing.TypeGift:
+		return "赠品"
+	default: // full_reduction | cash
+		return formatYuan(tpl.Params.OffCents)
+	}
+}
+
+// pointsLogDTO is the C-side 积分明细 row, the snake_case shape of
+// membership.PointsLog. ref_order_id stays (a member may recognise their
+// order); the internal id / tenant_id / member_id are dropped (C 端 never
+// needs them).
+type pointsLogDTO struct {
+	Type        string `json:"type"` // earn | redeem | expire | adjust
+	Delta       int64  `json:"delta"`
+	PointsAfter int64  `json:"points_after"`
+	RefOrderID  int64  `json:"ref_order_id,omitempty"`
+	CreatedAt   string `json:"created_at"` // ISO 8601
+}
+
+// Points returns the caller's 积分明细 (CONTRACT §16.3(10)). The member is
+// resolved idempotently from the verified claims; the points log is read within
+// the ctx tenant via membership.ListPointsLog. The current points balance is
+// the member row's Points (the authoritative running balance the logs sum to).
+// limit defaults to 50; ?limit= caps it. Cross-tenant reads return an empty
+// logs slice + 0 points (the member row is tenant-scoped via Join).
+// GET /v1/wxshop/member/points
+func (h *WxshopHandler) Points(c *gin.Context) {
+	m := h.memberFromClaims(c, "")
+	if m == nil {
+		return
+	}
+	limit := 50
+	if q := c.Query("limit"); q != "" {
+		if v, err := strconv.Atoi(q); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+	logs, err := h.membership.ListPointsLog(c.Request.Context(), m.ID, limit)
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	out := make([]pointsLogDTO, 0, len(logs))
+	for _, l := range logs {
+		out = append(out, pointsLogDTO{
+			Type:        l.Type,
+			Delta:       l.Delta,
+			PointsAfter: l.PointsAfter,
+			RefOrderID:  l.RefOrderID,
+			CreatedAt:   l.CreatedAt.Local().Format(time.RFC3339),
+		})
+	}
+	httpx.OK(c, gin.H{
+		"points": m.Points,
+		"logs":   out,
+	})
+}
+
+// storeDTO is the C-side 门店 row, the snake_case shape of store.Store. Only
+// the consumer-facing fields surface; the internal tenant_id / created_at /
+// active flag are dropped (the list already filters active + tenant-scoped).
+type storeDTO struct {
+	ID      int64  `json:"id"`
+	Name    string `json:"name"`
+	Address string `json:"address"`
+	Phone   string `json:"phone"`
+	GroupQR string `json:"group_qr,omitempty"`
+}
+
+// Stores returns the C-side 门店列表 (CONTRACT §16.3(11)). The tenant is
+// resolved from the verified ctx (EnforceTenant in the store service); a
+// caller without a verified tenant gets 40302 (EnforceTenant). When the store
+// service is not wired (minimal fixture) the endpoint degrades to an empty
+// list rather than 404. Cross-tenant stores are never visible (empty list).
+// GET /v1/wxshop/stores
+func (h *WxshopHandler) Stores(c *gin.Context) {
+	if h.store == nil {
+		httpx.OK(c, []any{})
+		return
+	}
+	list, err := h.store.ListStores(c.Request.Context())
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	out := make([]storeDTO, 0, len(list))
+	for _, s := range list {
+		out = append(out, storeDTO{
+			ID:      s.ID,
+			Name:    s.Name,
+			Address: s.Address,
+			Phone:   s.Phone,
+			GroupQR: s.GroupQR,
+		})
+	}
+	httpx.OK(c, out)
 }

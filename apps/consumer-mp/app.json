@@ -4,7 +4,14 @@
     "pages/coupons/coupons",
     "pages/profile/profile",
     "pages/join/join",
-    "pages/member-code/member-code"
+    "pages/member-code/member-code",
+    "pages/orders/orders",
+    "pages/balance/balance",
+    "pages/group-buy/group-buy",
+    "pages/group-buy-detail/group-buy-detail",
+    "pages/coupon-detail/coupon-detail",
+    "pages/points/points",
+    "pages/stores/stores"
   ],
   "tabBar": {
     "color": "#8C8C8C",

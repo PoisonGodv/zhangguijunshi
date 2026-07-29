@@ -1,0 +1,9 @@
+{
+  "navigationBarTitleText": "券详情",
+  "enablePullDownRefresh": true,
+  "backgroundColor": "#FFF9F5",
+  "backgroundTextStyle": "dark",
+  "usingComponents": {
+    "empty-state": "../../components/empty-state/empty-state"
+  }
+}

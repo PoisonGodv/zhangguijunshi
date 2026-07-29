@@ -122,7 +122,33 @@ RETURNING id, tenant_id, member_id, balance_cents, gift_cents, region_cap_cents,
 const (
 	sqlBalanceLogAppend = `INSERT INTO member_balance_log (tenant_id, member_id, account_id, type, amount_cents, balance_after, ref_order_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 	sqlPointsLogAppend  = `INSERT INTO member_points_log (tenant_id, member_id, type, delta, points_after, ref_order_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	// sqlPointsLogList returns the points-flow rows for (tenantID, memberID),
+	// newest first (FE-MP-02 CONTRACT §16.3(8)). Every read carries
+	// WHERE tenant_id = $N (ARCH-01). ref_order_id is nullable (NULL → 0).
+	sqlPointsLogList = `SELECT id, tenant_id, member_id, type, delta, points_after, COALESCE(ref_order_id,0), created_at
+FROM member_points_log
+WHERE tenant_id = $1 AND member_id = $2
+ORDER BY created_at DESC, id DESC
+LIMIT $3`
 )
+
+// sqlMemberListCountPrefix is the COUNT(*) prefix for the ListMembersPage total
+// (FE-MP-02 / FE-ADMIN boss list, CONTRACT §17.11). It shares the filter
+// dimensions with sqlMemberListPrefix.
+const sqlMemberListCountPrefix = `SELECT COUNT(*) FROM members WHERE tenant_id = $1 AND deleted_at IS NULL`
+
+// scanPointsLog decodes one member_points_log row. ref_order_id is COALESCE'd
+// to 0 in the SELECT, so it scans into a plain int64 (no NULL handling here).
+func scanPointsLog(s rowScanner) (*PointsLog, error) {
+	var p PointsLog
+	if err := s.Scan(
+		&p.ID, &p.TenantID, &p.MemberID, &p.Type, &p.Delta, &p.PointsAfter,
+		&p.RefOrderID, &p.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
 
 // ===== scan helpers =====
 
@@ -326,11 +352,12 @@ func (r *PGMemberRepo) AppendBalanceLog(ctx context.Context, tenantID, memberID,
 }
 
 // ListMembers enumerates tenantID's members matching f (M3-S2 signal
-// enumeration). Filter dimensions map onto SQL: SleepBefore (members who never
-// visited count as sleeping: last_visit_at IS NULL matches), MinPoints, and
-// BirthdayOn (month+day via TO_CHAR on the birthday DATE column, migration
-// 000009). Limit<=0 defaults to 500. Cross-tenant members are never visible.
-// A pool lacking Query (or a nil pool) returns an empty slice.
+// enumeration + FE-MP-02 boss list). Filter dimensions map onto SQL:
+// SleepBefore (members who never visited count as sleeping: last_visit_at IS
+// NULL matches), MinPoints, BirthdayOn (month+day via TO_CHAR on the birthday
+// DATE column, migration 000009), Level (equality), Query (ILIKE on name OR
+// phone_hash). Limit<=0 defaults to 500. Cross-tenant members are never
+// visible. A pool lacking Query (or a nil pool) returns an empty slice.
 func (r *PGMemberRepo) ListMembers(ctx context.Context, tenantID int64, f MemberFilter) ([]*Member, error) {
 	out := make([]*Member, 0)
 	if r == nil || r.pool == nil {
@@ -364,6 +391,19 @@ func (r *PGMemberRepo) ListMembers(ctx context.Context, tenantID int64, f Member
 		args = append(args, md)
 		ph++
 	}
+	if f.Level != "" {
+		sb.WriteString(fmt.Sprintf(` AND level = $%d`, ph))
+		args = append(args, f.Level)
+		ph++
+	}
+	if f.Query != "" {
+		// Loose substring match on name OR phone_hash (FE-MP-02 boss ?q=).
+		// ILIKE is case-insensitive substring; phone_hash is opaque so a
+		// human query rarely matches it, but name match is the practical path.
+		sb.WriteString(fmt.Sprintf(` AND (name ILIKE $%d OR phone_hash ILIKE $%d)`, ph, ph))
+		args = append(args, "%"+f.Query+"%")
+		ph++
+	}
 	sb.WriteString(` ORDER BY id`)
 	limit := f.Limit
 	if limit <= 0 {
@@ -386,6 +426,134 @@ func (r *PGMemberRepo) ListMembers(ctx context.Context, tenantID int64, f Member
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("membership: pg member list rows: %w", err)
+	}
+	return out, nil
+}
+
+// ListMembersPage returns one page of tenantID's members matching f plus the
+// total matching count (FE-MP-02 / FE-ADMIN boss list, CONTRACT §17.11). It
+// runs two queries: a COUNT (sans Offset/Limit) for the total, then the paged
+// SELECT with OFFSET/LIMIT. Filter dimensions map onto SQL identically to
+// ListMembers (SleepBefore / MinPoints / BirthdayOn / Level / Query). A nil
+// pool / a pool lacking Query returns an empty page with total 0.
+func (r *PGMemberRepo) ListMembersPage(ctx context.Context, tenantID int64, f MemberFilter) (ListMembersResult, error) {
+	empty := ListMembersResult{Items: []*Member{}, Total: 0}
+	if r == nil || r.pool == nil {
+		return empty, nil
+	}
+	q, ok := r.pool.(queryer)
+	if !ok {
+		return empty, nil
+	}
+
+	// Build the shared filter suffix once (sans ORDER BY / LIMIT / OFFSET).
+	var (
+		fsb  strings.Builder
+		farg []any
+	)
+	fsb.WriteString(sqlMemberListPrefix)
+	farg = append(farg, tenantID)
+	ph := 2 // $1 is tenant_id
+	if f.SleepBefore != nil {
+		fsb.WriteString(fmt.Sprintf(` AND (last_visit_at IS NULL OR last_visit_at < $%d)`, ph))
+		farg = append(farg, *f.SleepBefore)
+		ph++
+	}
+	if f.MinPoints > 0 {
+		fsb.WriteString(fmt.Sprintf(` AND points >= $%d`, ph))
+		farg = append(farg, f.MinPoints)
+		ph++
+	}
+	if f.BirthdayOn != nil {
+		md := fmt.Sprintf("%02d-%02d", int(f.BirthdayOn.Month()), f.BirthdayOn.Day())
+		fsb.WriteString(fmt.Sprintf(` AND birthday IS NOT NULL AND TO_CHAR(birthday, 'MM-DD') = $%d`, ph))
+		farg = append(farg, md)
+		ph++
+	}
+	if f.Level != "" {
+		fsb.WriteString(fmt.Sprintf(` AND level = $%d`, ph))
+		farg = append(farg, f.Level)
+		ph++
+	}
+	if f.Query != "" {
+		fsb.WriteString(fmt.Sprintf(` AND (name ILIKE $%d OR phone_hash ILIKE $%d)`, ph, ph))
+		farg = append(farg, "%"+f.Query+"%")
+		ph++
+	}
+	filterSQL := fsb.String()
+
+	// 1) COUNT — total matching sans Offset/Limit. Replace the SELECT list with
+	// COUNT(*) and drop the ORDER BY.
+	var total int64
+	countSQL := strings.Replace(filterSQL, `SELECT id, tenant_id, store_id, phone_hash, wx_openid, name, level, points, total_spent_cents, last_visit_at, birthday, status, created_at, updated_at FROM members`, `SELECT COUNT(*) FROM members`, 1)
+	if err := r.pool.QueryRow(ctx, countSQL, farg...).Scan(&total); err != nil {
+		return empty, fmt.Errorf("membership: pg member list count: %w", err)
+	}
+	if total == 0 {
+		return empty, nil
+	}
+
+	// 2) PAGED SELECT — append ORDER BY + OFFSET/LIMIT.
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultListMembersPageLimit
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	pageSQL := filterSQL + fmt.Sprintf(` ORDER BY id LIMIT $%d OFFSET $%d`, ph, ph+1)
+	pageArgs := append(append([]any{}, farg...), limit, offset)
+
+	rows, err := q.Query(ctx, pageSQL, pageArgs...)
+	if err != nil {
+		return empty, fmt.Errorf("membership: pg member list page: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*Member, 0, limit)
+	for rows.Next() {
+		m, err := scanMember(rows)
+		if err != nil {
+			return empty, fmt.Errorf("membership: pg member list page scan: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return empty, fmt.Errorf("membership: pg member list page rows: %w", err)
+	}
+	return ListMembersResult{Items: out, Total: total}, nil
+}
+
+// ListPointsLog returns the points-flow rows for (tenantID, memberID), newest
+// first (FE-MP-02 CONTRACT §16.3(8)). limit<=0 defaults to 50. Cross-tenant
+// rows are never visible (filtered by tenant_id). A nil pool / a pool lacking
+// Query returns an empty slice.
+func (r *PGMemberRepo) ListPointsLog(ctx context.Context, tenantID, memberID int64, limit int) ([]PointsLog, error) {
+	out := make([]PointsLog, 0)
+	if r == nil || r.pool == nil {
+		return out, nil
+	}
+	q, ok := r.pool.(queryer)
+	if !ok {
+		return out, nil
+	}
+	if limit <= 0 {
+		limit = defaultPointsLogLimit
+	}
+	rows, err := q.Query(ctx, sqlPointsLogList, tenantID, memberID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("membership: pg points log list: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		p, err := scanPointsLog(rows)
+		if err != nil {
+			return nil, fmt.Errorf("membership: pg points log list scan: %w", err)
+		}
+		out = append(out, *p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("membership: pg points log list rows: %w", err)
 	}
 	return out, nil
 }

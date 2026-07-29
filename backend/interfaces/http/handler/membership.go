@@ -71,7 +71,10 @@ func (h *MembershipHandler) GetMember(c *gin.Context) {
 		httpx.FailError(c, err)
 		return
 	}
-	httpx.OK(c, m)
+	// balance_cents reflects the real stored-value balance (best-effort: a
+	// member with no account reads 0). memberDTO hides phone hash / openid.
+	acc, _ := h.svc.GetAccount(c.Request.Context(), id)
+	httpx.OK(c, toMemberDTO(m, acc))
 }
 
 // IssueCode issues a short-lived dynamic member code for a member.
@@ -212,4 +215,89 @@ func (h *MembershipHandler) SetRegionCap(c *gin.Context) {
 		return
 	}
 	httpx.OK(c, gin.H{"ok": true})
+}
+
+// memberDTO is the boss/admin member shape (FE-ADMIN, CONTRACT §17.11). It
+// exposes only the admin-visible fields — id / level / points / balance /
+// total spent / created_at / block status — and deliberately hides the phone
+// hash, wx_openid (sensitive PII / idempotency keys). balance_cents is the real
+// stored-value balance (0 when no account). total_spent_cents is the running
+// 90-day spent counter the member row carries. block=true when the member is
+// frozen (status='blocked').
+type memberDTO struct {
+	ID              int64  `json:"id"`
+	Level           string `json:"level"`
+	LevelName       string `json:"level_name"`
+	Name            string `json:"name,omitempty"`
+	Points          int64  `json:"points"`
+	BalanceCents    int64  `json:"balance_cents"`
+	TotalSpentCents int64  `json:"total_spent_cents"`
+	CreatedAt       string `json:"created_at"`
+	Block           bool   `json:"block"`
+}
+
+// memberLevelName mirrors the wxshop handler's level→display-name map.
+func memberLevelName(level string) string {
+	switch level {
+	case "vip":
+		return "银卡会员"
+	case "blackcard":
+		return "金卡会员"
+	default:
+		return "普通会员"
+	}
+}
+
+// toMemberDTO renders a member + its account into the boss/admin DTO. acc may
+// be nil (no stored-value account yet → balance 0).
+func toMemberDTO(m *membership.Member, acc *membership.BalanceAccount) memberDTO {
+	d := memberDTO{
+		ID:              m.ID,
+		Level:           m.Level,
+		LevelName:       memberLevelName(m.Level),
+		Name:            m.Name,
+		Points:          m.Points,
+		TotalSpentCents: m.TotalSpentCents,
+		CreatedAt:       m.CreatedAt.Local().Format("2006-01-02 15:04:05"),
+		Block:           m.Status == "blocked",
+	}
+	if acc != nil {
+		d.BalanceCents = acc.BalanceCents
+	}
+	return d
+}
+
+// ListMembers lists the tenant's members with pagination + filters
+// (FE-ADMIN, CONTRACT §17.11). query ?page=&size=&level=&q=.
+// GET /v1/boss/membership/members
+func (h *MembershipHandler) ListMembers(c *gin.Context) {
+	page := int(queryInt64(c, "page"))
+	if page < 1 {
+		page = 1
+	}
+	size := int(queryInt64(c, "size"))
+	if size <= 0 {
+		size = 20
+	}
+	if size > 200 {
+		size = 200
+	}
+	f := membership.MemberFilter{
+		Level:  c.Query("level"),
+		Query:  c.Query("q"),
+		Limit:  size,
+		Offset: (page - 1) * size,
+	}
+	res, err := h.svc.ListMembersPage(c.Request.Context(), f)
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	items := make([]memberDTO, 0, len(res.Items))
+	for _, m := range res.Items {
+		// Best-effort balance fetch; a member with no account reads 0.
+		acc, _ := h.svc.GetAccount(c.Request.Context(), m.ID)
+		items = append(items, toMemberDTO(m, acc))
+	}
+	httpx.OK(c, gin.H{"items": items, "total": res.Total})
 }

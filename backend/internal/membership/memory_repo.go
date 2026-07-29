@@ -19,6 +19,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,14 @@ import (
 
 // defaultListMembersLimit is used when MemberFilter.Limit <= 0.
 const defaultListMembersLimit = 500
+
+// defaultListMembersPageLimit is the boss membership list default page size
+// (FE-MP-02 / FE-ADMIN, CONTRACT §17.11).
+const defaultListMembersPageLimit = 20
+
+// defaultPointsLogLimit is the C 端 积分明细 default limit (FE-MP-02 CONTRACT
+// §16.3(8)).
+const defaultPointsLogLimit = 50
 
 // pointsFlow is one member_points_log row (audit, no soft delete).
 type pointsFlow struct {
@@ -234,11 +243,13 @@ func (r *MemoryMemberRepo) AppendBalanceLog(_ context.Context, tenantID, memberI
 	return nil
 }
 
-// ListMembers implements MemberRepo (M3-S2). It scans the member table under a
-// read lock and applies the filter dimensions in turn: SleepBefore (members who
-// never visited count as sleeping), MinPoints, BirthdayOn (month+day match), and
-// Limit (default 500). Only members of tenantID are ever visible. Results are
-// defensive copies ordered by member id (deterministic for tests).
+// ListMembers implements MemberRepo (M3-S2 + FE-MP-02 boss list). It scans the
+// member table under a read lock and applies the filter dimensions in turn:
+// SleepBefore (members who never visited count as sleeping), MinPoints,
+// BirthdayOn (month+day match), Level (equality), Query (substring on name OR
+// phone_hash), then Offset + Limit (default 500). Only members of tenantID are
+// ever visible. Results are defensive copies ordered by member id
+// (deterministic for tests).
 func (r *MemoryMemberRepo) ListMembers(_ context.Context, tenantID int64, f MemberFilter) ([]*Member, error) {
 	limit := f.Limit
 	if limit <= 0 {
@@ -281,7 +292,167 @@ func (r *MemoryMemberRepo) ListMembers(_ context.Context, tenantID int64, f Memb
 				continue
 			}
 		}
+		if f.Level != "" && m.Level != f.Level {
+			continue
+		}
+		if f.Query != "" {
+			// Loose substring match on name OR phone_hash. phone_hash is the
+			// only stored search key (raw phone never persisted); the boss
+			// query ?q= is best-effort (hash is opaque, so a free-text match
+			// on the hash is near-useless for humans but the code path is
+			// exercised; name match is the practical path).
+			if !strings.Contains(m.Name, f.Query) && !strings.Contains(m.PhoneHash, f.Query) {
+				continue
+			}
+		}
 		out = append(out, cloneMember(m))
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// countMembersLocked returns the count of tenantID's members matching f (the
+// SAME filter dimensions ListMembers applies), without applying Offset/Limit.
+// Must be called with r.mu (R) held. Used by ListMembersPage to report the
+// total for the pager.
+func (r *MemoryMemberRepo) countMembersLocked(tenantID int64, f MemberFilter) int64 {
+	var n int64
+	for _, m := range r.membersByID {
+		if m.TenantID != tenantID {
+			continue
+		}
+		if f.SleepBefore != nil {
+			if m.LastVisitAt != nil && !m.LastVisitAt.Before(*f.SleepBefore) {
+				continue
+			}
+		}
+		if f.MinPoints > 0 && m.Points < f.MinPoints {
+			continue
+		}
+		if f.BirthdayOn != nil {
+			if m.Birthday == nil {
+				continue
+			}
+			if m.Birthday.Month() != f.BirthdayOn.Month() || m.Birthday.Day() != f.BirthdayOn.Day() {
+				continue
+			}
+		}
+		if f.Level != "" && m.Level != f.Level {
+			continue
+		}
+		if f.Query != "" {
+			if !strings.Contains(m.Name, f.Query) && !strings.Contains(m.PhoneHash, f.Query) {
+				continue
+			}
+		}
+		n++
+	}
+	return n
+}
+
+// ListMembersPage returns one page of tenantID's members matching f plus the
+// total matching count (FE-MP-02 / FE-ADMIN boss membership list, CONTRACT
+// §17.11). limit<=0 defaults to 20 (boss default page size); offset<=0 starts
+// at 0. The page applies Offset AFTER the sort (so the pager is stable), and
+// the Total reflects the SAME filter sans Offset/Limit. Cross-tenant members
+// are never visible.
+func (r *MemoryMemberRepo) ListMembersPage(_ context.Context, tenantID int64, f MemberFilter) (ListMembersResult, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultListMembersPageLimit
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	total := r.countMembersLocked(tenantID, f)
+
+	ids := make([]int64, 0)
+	for id, m := range r.membersByID {
+		if m.TenantID != tenantID {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	out := make([]*Member, 0, limit)
+	skipped := 0
+	for _, id := range ids {
+		m := r.membersByID[id]
+		if m.TenantID != tenantID {
+			continue
+		}
+		if f.SleepBefore != nil {
+			if m.LastVisitAt != nil && !m.LastVisitAt.Before(*f.SleepBefore) {
+				continue
+			}
+		}
+		if f.MinPoints > 0 && m.Points < f.MinPoints {
+			continue
+		}
+		if f.BirthdayOn != nil {
+			if m.Birthday == nil {
+				continue
+			}
+			if m.Birthday.Month() != f.BirthdayOn.Month() || m.Birthday.Day() != f.BirthdayOn.Day() {
+				continue
+			}
+		}
+		if f.Level != "" && m.Level != f.Level {
+			continue
+		}
+		if f.Query != "" {
+			if !strings.Contains(m.Name, f.Query) && !strings.Contains(m.PhoneHash, f.Query) {
+				continue
+			}
+		}
+		if skipped < offset {
+			skipped++
+			continue
+		}
+		out = append(out, cloneMember(m))
+		if len(out) >= limit {
+			break
+		}
+	}
+	return ListMembersResult{Items: out, Total: total}, nil
+}
+
+// ListPointsLog implements MemberRepo (FE-MP-02 CONTRACT §16.3(8)). It returns
+// the points-flow rows for (tenantID, memberID), newest first. limit<=0
+// defaults to 50. Cross-tenant rows are never returned.
+func (r *MemoryMemberRepo) ListPointsLog(_ context.Context, tenantID, memberID int64, limit int) ([]PointsLog, error) {
+	if limit <= 0 {
+		limit = defaultPointsLogLimit
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Collect the matching rows newest-first. pointsLog is append-only and
+	// ordered by createdAt ascending, so walk it backwards.
+	out := make([]PointsLog, 0, limit)
+	for i := len(r.pointsLog) - 1; i >= 0; i-- {
+		f := r.pointsLog[i]
+		if f.tenantID != tenantID || f.memberID != memberID {
+			continue
+		}
+		out = append(out, PointsLog{
+			ID:          f.id,
+			TenantID:    f.tenantID,
+			MemberID:    f.memberID,
+			Type:        f.typ,
+			Delta:       f.delta,
+			PointsAfter: f.pointsAfter,
+			RefOrderID:  f.refOrderID,
+			CreatedAt:   f.createdAt,
+		})
 		if len(out) >= limit {
 			break
 		}

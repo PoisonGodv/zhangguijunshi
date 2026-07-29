@@ -11,15 +11,15 @@
 // 事件:
 //   onTapJoin        → /pages/join/join (领券入会转化页)
 //   onTapMemberCode  → /pages/member-code/member-code
-//   onTapBenefit     → 骨架期 toast「详情即将上线」
-//   onTapGroupbuy    → 未登录引导入会; 已登录真实参团 (joinGroupBuy), 成功刷新列表
-//   onTapStoreGroup  → 骨架期 toast「进群功能即将上线」
+//   onTapBenefit     → 骨架期 toast「详情即将上线」(无对应接口, 暂留)
+//   onTapGroupbuy    → 跳拼团列表/详情 (参团在详情页完成; 仅 1 个直跳详情)
+//   onTapStoreGroup  → /pages/stores/stores (进群二维码在门店页展示)
 // 埋点: home_view (onShow 主动 event; onPageShow 由 app.ts 全局注入, 不重复)
 
 import { userStore, setUserMember } from '../../stores/user'
 import { tenantStore } from '../../stores/tenant'
 import { listCoupons } from '../../services/coupon'
-import { listGroupBuys, joinGroupBuy } from '../../services/group-buy'
+import { listGroupBuys } from '../../services/group-buy'
 import { getMyProfile } from '../../services/member'
 import { tracker } from '../../utils/tracker'
 import { yuan } from '../../utils/format'
@@ -128,40 +128,24 @@ Page({
     wx.showToast({ title: '详情即将上线', icon: 'none' })
   },
 
-  async onTapGroupbuy(e: { currentTarget: { dataset: { id?: number; index?: number } } }) {
+  onTapGroupbuy(e: { currentTarget: { dataset: { id?: number; index?: number } } }) {
     // 从 dataset 取拼团 id (wxml 需带 data-id="{{item.id}}"); 未带则回退按 index 取
     let id = e.currentTarget.dataset.id
     if (!id && typeof e.currentTarget.dataset.index === 'number') {
       const item = this.data.groupbuys[e.currentTarget.dataset.index]
       id = item && item.id
     }
-    if (!id) {
-      wx.showToast({ title: '拼团不存在', icon: 'none' })
+    // 拼团入口: 优先列表页; 仅 1 个拼团时直跳详情
+    if (this.data.groupbuys.length === 1 && id) {
+      wx.navigateTo({ url: `/pages/group-buy-detail/group-buy-detail?id=${id}` })
       return
     }
-    // 未登录 → 引导入会 (参团需 JWT)
-    if (!userStore.get().accessToken) {
-      wx.showToast({ title: '请先领券入会再参团', icon: 'none' })
-      wx.navigateTo({ url: '/pages/join/join' })
-      return
-    }
-    try {
-      wx.showLoading({ title: '参团中...', mask: true })
-      await joinGroupBuy(id)
-      wx.hideLoading()
-      wx.showToast({ title: '参团成功', icon: 'success' })
-      tracker.event('groupbuy_join_success')
-      this.load() // 刷新进度
-    } catch (err) {
-      wx.hideLoading()
-      // ERR_CODE_MSG 已映射 60013 满员/60015 已参团; 60014 拼团已结束用后端 message
-      const msg = err instanceof ApiError ? err.message : '参团失败,请重试'
-      wx.showToast({ title: msg, icon: 'none' })
-    }
+    wx.navigateTo({ url: '/pages/group-buy/group-buy' })
   },
 
   onTapStoreGroup() {
-    wx.showToast({ title: '进群功能即将上线', icon: 'none' })
+    // 进群入口: 优先跳门店列表页 (本期 group_qr 在门店页展示)
+    wx.navigateTo({ url: '/pages/stores/stores' })
   },
 
   // userStore → 页面快照 (范式要求的 _snap)

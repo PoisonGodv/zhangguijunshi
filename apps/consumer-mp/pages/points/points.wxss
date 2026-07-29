@@ -1,0 +1,65 @@
+/* pages/points/points.wxss — 积分明细页特有布局 */
+.points-label {
+  font-size: 26rpx;
+  opacity: 0.92;
+  margin-bottom: 8rpx;
+}
+.points-num {
+  font-size: 80rpx;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.points-day {
+  margin-bottom: 24rpx;
+}
+.points-day-title {
+  font-size: 26rpx;
+  color: #8C8C8C;
+  margin: 8rpx 0 12rpx 4rpx;
+}
+.points-day-body {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  overflow: hidden;
+  box-shadow: 0 2rpx 12rpx rgba(255, 107, 53, 0.08);
+}
+.points-log {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24rpx;
+  border-bottom: 2rpx dashed #F0E6DE;
+}
+.points-log:last-child {
+  border-bottom: none;
+}
+.points-log-left {
+  flex: 1;
+}
+.points-log-type {
+  font-size: 30rpx;
+  color: #1F1F1F;
+  margin-bottom: 6rpx;
+}
+.points-log-time {
+  font-size: 24rpx;
+  color: #BFBFBF;
+}
+.points-log-right {
+  text-align: right;
+}
+.points-delta-pos {
+  font-size: 34rpx;
+  font-weight: 700;
+  color: #2ECC71;
+}
+.points-delta-neg {
+  font-size: 34rpx;
+  font-weight: 700;
+  color: #FF4D4F;
+}
+.points-log-after {
+  font-size: 22rpx;
+  color: #BFBFBF;
+  margin-top: 4rpx;
+}

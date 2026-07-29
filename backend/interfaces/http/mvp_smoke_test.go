@@ -26,6 +26,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/margin"
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
+	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/jwt"
 )
@@ -40,8 +41,8 @@ func newMVPRouter(t *testing.T) (*gin.Engine, *jwt.Manager) {
 	require.NoError(t, err)
 	mgr, err := jwt.New(jwt.Config{PrivateKey: priv, Issuer: "zgjs-mvp", AccessTTL: time.Minute})
 	require.NoError(t, err)
-	store := jwt.NewMemorySessionStore()
-	t.Cleanup(func() { _ = store.Close() })
+	sessStore := jwt.NewMemorySessionStore()
+	t.Cleanup(func() { _ = sessStore.Close() })
 
 	catSvc := catalog.NewService(catalog.NewMemoryProductRepo())
 	invSvc := inventory.New(inventory.NewMemoryBatchRepo(), testProductLookuper{catSvc})
@@ -54,21 +55,24 @@ func newMVPRouter(t *testing.T) (*gin.Engine, *jwt.Manager) {
 		marketing.WithMarginGuard(wxMarginGuard{guard: margin.Guard{MarginFloorPct: 10}, catalogSvc: catSvc}),
 	)
 	gbSvc := groupbuy.New(groupbuy.NewMemoryGroupbuyRepo(), groupbuy.WithMemberLookuper(wxMembershipLookuper{memSvc}))
+	storeSvc := store.New(store.NewMemoryStoreRepo())
 	wxGroupbuySvc = gbSvc // let the wxshop fixture helpers seed squads if needed
 	wxBillingSvc = bilSvc
 	wxCatalogSvc = catSvc
 	wxMembershipSvc = memSvc
+	wxStoreSvc = storeSvc
 
 	return New(Deps{
 		Cfg:        &config.Config{App: config.AppConfig{Env: "test"}},
 		JWT:        mgr,
-		Store:      store,
+		Store:      sessStore,
 		Catalog:    catSvc,
 		Inventory:  invSvc,
 		Billing:    bilSvc,
 		Membership: memSvc,
 		Marketing:  mktSvc,
 		Groupbuy:   gbSvc,
+		StoreSvc:   storeSvc,
 		DevMock:    true,
 	}), mgr
 }

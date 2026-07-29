@@ -1,0 +1,31 @@
+<!-- pages/group-buy/group-buy.wxml — 拼团列表 -->
+<view class="container">
+  <block wx:if="{{loading}}">
+    <view class="loading">加载中…</view>
+  </block>
+
+  <block wx:elif="{{list.length}}">
+    <view
+      wx:for="{{list}}"
+      wx:key="id"
+      class="gb-card"
+      data-id="{{item.id}}"
+      bindtap="onTapItem"
+    >
+      <view class="gb-title">{{item.title}}</view>
+      <view class="gb-price-row">
+        <text class="price-now">¥{{item.priceYuan}}</text>
+        <text class="price-old">¥{{item.originalYuan}}</text>
+      </view>
+      <view class="gb-progress">
+        <view class="gb-progress-bar">
+          <view class="gb-progress-inner" style="width:{{item.progress}}%"/>
+        </view>
+        <view class="gb-progress-text">已拼 {{item.joined}}/{{item.required}} 人</view>
+      </view>
+      <view class="gb-cta">去参团 ›</view>
+    </view>
+  </block>
+
+  <empty-state wx:else icon="🛒" text="暂无进行中的拼团"/>
+</view>

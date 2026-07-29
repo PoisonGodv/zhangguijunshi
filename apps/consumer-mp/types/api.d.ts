@@ -45,5 +45,81 @@ export interface HomeBenefit { id: number; tag: string; title: string; desc: str
 /** 拼团简报 (首页入口) */
 export interface GroupBuyBrief { id: number; title: string; price_cents: number; original_cents: number; required: number; joined: number }
 
+/** 拼团详情 (GET /v1/wxshop/groupbuys/:id; CONTRACT §16.3(8)) */
+export interface GroupBuyDetail {
+  id: number
+  title: string
+  desc: string               // C 端文案 (本期后端 = title, TODO 独立 desc)
+  price_cents: number        // 团购价(分)
+  original_cents: number    // 原价(分; 后端无原价字段,降级=团购价)
+  required: number           // 成团门槛
+  joined: number             // 权威参团人数(ListParticipants 计数)
+  status: string             // active|success|failed|cancelled
+  expire: string             // 截止时间 ISO (EndAt)
+}
+
 /** 门店 */
-export interface Store { id: number; name: string; address: string; distance_text?: string; group_qr?: string }
+export interface Store {
+  id: number
+  name: string
+  address: string
+  distance_text?: string
+  phone?: string            // 门店电话 (B1 storeDTO 补)
+  group_qr?: string         // 进群二维码 (文本/图片URL)
+  active?: boolean          // 门店启用状态 (B1 storeDTO 对齐; 列表已过滤 active)
+}
+
+/** 储值余额 (GET /v1/wxshop/member/balance; 本金 + 赠送) */
+export interface Balance {
+  balance_cents: number   // 本金(分)
+  gift_cents: number      // 赠送(分)
+}
+
+/** 订单明细行 (GET /v1/wxshop/orders → items[]; CONTRACT §16.3(7)) */
+export interface OrderItem {
+  name: string
+  unit: string            // 件 / 瓶 / 斤 ...
+  qty: number
+  price_cents: number
+}
+
+/** 订单行 (GET /v1/wxshop/orders; CONTRACT §16.3(7)) */
+export interface Order {
+  id: number
+  order_no: string
+  status: 'pending' | 'paid' | 'refunded' | 'voided'
+  total_cents: number
+  paid_cents: number
+  created_at: string     // ISO 时间
+  items: OrderItem[]
+}
+
+/** 积分流水 (GET /v1/wxshop/member/points → logs[]; CONTRACT §16.3(10)) */
+export interface PointLog {
+  type: string             // earn|redeem|expire|adjust
+  delta: number            // 正负
+  points_after: number
+  ref_order_id?: number     // 关联订单 (后端 omitempty; 无关联则不出)
+  created_at: string       // ISO 8601
+}
+
+/** 积分明细结果 (GET /v1/wxshop/member/points; CONTRACT §16.3(10))
+ *  points: 会员当前积分(权威运行余额); logs: 流水(倒序, limit 默认 50) */
+export interface PointsResult {
+  points: number
+  logs: PointLog[]
+}
+
+/** 券详情 (GET /v1/wxshop/coupons/:id; CONTRACT §16.3(9))
+ *  detail: 使用规则 + 有效期; available: 调用方是否仍可领取/使用 */
+export interface CouponDetail extends Coupon {
+  detail: {
+    threshold_text?: string  // 满¥N可用 / 无门槛
+    scope_text?: string       // 全场通用 / 指定商品
+    value_text?: string       // ¥N / N折 / 赠品
+    valid_from?: string       // ISO date
+    valid_to?: string         // ISO date
+  }
+  available: boolean           // true = 调用方可领/可用
+  expire: string               // ISO date 或 "" 无
+}

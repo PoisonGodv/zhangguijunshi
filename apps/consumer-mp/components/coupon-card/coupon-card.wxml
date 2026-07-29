@@ -1,4 +1,4 @@
-<view class="coupon-item" bindtap="onTap">
+<view class="coupon-item" catchtap="onTap">
   <view class="coupon-left">
     <view class="coupon-value">{{coupon.value_text}}</view>
     <view class="coupon-status coupon-status-{{coupon.status}}">{{statusText}}</view>

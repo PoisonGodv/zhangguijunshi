@@ -61,9 +61,15 @@ Page({
     } else if (key === 'coupons') {
       wx.switchTab({ url: '/pages/coupons/coupons' })
     } else if (key === 'orders') {
-      // 订单: 后端本期返回空 (CONTRACT §16.8 TODO), 直接提示空态
-      wx.showToast({ title: '订单查询即将上线', icon: 'none' })
+      wx.navigateTo({ url: '/pages/orders/orders' })
+    } else if (key === 'balance') {
+      wx.navigateTo({ url: '/pages/balance/balance' })
+    } else if (key === 'points') {
+      wx.navigateTo({ url: '/pages/points/points' })
+    } else if (key === 'stores') {
+      wx.navigateTo({ url: '/pages/stores/stores' })
     } else {
+      // service/settings: C2/后续补
       wx.showToast({ title: '即将上线', icon: 'none' })
     }
   },
