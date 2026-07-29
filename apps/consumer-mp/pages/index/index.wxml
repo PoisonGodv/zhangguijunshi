@@ -1,0 +1,77 @@
+<!-- pages/index/index.wxml — C 端首页 -->
+<view class="container">
+
+  <!-- 顶部 hero 领券卡: 登录态两态 -->
+  <view class="hero">
+    <block wx:if="{{!isLoggedIn}}">
+      <view class="hero-title">一键领券入会</view>
+      <view class="hero-sub">立领新人券 · 积分储值 · 会员价专享</view>
+      <button class="hero-cta" bindtap="onTapJoin">立即领券入会</button>
+    </block>
+    <block wx:else>
+      <view class="hero-title">欢迎回来,{{levelName}}</view>
+      <view class="hero-sub">{{storeName || store.name}} · 今日好物已备好</view>
+      <button class="hero-cta" bindtap="onTapMemberCode">出示会员码</button>
+    </block>
+  </view>
+
+  <block wx:if="{{loading}}">
+    <view class="loading">正在为你准备今日福利…</view>
+  </block>
+
+  <block wx:else>
+    <!-- 今日福利区 (listCoupons('unused') 前 3 条) -->
+    <block wx:if="{{benefits.length}}">
+      <view class="section-title">今日福利</view>
+      <view
+        wx:for="{{benefits}}"
+        wx:key="id"
+        class="benefit-card"
+        data-id="{{item.id}}"
+        bindtap="onTapBenefit"
+      >
+        <view class="benefit-tag">{{item.tag}}</view>
+        <view class="benefit-title">{{item.title}}</view>
+        <view class="benefit-desc">{{item.desc}}</view>
+      </view>
+    </block>
+
+    <!-- 拼团专区 -->
+    <block wx:if="{{groupbuys.length}}">
+      <view class="section-title">拼团专区</view>
+      <view
+        wx:for="{{groupbuys}}"
+        wx:key="id"
+        class="benefit-card"
+        data-id="{{item.id}}"
+        bindtap="onTapGroupbuy"
+      >
+        <view class="benefit-title">{{item.title}}</view>
+        <view class="groupbuy-price-row">
+          <text class="price-now">¥{{item.priceYuan}}</text>
+          <text class="price-old">¥{{item.originalYuan}}</text>
+        </view>
+        <view class="benefit-desc">已拼 {{item.joined}}/{{item.required}} 人</view>
+      </view>
+    </block>
+
+    <!-- 附近门店 -->
+    <view class="section-title">附近门店</view>
+    <view class="store-card">
+      <view class="store-row">
+        <view class="store-info">
+          <view class="store-name">{{store.name}}</view>
+          <view class="store-addr">{{store.address}}</view>
+          <view class="store-addr" wx:if="{{store.distance_text}}">{{store.distance_text}}</view>
+        </view>
+        <button class="store-group-btn" bindtap="onTapStoreGroup">进群</button>
+      </view>
+    </view>
+
+    <!-- 空状态: 福利和拼团都为空时 -->
+    <view wx:if="{{!benefits.length && !groupbuys.length}}" class="empty">
+      <view class="empty-icon">🎁</view>
+      <view>今日福利准备中,稍后再来看看</view>
+    </view>
+  </block>
+</view>

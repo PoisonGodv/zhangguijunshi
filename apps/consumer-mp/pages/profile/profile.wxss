@@ -1,0 +1,59 @@
+/* pages/profile/profile.wxss — 我的页特有布局 */
+.member-header {
+  background: linear-gradient(135deg, #FF6B35, #FFB627);
+  border-radius: 16rpx;
+  padding: 32rpx 24rpx;
+  margin-bottom: 24rpx;
+  color: #FFFFFF;
+}
+.member-header-guest {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.guest-text {
+  font-size: 32rpx;
+  font-weight: 600;
+}
+.guest-login-btn {
+  width: 200rpx;
+  height: 64rpx;
+  line-height: 64rpx;
+  font-size: 28rpx;
+  background: #FFFFFF;
+  color: #FF6B35;
+}
+.grade-badge {
+  display: inline-block;
+  background: rgba(255, 255, 255, 0.25);
+  color: #FFFFFF;
+  font-size: 24rpx;
+  padding: 4rpx 20rpx;
+  border-radius: 24rpx;
+  margin-bottom: 20rpx;
+}
+.stat-row {
+  display: flex;
+  justify-content: space-around;
+}
+.stat-item {
+  text-align: center;
+}
+.stat-num {
+  font-size: 36rpx;
+  font-weight: bold;
+}
+.stat-phone {
+  font-size: 28rpx;
+}
+.stat-label {
+  font-size: 24rpx;
+  opacity: 0.85;
+  margin-top: 4rpx;
+}
+/* 全局已定义 .entry-grid / .entry-item / .entry-icon / .entry-label */
+.entry-grid {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  padding: 24rpx 0;
+}

@@ -1,0 +1,45 @@
+<!-- pages/profile/profile.wxml — 我的 -->
+<view class="container">
+  <!-- 未登录态 -->
+  <view wx:if="{{!isLoggedIn}}" class="member-header member-header-guest">
+    <view class="guest-text">登录领新人券</view>
+    <button class="btn-primary guest-login-btn" bindtap="onTapLogin">去登录</button>
+  </view>
+
+  <!-- 已登录态 -->
+  <view wx:else class="member-header">
+    <view class="grade-badge">{{levelName}}</view>
+    <view class="stat-row">
+      <view class="stat-item">
+        <view class="stat-num">{{points}}</view>
+        <view class="stat-label">积分</view>
+      </view>
+      <view class="stat-item">
+        <view class="stat-num">¥{{balanceYuan}}</view>
+        <view class="stat-label">储值</view>
+      </view>
+      <view class="stat-item">
+        <view class="stat-num">¥{{totalSpentYuan}}</view>
+        <view class="stat-label">累计消费</view>
+      </view>
+      <view class="stat-item" wx:if="{{phone}}">
+        <view class="stat-num stat-phone">{{phone}}</view>
+        <view class="stat-label">手机号</view>
+      </view>
+    </view>
+  </view>
+
+  <!-- 九宫格菜单 -->
+  <view class="entry-grid">
+    <view
+      wx:for="{{entries}}"
+      wx:key="key"
+      class="entry-item"
+      data-key="{{item.key}}"
+      bindtap="onEntry"
+    >
+      <view class="entry-icon">{{item.icon}}</view>
+      <view class="entry-label">{{item.label}}</view>
+    </view>
+  </view>
+</view>

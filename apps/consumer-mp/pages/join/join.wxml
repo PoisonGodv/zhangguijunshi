@@ -1,0 +1,59 @@
+<!-- pages/join/join.wxml — 领券入会转化页 -->
+<view class="container">
+
+  <!-- 成功态 -->
+  <block wx:if="{{success}}">
+    <view class="join-success">
+      <view class="join-success-icon">🎉</view>
+      <view class="join-success-title">领券成功!</view>
+      <view class="join-success-sub">新人券已放入你的券包,会员权益已开通</view>
+      <button class="btn-primary join-success-btn" bindtap="onTapMemberCode">查看会员码</button>
+      <button class="join-link-btn" bindtap="onTapCoupons">去券包看看</button>
+    </view>
+  </block>
+
+  <!-- 转化态 (默认) -->
+  <block wx:else>
+    <!-- 新人专享券大图 (文字+色块占位) -->
+    <view class="join-coupon">
+      <view class="join-coupon-value">¥10</view>
+      <view class="join-coupon-label">无门槛新人券</view>
+      <view class="join-coupon-sub">入会立领 · 全场通用</view>
+    </view>
+
+    <!-- 会员权益 -->
+    <view class="join-benefits">
+      <view class="join-benefit-item">
+        <view class="join-benefit-icon">🎯</view>
+        <view class="join-benefit-text">消费得积分 积分抵现</view>
+      </view>
+      <view class="join-benefit-item">
+        <view class="join-benefit-icon">💰</view>
+        <view class="join-benefit-text">储值有礼 多充多送</view>
+      </view>
+      <view class="join-benefit-item">
+        <view class="join-benefit-icon">🏷️</view>
+        <view class="join-benefit-text">会员专享价 天天省钱</view>
+      </view>
+    </view>
+
+    <!-- 隐私同意 -->
+    <view class="join-agree" bindtap="onToggleAgree">
+      <checkbox checked="{{agreed}}" class="join-agree-checkbox" />
+      <text class="join-agree-text">我已阅读并同意</text>
+      <text class="join-agree-link">《会员协议》</text>
+      <text class="join-agree-link">《隐私政策》</text>
+    </view>
+
+    <!-- 手机号授权按钮 -->
+    <button
+      class="btn-primary join-submit"
+      open-type="getPhoneNumber"
+      bindgetphonenumber="onGetPhone"
+      disabled="{{!agreed || submitting}}"
+      loading="{{submitting}}"
+    >
+      {{submitting ? '正在领券…' : '手机号一键登录领券'}}
+    </button>
+  </block>
+</view>

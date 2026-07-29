@@ -1,0 +1,45 @@
+{
+  "pages": [
+    "pages/index/index",
+    "pages/coupons/coupons",
+    "pages/profile/profile",
+    "pages/join/join",
+    "pages/member-code/member-code"
+  ],
+  "tabBar": {
+    "color": "#8C8C8C",
+    "selectedColor": "#FF6B35",
+    "backgroundColor": "#FFFFFF",
+    "borderStyle": "white",
+    "list": [
+      {
+        "pagePath": "pages/index/index",
+        "text": "首页",
+        "iconPath": "assets/tab-inactive.png",
+        "selectedIconPath": "assets/tab-active.png"
+      },
+      {
+        "pagePath": "pages/coupons/coupons",
+        "text": "券包",
+        "iconPath": "assets/tab-inactive.png",
+        "selectedIconPath": "assets/tab-active.png"
+      },
+      {
+        "pagePath": "pages/profile/profile",
+        "text": "我的",
+        "iconPath": "assets/tab-inactive.png",
+        "selectedIconPath": "assets/tab-active.png"
+      }
+    ]
+  },
+  "window": {
+    "navigationBarBackgroundColor": "#FF6B35",
+    "navigationBarTitleText": "掌柜军师",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#FFF9F5",
+    "backgroundTextStyle": "dark"
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json",
+  "lazyCodeLoading": "requiredComponents"
+}

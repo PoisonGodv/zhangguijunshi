@@ -1,0 +1,23 @@
+<!-- pages/member-code/member-code.wxml — 会员码出示页 -->
+<view class="container">
+  <block wx:if="{{!isLoggedIn}}">
+    <view class="empty">
+      <view class="empty-icon">🔒</view>
+      <view>请先登录</view>
+      <button class="btn-primary login-btn" bindtap="onTapLogin">去登录</button>
+    </view>
+  </block>
+
+  <block wx:else>
+    <view class="member-header">
+      <view class="grade-badge">{{levelName}}</view>
+      <view class="member-points">积分 {{points}}</view>
+    </view>
+
+    <member-qr nonce="{{nonce}}" countdown="{{countdown}}"/>
+
+    <view class="qr-tip">请到收银台出示，每 60 秒自动刷新，避免截图泄露</view>
+
+    <button class="btn-primary refresh-btn" bindtap="onTapRefresh">手动刷新</button>
+  </block>
+</view>

@@ -94,3 +94,147 @@ export interface DetailVM {
   actionType: string
   executed: boolean
 }
+
+// ============================================================
+// === 商品 / 订单 (billing 开单页) ===
+//
+// 后端字段命名警告: catalog.Product / billing.Order 结构体**未声明 json tag**,
+// Go encoding/json 默认按字段名 (PascalCase) 输出,与 interfaces/http/*_test.go 断言一致。
+// 因此下方接口使用 PascalCase (ID/Name/PriceCents/...),而非本项目其他类型的 snake_case。
+// CreateOrderReq/CreateOrderItem 是 handler 的 DTO,有显式 json tag,走 snake_case。
+// ============================================================
+
+/** 商品 (catalog.Product — 无 json tag, PascalCase 输出) */
+export interface Product {
+  ID: number
+  TenantID: number
+  StoreID: number
+  Barcode: string
+  Name: string
+  Category: string
+  Unit: string
+  CostCents: number
+  PriceCents: number
+  ImageURL: string
+  ShelfLifeDays: number
+  Tags?: string[]
+  Status: string // "active" | "archived"
+  CreatedAt: string
+  UpdatedAt: string
+}
+
+/** 商品列表响应 (handler.ListProducts 返回 gin.H{items, count}) */
+export interface ProductListResp {
+  items: Product[]
+  count: number
+}
+
+/** 开单行 (handler.createOrderItemRequest json tag = snake_case) */
+export interface CreateOrderItem {
+  product_id: number
+  qty: number
+}
+
+/** 开单请求体 (handler.createOrderRequest; CreatePendingOrder 与 CreateOrder 同构) */
+export interface CreateOrderReq {
+  store_id?: number // 缺省时后端用 ctx.StoreID
+  member_id?: number // 散客=0
+  channel?: string // 默认 "in_store"
+  payment_method?: string // 默认 "cash"
+  items: CreateOrderItem[] // 至少 1 行
+}
+
+/** 订单行 (billing.OrderItem — 无 json tag, PascalCase) */
+export interface OrderItem {
+  ProductID: number
+  NameSnapshot: string
+  Unit: string
+  Qty: number
+  PriceCents: number
+  CostCents: number
+}
+
+/** 订单 (billing.Order — 无 json tag, PascalCase) */
+export interface Order {
+  ID: number
+  TenantID: number
+  StoreID: number
+  MemberID: number
+  OrderNo: string
+  Channel: string // in_store|wxshop|wework|delivery
+  Status: string // pending|paid|refunded|voided
+  TotalCents: number
+  PaidCents: number
+  DiscountCents: number
+  PaymentMethod: string
+  OperatorID: number
+  Items: OrderItem[]
+  PaidAt?: string // ISO 时间, paid 后填
+  CreatedAt: string
+  UpdatedAt: string
+  PaymentRef?: string
+}
+
+// === me 我的页 (FE-MP-04) —— /v1/boss 下经营/订阅/门店数据 ===
+
+/**
+ * 当日流水摘要 (GET /v1/boss/billing/summary/today)
+ * 镜像后端 billing.DailySummary (internal/billing/billing.go),字段为 PascalCase
+ * (后端未加 json tag,Go encoding/json 默认序列化字段名)。
+ */
+export interface DailySummary {
+  TenantID: number
+  StoreID: number
+  Date: string // YYYY-MM-DD
+  OrderCount: number
+  GrossCents: number // Σ total (分)
+  NetCents: number   // Σ paid (分)
+  CostCents: number  // Σ 各项 qty*cost (分)
+  ProfitCents: number // Net - Cost (分)
+  TopProducts?: TopProduct[] | null
+}
+
+/** 热销商品 (billing.TopProduct) */
+export interface TopProduct {
+  ProductID: number
+  Name: string
+  Qty: number
+  GrossCents: number
+}
+
+/**
+ * 订阅记录 (subscription.Subscription, internal/subscription/subscription.go)
+ * 无 json tag → PascalCase;PeriodEndsAt 为 *time.Time,永久 free 时为 null。
+ */
+export interface Subscription {
+  ID: number
+  TenantID: number
+  Plan: string // free|pro|flagship
+  PeriodStartedAt: string
+  PeriodEndsAt?: string | null // nil=永久 (仅 free)
+  Status: string // active|expired|cancelled
+  Source: string // manual|wxpay|alipay|admin
+  PaymentRef?: string
+  CreatedAt: string
+  UpdatedAt: string
+}
+
+/**
+ * GET /v1/boss/subscription 响应 (handler/subscription.go GetSubscription):
+ *   httpx.OK(c, gin.H{"plan": plan, "subscription": sub})
+ * sub 可能为 null (无任何订阅记录,CurrentPlan 默认 free)。
+ */
+export interface SubscriptionResp {
+  plan: string
+  subscription?: Subscription | null
+}
+
+/**
+ * GET /v1/boss/whoami 响应 (interfaces/http/router.go whoami):
+ *   httpx.OK(c, gin.H{"tenant_id": tid, "source": source})
+ * 注: 后端目前只返回 tenant_id + source,**没有** store_id / role / scene。
+ */
+export interface Whoami {
+  tenant_id: number
+  source: string // consumer|merchant|admin|system / unresolved
+}

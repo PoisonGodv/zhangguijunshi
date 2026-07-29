@@ -1,0 +1,27 @@
+<!-- pages/coupons/coupons.wxml — 券包 -->
+<view class="container">
+  <view class="tabs">
+    <view
+      wx:for="{{tabs}}"
+      wx:key="status"
+      class="tab {{currentTab === item.status ? 'tab-active' : ''}}"
+      data-status="{{item.status}}"
+      bindtap="onTabTap"
+    >{{item.label}}</view>
+  </view>
+
+  <block wx:if="{{loading}}">
+    <view class="loading">加载中…</view>
+  </block>
+
+  <block wx:else-if="{{coupons.length}}">
+    <coupon-card
+      wx:for="{{coupons}}"
+      wx:key="id"
+      coupon="{{item}}"
+      bindtap="onTapCoupon"
+    />
+  </block>
+
+  <empty-state wx:else text="暂无券"/>
+</view>

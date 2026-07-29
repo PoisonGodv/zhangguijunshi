@@ -3,7 +3,20 @@
 // 职责: baseURL 注入 + 鉴权头 (attachAuth 钩子) + envelope 解包 (code===0 取 data) +
 //       errcode 中文映射 + 三种 AI 引擎 API (getToday/getStrategy/executeItem)。
 
-import type { Envelope, Advice, Strategy, ExecResult, ExecuteBody } from '../types/api'
+import type {
+  Envelope,
+  Advice,
+  Strategy,
+  ExecResult,
+  ExecuteBody,
+  DailySummary,
+  SubscriptionResp,
+  Whoami,
+  Product,
+  ProductListResp,
+  Order,
+  CreateOrderReq,
+} from '../types/api'
 
 // === 全局 globalData 形状 (与 app.ts 一致) ===
 interface AppGlobalData {
@@ -110,4 +123,81 @@ export function executeItem(id: number, itemId: number, body: ExecuteBody = {}):
     `/v1/boss/aiengine/strategies/${id}/items/${itemId}/execute`,
     { confirm: true, ...body },
   )
+}
+
+// === me 我的页 (FE-MP-04) —— 经营/订阅/门店 BFF ===
+
+/**
+ * getDailySummaryToday: 当日流水摘要。
+ * GET /v1/boss/billing/summary/today → billing.DailySummary (无 json tag,字段 PascalCase)。
+ * storeID 由后端从 ctx (X-Mock-Tenant 注入的 MockTenant) 解析,无需前端传。
+ */
+export function getDailySummaryToday(): Promise<DailySummary> {
+  return request<DailySummary>('GET', '/v1/boss/billing/summary/today')
+}
+
+/**
+ * getSubscription: 当前订阅状态。
+ * GET /v1/boss/subscription → { plan, subscription } (handler GetSubscription,gin.H 键小写)
+ * subscription 可能为 null (无订阅记录,默认 free)。
+ */
+export function getSubscription(): Promise<SubscriptionResp> {
+  return request<SubscriptionResp>('GET', '/v1/boss/subscription')
+}
+
+/**
+ * getWhoami: 当前租户身份 (用于 me 页门店/身份卡)。
+ * GET /v1/boss/whoami → { tenant_id, source } (router.go whoami,gin.H 键 snake_case)。
+ * 后端目前不返回 store_id/role/scene,前端只用 tenant_id + source。
+ */
+export function getWhoami(): Promise<Whoami> {
+  return request<Whoami>('GET', '/v1/boss/whoami')
+}
+
+// === billing 开单页 (FE-MP-02) —— 商品/订单 API ===
+
+/**
+ * listProducts: 商品分页列表。
+ * GET /v1/boss/catalog/products?limit=&offset=&query= → {items, count}
+ * 后端无 page/page_size, 用 limit/offset;keyword 走 query 模糊匹配名称/条码。
+ */
+export function listProducts(limit: number, offset: number, keyword?: string): Promise<ProductListResp> {
+  const qs: string[] = [`limit=${limit}`, `offset=${offset}`]
+  if (keyword) qs.push(`query=${encodeURIComponent(keyword)}`)
+  return request<ProductListResp>('GET', `/v1/boss/catalog/products?${qs.join('&')}`)
+}
+
+/**
+ * getProductByBarcode: 按条码查商品 (扫码开单)。
+ * GET /v1/boss/catalog/products/barcode/:barcode → Product
+ * 未命中 → 40401 ApiError。
+ */
+export function getProductByBarcode(barcode: string): Promise<Product> {
+  return request<Product>('GET', `/v1/boss/catalog/products/barcode/${encodeURIComponent(barcode)}`)
+}
+
+/**
+ * createOrder: 直接创建已收款订单 (M1-S1 一步到位,status=paid,自动 FIFO 扣库存)。
+ * POST /v1/boss/billing/orders  body CreateOrderReq → Order
+ */
+export function createOrder(body: CreateOrderReq): Promise<Order> {
+  return request<Order>('POST', '/v1/boss/billing/orders', body)
+}
+
+/**
+ * createPendingOrder: 创建挂单 (M4-S1,status=pending,不扣库存)。
+ * POST /v1/boss/billing/orders/pending  body CreateOrderReq → Order
+ * 配合 payOrder 走「开单→确认收款→回执」两段式 UX。
+ */
+export function createPendingOrder(body: CreateOrderReq): Promise<Order> {
+  return request<Order>('POST', '/v1/boss/billing/orders/pending', body)
+}
+
+/**
+ * payOrder: 模拟收款 (pending→paid, M4-S1 SimulatePay)。
+ * POST /v1/boss/billing/orders/:id/pay → Order
+ * 已 paid → 40903 ErrStatusConflict;跨租户/不存在 → 40401。
+ */
+export function payOrder(id: number): Promise<Order> {
+  return request<Order>('POST', `/v1/boss/billing/orders/${id}/pay`)
 }

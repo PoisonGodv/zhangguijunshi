@@ -3048,3 +3048,113 @@ type MemberRepo interface {
 - 储值退款（type=refund 流水类型留位，退款流延后）。
 - WX-01 微信支付服务商资质申请（行政，M0-S2 已启动；资质到位前代码就绪不收款）。
 - 多店功能门禁落地（FeatureMultiStore 定义在矩阵，但本期单店为主，多店 RBAC 校验延后）。
+
+## 16. MVP C端业务接口契约（2026-07-29）
+
+本期补 **C 端（消费者小程序）业务接口**，挂在 `/v1/wxshop` 的 authed 组（JWT）之下，解锁 consumer-mp 前端从 mock 转真实（FE-MP-01 骨架的 `USE_MOCK` 开关可置 false）。**纯加性**：不改任何已存在的共享类型/域服务签名，只新增 `interfaces/http/handler/wxshop.go` + 路由装配 + `interfaces/http/wxshop_test.go`。所有接口从 verified JWT claims 取 openid、从 verified ctx 取 tenant/store，**绝不从 body 信 tenant/member**（ARCH-01）；串户访问与"不存在"不可区分（40404 / 空列表），绝不返回他租户资源。
+
+### 16.1 路由装配（router.go `wireWxshop` authed 组）
+
+仅当 `Membership && Marketing && Groupbuy` 均非 nil 时挂载（`Billing` 可 nil → `/orders` 降级空列表）：
+
+```go
+h := handler.NewWxshopHandler(deps.Membership, deps.Marketing, deps.Groupbuy, deps.Billing)
+authed.GET("/coupons", h.Coupons)
+authed.GET("/member/profile", h.Profile)
+authed.POST("/member/code", h.MemberCode)
+authed.POST("/member/claim-newcomer", h.ClaimNewcomer)
+authed.GET("/groupbuys/active", h.GroupbuysActive)
+authed.POST("/groupbuys/:id/join", h.GroupbuyJoin)
+authed.GET("/orders", h.Orders)
+```
+
+### 16.2 memberID 约定（核心）：Join 幂等拿 member
+
+C 端 JWT 不带 memberID（只带 openid/tenant/store）。**每个 C 端接口都先调 `membership.Join(ctx, JoinInput{WxOpenID: claims.OpenID, PhoneHash: ...})` 幂等拿 member**：Join 按 (tenant, wx_openid) 去重，首次访问自动开户（含零余额储值账户），后续复用同一 member 行。这是拿到 memberID 的**唯一推荐方式**——不改 MemberRepo 私有方法（`findMemberIDByOpenID` 等），不新增"按 openid 查 member"的公开方法。openid 为空 → 40101。
+
+### 16.3 端点契约（7 个）
+
+统一响应信封 `{code,message,data,trace_id}`。字段全部 snake_case，与 `apps/consumer-mp/types/api.d.ts` 对齐。
+
+**1) `GET /v1/wxshop/coupons?status=` — 我的券包**
+- query `status` 缺省 `unused`；可 `unused|used|expired`。
+- 流程：Join 幂等得 member → `ListMemberCoupons(member.ID, status)` → 逐张补模板渲染前端 `Coupon` DTO。
+- 响应 `data: Coupon[]`：
+```json
+[{"id":1,"title":"新人见面礼 满30减10","type":"cash","value_text":"¥10","threshold_text":"满¥30可用","scope_text":"全场通用","expire_text":"2026-08-05 到期","status":"unused"}]
+```
+- 类型映射：后端 `full_reduction|cash`→前端 `cash`，`discount`→`discount`，`gift`→`gift`。`value_text`=¥N（cash）/ N折（discount）/ 赠品（gift）。仍 `unused` 但已过期的券渲染为 `expired`（C 端不展示过期可用券）。
+
+**2) `GET /v1/wxshop/member/profile` — 我的会员档案**
+- 响应 `data`：
+```json
+{"member_id":1,"phone_masked":"","level":"normal","level_name":"普通会员","points":0,"balance_cents":0,"total_spent_cents":0,"tenant_id":50021,"store_id":9}
+```
+- `level_name`：normal→普通会员 / vip→银卡会员 / blackcard→金卡会员。
+
+**3) `POST /v1/wxshop/member/code` — 生成动态会员码**
+- 无 body。流程：Join 幂等得 member → `IssueCode(member.ID)`。
+- 响应 `data: {"code":"<hmac-nonce>","expire_seconds":60}`（ttl 对齐 membership `codeTTL`=60s）。
+- errcode：40402 会员不存在 / 42302 会员已冻结。
+
+**4) `POST /v1/wxshop/member/claim-newcomer` — 领新人券**
+- body `{"phone":"138..."}`（可选；非空时 hash 后作为 Join 的 phone_hash 幂等键之一，不存明文）。
+- **幂等**：member 已持有 `source=newmember` 的券 → 返回该券且 `already_claimed:true`，不重复发。
+- 模板：先找本租户 active 且标题含「新人/新客/见面礼/新会员」的券；找不到则**自动建**一张默认「新人见面礼 满30减10」（full_reduction 满3000减1000，1年有效，不限量）并激活。
+- 发行：`Issue(member, coupon, source=newmember, expire_at=now+7d)`（领取后 7 天有效，含毛利护栏）。
+- 响应 `data: {"coupon":Coupon, "already_claimed"?:true}`。
+- errcode：60005 券已发完 / 60001 毛利护栏拦截。
+
+**5) `GET /v1/wxshop/groupbuys/active` — 进行中拼团**
+- store 取 ctx（fallback tenant 全店）。流程：`ListActive(storeID)`，joined 用 `ListParticipants` 计数（权威）。
+- 响应 `data: GroupBuyBrief[]`：
+```json
+[{"id":1,"title":"3人团 新鲜草莓 2斤装","price_cents":1990,"original_cents":1990,"required":3,"joined":2}]
+```
+- `original_cents`：Groupbuy 无原价字段，本期降级=团购价（前端可渲染；TODO 补原价）。
+
+**6) `POST /v1/wxshop/groupbuys/:id/join` — 参团**
+- 无 body（memberID 从 Join 幂等得，**不从 body 信**）。流程：`groupbuy.Join(id, member.ID)`。
+- 响应 `data: {"participant":Participant, "groupbuy":Groupbuy}`。
+- errcode：40404 拼团不存在（含串户）/ 60013 已满 / 60014 已结束 / 60015 已参团。
+
+**7) `GET /v1/wxshop/orders` — 我的订单/交易记录**
+- **本期降级**：billing 无"按 member 查询"公开方法，返回空数组 `data: []`（不硬塞散客/全店订单，防越权）。TODO §16.8。
+- 仍先 Join 幂等拿 member 以证明身份+租户。
+
+### 16.4 已知 TODO 降级（不阻塞接通）
+- **`balance_cents` 恒 0**：membership 未暴露 `GetAccount` 公开方法（只有 repo 接口的 `GetAccount`，Service 无对应公开读）。硬约束不改共享签名，故 profile 的储值余额降级为 0；待 membership 加公开读方法后接真实余额。
+- **`GET /orders` 空数组**：见 §16.3(7)。待 billing 加 `ListByMember(ctx, memberID)` 后返回真实订单。
+- **`original_cents` = 团购价**：Groupbuy 无原价字段。
+- **`phone_masked` 空**：member 只存 phone_hash，无法回显明文/掩码；C 端档案不展示手机号。
+
+### 16.5 默认新人券模板
+`新人见面礼 满30减10`：type=full_reduction，params `{threshold_cents:3000, off_cents:1000}`，valid 1 年，TotalQuota=0（不限量），auto-create + activate。领取时 `expire_at=now+7d`（领取后 7 天有效）。
+
+### 16.6 串户隔离（ARCH-01）
+- 每个接口 tenant 取自 verified ctx（`EnforceTenant`/FromContext），member 用 claims.OpenID 在本租户内 Join 幂等——**同一 openid 在不同租户映射到不同 member 行**（member 行带 tenant_id）。
+- 串户结果：券包/档案/拼团均只见本租户数据；跨租户参团/读资源 → 40404（与不存在同口径）。绝不返回他租户资源。
+
+### 16.7 测试（`interfaces/http/wxshop_test.go`，memory repo + 真实 dev-key JWT）
+- `TestWxshop_FullConsumerFlow`：领新人券（auto-create 模板）→ 幂等再领（already_claimed）→ 券包 1 张 unused → 档案（普通会员/tenant/store 正确）→ 动态码非空+expire_seconds=60 → 建拼团 → 进行中列表 → 参团 → 重复参团 60015 → 订单空数组。
+- `TestWxshop_CrossTenantIsolation`：tenant A 领券 → tenant B（同 openid）券包为空、member_id 不同（每租户独立 member 行）→ B 参 A 的团 40404。
+- `TestWxshop_NoToken`：7 端点无 token 全部 401/40101。
+- 退出码：`go build ./...`=0；`go test ./interfaces/... ./internal/... -race`=0（不破坏 M0→M4-S1 全部现有测试）。
+
+### 16.8 后续（解锁 mock→真实后）
+- membership 加 `GetAccount` 公开读 → profile 真实储值余额。
+- billing 加 `ListByMember` → orders 真实交易记录。
+- consumer-mp 各 service `USE_MOCK` 置 false（types/services 字段已对齐本期契约）。
+
+
+### 16.9 商家端 MVP 前端闭环（billing 开单 + me 我的，2026-07-29）
+- **billing 开单页**(`apps/merchant-mp/pages/billing/`,原占位 → 真实): 商品搜索(query 模糊 + 分页触底)+ `wx.scanCode` → `GET /catalog/products/barcode/:barcode` 入车; 购物车步进器/删除/清空; 两段式开单 `POST /billing/orders/pending` → 确认收款 `POST /billing/orders/:id/pay`(SimulatePay)→ 回执。库存由后端 MarkOrderPaid best-effort FIFO 扣,前端不调 consume。
+- **me 我的页**(`apps/merchant-mp/pages/me/`,原占位 → 真实): `GET /billing/summary/today`(营业额 NetCents/订单数 OrderCount/客单价前端算)+ `GET /subscription`(plan/到期)+ `GET /whoami`(tenant_id+source)。
+- **响应字段大小写约定(关键)**: `catalog.Product` / `billing.Order` / `billing.DailySummary` / `subscription.Subscription` 结构体**未声明 json tag**,Go encoding/json 默认按字段名输出 **PascalCase**(`ID/Name/PriceCents/TotalCents/NetCents/OrderCount/Plan/...`);仅 handler 的 DTO(`createOrderRequest` 等)有显式 snake_case tag。前端 `types/api.d.ts` 据此按 PascalCase 镜像这些类型(文件顶部有醒目注释)。**历史接口测试(m1s1 等)大量断言 PascalCase 键,故本期不改共享类型 json tag,保持 PascalCase 契约**;若未来统一 snake_case 需同步改全部历史测试。
+- GetStock(`GET /inventory/stock`)返回 `gin.H{"product_id","store_id","quantity"}` → **小写 `quantity`**(与 batch 实体的 PascalCase `Quantity` 不同,注意区分)。
+- **会员总数**: B 端 `/v1/boss/membership` 无列表/计数接口(仅 Join/GetMember/IssueCode/Redeem/Recharge/SetRegionCap),me 页会员数卡片显示「—」占位。TODO: 补 `GET /membership/members?count` 或 summary。
+
+### 16.10 MVP 一体化冒烟（`interfaces/http/mvp_smoke_test.go`，同一进程双 BFF 共享 in-memory 状态）
+- `TestMVP_EndToEnd`: B 端 建品→扫码查品→入库20→现金开单2件(扣库存20→18)→挂单3件→收款(→15)→当日流水(2单/NetCents=9950); C 端 JWT→领新人券(幂等)→券包1→档案→动态码→建拼团→列表→参团→重复参团60015→订单空。双端在同一 fixture(同一 tenant 50021/store 9)共享 catalog/inventory/billing/membership/marketing/groupbuy 状态,端到端证明 MVP 闭环。
+- `TestMVP_CrossTenant`: tenant A 建品+开单+领券后, tenant B(同 openid)商品列表空/流水0/券包空/拼团空 —— ARCH-01 串户隔离端到端证明。
+- 退出码: `go test ./interfaces/http/ -run TestMVP_ -count=1`=0(连续5次稳定)。

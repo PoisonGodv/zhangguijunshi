@@ -1,0 +1,5 @@
+<view class="qr-box">
+  <!-- 后端返回二维码图片 URL 后改为 <image src="{{qrUrl}}"> -->
+  <view class="qr-nonce">{{nonce}}</view>
+  <view wx:if="{{countdown <= 5 && countdown > 0}}" class="qr-mask">{{countdown}}s 后刷新</view>
+</view>

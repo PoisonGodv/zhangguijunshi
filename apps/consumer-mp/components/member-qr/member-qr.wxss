@@ -1,0 +1,22 @@
+/* components/member-qr/member-qr.wxss — 会员码组件 */
+/* 全局已定义 .qr-box / .qr-mask / .qr-tip */
+.qr-box {
+  position: relative;
+  width: 400rpx;
+  height: 400rpx;
+  margin: 0 auto;
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.qr-nonce {
+  font-size: 48rpx;
+  font-weight: bold;
+  color: #1F1F1F;
+  letter-spacing: 4rpx;
+  word-break: break-all;
+  text-align: center;
+  padding: 0 20rpx;
+}

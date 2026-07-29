@@ -1,0 +1,6 @@
+/* pages/coupons/coupons.wxss — 券包页特有布局 */
+/* 全局已定义 .tabs / .tab / .tab-active */
+.tabs {
+  display: flex;
+  margin-bottom: 24rpx;
+}

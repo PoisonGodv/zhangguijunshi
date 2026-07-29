@@ -1,4 +1,7 @@
 {
   "navigationBarTitleText": "开单",
-  "backgroundColor": "#FFF9F5"
+  "backgroundColor": "#FFF9F5",
+  "enablePullDownRefresh": true,
+  "backgroundTextStyle": "dark",
+  "onReachBottomDistance": 80
 }

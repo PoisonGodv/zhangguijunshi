@@ -1,0 +1,12 @@
+<view class="coupon-item" bindtap="onTap">
+  <view class="coupon-left">
+    <view class="coupon-value">{{coupon.value_text}}</view>
+    <view class="coupon-status coupon-status-{{coupon.status}}">{{statusText}}</view>
+  </view>
+  <view class="coupon-right">
+    <view class="coupon-title">{{coupon.title}}</view>
+    <view class="coupon-meta" wx:if="{{coupon.threshold_text}}">{{coupon.threshold_text}}</view>
+    <view class="coupon-meta" wx:if="{{coupon.scope_text}}">{{coupon.scope_text}}</view>
+    <view class="coupon-meta" wx:if="{{coupon.expire_text}}">{{coupon.expire_text}}</view>
+  </view>
+</view>

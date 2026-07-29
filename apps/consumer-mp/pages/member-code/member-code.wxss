@@ -1,0 +1,21 @@
+/* pages/member-code/member-code.wxss — 会员码页特有布局 */
+.member-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20rpx 0 32rpx;
+}
+.member-points {
+  font-size: 28rpx;
+  color: #8C8C8C;
+}
+.qr-box {
+  margin: 40rpx auto;
+}
+.login-btn {
+  margin-top: 40rpx;
+  width: 300rpx;
+}
+.refresh-btn {
+  margin-top: 40rpx;
+}

@@ -1,5 +1,79 @@
-<!-- pages/me/me.wxml — 「我的」占位页 -->
-<view class="placeholder-page">
-  <view class="placeholder-icon">👤</view>
-  <view class="placeholder-text">我的 · 即将上线</view>
+<!-- pages/me/me.wxml — 「我的」页 -->
+<view class="container">
+  <!-- 头部: 门店/身份卡 -->
+  <view class="me-header">
+    <view class="me-avatar">🏪</view>
+    <view class="me-header-main">
+      <view class="me-store-name">我的门店</view>
+      <view class="me-store-id">门店号 {{tenantId || '—'}} · {{sourceLabel}}</view>
+    </view>
+  </view>
+
+  <!-- 今日经营摘要 -->
+  <view class="section">
+    <view class="section-title">今日经营 {{summaryDate ? '(' + summaryDate + ')' : ''}}</view>
+    <view class="stat-grid">
+      <view class="stat-cell">
+        <view class="stat-value">¥{{revenueYuan}}</view>
+        <view class="stat-label">营业额</view>
+      </view>
+      <view class="stat-cell">
+        <view class="stat-value">{{orderCount}}</view>
+        <view class="stat-label">订单数</view>
+      </view>
+      <view class="stat-cell">
+        <view class="stat-value">{{avgYuan === '—' ? '—' : '¥' + avgYuan}}</view>
+        <view class="stat-label">客单价</view>
+      </view>
+      <view class="stat-cell">
+        <view class="stat-value">{{memberCountText}}</view>
+        <view class="stat-label">会员数</view>
+      </view>
+    </view>
+  </view>
+
+  <!-- 订阅状态 -->
+  <view class="section">
+    <view class="section-title">订阅</view>
+    <view class="sub-row">
+      <view class="sub-main">
+        <view class="sub-plan">
+          <text class="sub-plan-name">{{planLabel}}</text>
+          <text wx:if="{{planStatus}}" class="sub-status">{{planStatus}}</text>
+        </view>
+        <view class="sub-expire">到期时间:{{planExpire}}</view>
+      </view>
+      <view
+        wx:if="{{planRaw === 'free'}}"
+        class="sub-upgrade"
+        bindtap="onTapUpgrade"
+      >升级 Pro</view>
+    </view>
+  </view>
+
+  <!-- 功能区 -->
+  <view class="section">
+    <view class="menu-list">
+      <view class="menu-item" bindtap="onTapSettings">
+        <view class="menu-icon">⚙️</view>
+        <view class="menu-text">设置</view>
+        <view class="menu-arrow">›</view>
+      </view>
+      <view class="menu-item" bindtap="onTapHelp">
+        <view class="menu-icon">❓</view>
+        <view class="menu-text">帮助</view>
+        <view class="menu-arrow">›</view>
+      </view>
+      <view class="menu-item" bindtap="onTapAbout">
+        <view class="menu-icon">ℹ️</view>
+        <view class="menu-text">关于掌柜军师</view>
+        <view class="menu-arrow">›</view>
+      </view>
+      <view class="menu-item menu-item-danger" bindtap="onTapLogout">
+        <view class="menu-icon">🚪</view>
+        <view class="menu-text">退出登录</view>
+        <view class="menu-arrow">›</view>
+      </view>
+    </view>
+  </view>
 </view>

@@ -1,0 +1,5 @@
+/* components/empty-state/empty-state.wxss — 空状态组件 */
+/* 全局 .empty / .empty-icon 已在 app.wxss 定义,组件内补充容器居中 */
+.empty {
+  padding: 120rpx 0;
+}

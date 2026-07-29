@@ -1,0 +1,44 @@
+/* pages/index/index.wxss — 复用 app.wxss 全局 class, 本页只补布局细节 */
+
+/* 今日福利/拼团专区标题与上方卡片的间距 */
+.section-title {
+  margin: 24rpx 0 16rpx 4rpx;
+  font-size: 28rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+}
+
+/* 拼团价格行: 现价与划线价并排基线对齐 */
+.groupbuy-price-row {
+  display: flex;
+  align-items: baseline;
+  margin: 12rpx 0 8rpx;
+}
+.groupbuy-price-row .price-now {
+  font-size: 36rpx;
+}
+.groupbuy-price-row .price-old {
+  font-size: 26rpx;
+}
+
+/* 门店卡: 左侧信息 + 右侧进群按钮 */
+.store-info {
+  flex: 1;
+  min-width: 0;
+}
+.store-group-btn {
+  flex-shrink: 0;
+  margin-left: 24rpx;
+  background: #FFF3EB;
+  color: #FF6B35;
+  font-size: 26rpx;
+  font-weight: 600;
+  border-radius: 32rpx;
+  padding: 0 32rpx;
+  height: 64rpx;
+  line-height: 64rpx;
+  border: none;
+}
+.store-group-btn::after {
+  border: none;
+}

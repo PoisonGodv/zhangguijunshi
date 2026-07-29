@@ -1,0 +1,10 @@
+{
+  "navigationBarTitleText": "我的券包",
+  "enablePullDownRefresh": true,
+  "backgroundColor": "#FFF9F5",
+  "backgroundTextStyle": "dark",
+  "usingComponents": {
+    "coupon-card": "../../components/coupon-card/coupon-card",
+    "empty-state": "../../components/empty-state/empty-state"
+  }
+}

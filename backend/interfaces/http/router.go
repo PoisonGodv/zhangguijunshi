@@ -251,6 +251,20 @@ func wireWxshop(r *gin.Engine, deps Deps) {
 		authed.GET("/auth/me", h.Me)
 		authed.POST("/auth/logout", h.Logout)
 	}
+
+	// M-C-01 C 端业务接口 (CONTRACT §16): member profile / 券包 / 动态会员码 /
+	// 新人券 / 拼团 / 订单。Membership+Marketing+Groupbuy are required to wire the
+	// group; Billing may be nil (→ /orders degrades to an empty list, §16.8).
+	if deps.Membership != nil && deps.Marketing != nil && deps.Groupbuy != nil {
+		h := handler.NewWxshopHandler(deps.Membership, deps.Marketing, deps.Groupbuy, deps.Billing)
+		authed.GET("/coupons", h.Coupons)
+		authed.GET("/member/profile", h.Profile)
+		authed.POST("/member/code", h.MemberCode)
+		authed.POST("/member/claim-newcomer", h.ClaimNewcomer)
+		authed.GET("/groupbuys/active", h.GroupbuysActive)
+		authed.POST("/groupbuys/:id/join", h.GroupbuyJoin)
+		authed.GET("/orders", h.Orders)
+	}
 }
 
 // wxshopAuthMW prefers real JWT auth; it falls back to MockTenant only when no

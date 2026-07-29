@@ -1,3 +1,0 @@
-# FE-MP-02 扫码开单 / 建品 / 核销 扩展位
-# 本目录由 FE-MP-03 建立,作为 tabBar「开单」入口的最小占位 (pages/billing/billing.{ts,wxml,wxss,json})。
-# FE-MP-02 将在此实现: 扫码 1 秒开单 / 建品 / 扫顾客会员码扣储值/累积分/核销券。
