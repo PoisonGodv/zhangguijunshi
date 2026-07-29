@@ -55,6 +55,7 @@ func sampleBundle() *signal.Bundle {
 // ActionType/ReasonType on the item, copy≤40字, GeneratedBy=live_llm (degrade
 // empty), and a non-empty Signals snapshot.
 func TestEncode_PersistsAndMapsFields(t *testing.T) {
+	today := time.Now().Format("2006-01-02")
 	repo := strategy.NewMemoryStrategyRepo()
 	svc := strategy.New(repo, strategy.WithNowFunc(func() time.Time {
 		return time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
@@ -78,7 +79,7 @@ func TestEncode_PersistsAndMapsFields(t *testing.T) {
 	if st.LLMTier != "lite" {
 		t.Errorf("LLMTier = %q, want lite", st.LLMTier)
 	}
-	if st.ForDate != "2026-07-28" {
+	if st.ForDate != today {
 		t.Errorf("ForDate = %q", st.ForDate)
 	}
 	if len(st.Items) != 1 {
@@ -114,7 +115,7 @@ func TestEncode_PersistsAndMapsFields(t *testing.T) {
 	}
 
 	// Persisted: a fresh load via GetToday returns the same row+item.
-	got, err := svc.GetToday(ctxWith(7001, 7100), 7100, "2026-07-28")
+	got, err := svc.GetToday(ctxWith(7001, 7100), 7100, today)
 	if err != nil {
 		t.Fatalf("GetToday: %v", err)
 	}
@@ -225,6 +226,7 @@ func TestEncode_NilBundleAndItems(t *testing.T) {
 // TestEncode_CrossTenantIsolation: the strategy service rejects a context
 // without a tenant; a different tenant cannot read another's advice.
 func TestEncode_CrossTenantIsolation(t *testing.T) {
+	today := time.Now().Format("2006-01-02")
 	repo := strategy.NewMemoryStrategyRepo()
 	svc := strategy.New(repo, strategy.WithNowFunc(func() time.Time { return time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC) }))
 	enc := NewEncoder(svc)
@@ -237,7 +239,7 @@ func TestEncode_CrossTenantIsolation(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 	// Tenant 7002 cannot see it.
-	if _, err := svc.GetToday(ctxWith(7002, 7100), 7100, "2026-07-28"); err != strategy.ErrNotFound {
+	if _, err := svc.GetToday(ctxWith(7002, 7100), 7100, today); err != strategy.ErrNotFound {
 		t.Errorf("cross-tenant GetToday err = %v, want ErrNotFound", err)
 	}
 }

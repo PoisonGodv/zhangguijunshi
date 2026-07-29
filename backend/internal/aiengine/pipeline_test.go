@@ -138,6 +138,7 @@ func oneRoutedItem(tenantID int64) *rule.Routed {
 // TestPipeline_Happy_LiveLLM: real-ish flow, fake LLM returns good JSON →
 // Degrade empty, GeneratedBy=live_llm, one item with LLM-polished copy.
 func TestPipeline_Happy_LiveLLM(t *testing.T) {
+	today := time.Now().Format("2006-01-02")
 	bundle := &signal.Bundle{TenantID: 7001, StoreID: 7100, BusinessType: "fruit", DataQuality: 70,
 		Inventory: []signal.InventorySig{{ProductID: 42, Name: "芒果", CostCents: 1200, PriceCents: 2580, DaysToExpiry: 2}}}
 	p, svc, _ := buildPipeline(t,
@@ -160,7 +161,7 @@ func TestPipeline_Happy_LiveLLM(t *testing.T) {
 		t.Fatalf("items = %d, want 1", len(advice.Strategy.Items))
 	}
 	// Persisted.
-	if got, err := svc.GetToday(ctxWith(7001, 7100), 7100, "2026-07-28"); err != nil || got.GeneratedBy != strategy.GenLiveLLM {
+	if got, err := svc.GetToday(ctxWith(7001, 7100), 7100, today); err != nil || got.GeneratedBy != strategy.GenLiveLLM {
 		t.Errorf("GetToday after Run: %+v err=%v", got, err)
 	}
 }
@@ -191,6 +192,7 @@ func TestPipeline_CacheShortCircuit(t *testing.T) {
 // TestPipeline_SignalFail_RuleOnly: collector error → empty bundle → cold-start
 // injection → GeneratedBy=rule_only, no Run error.
 func TestPipeline_SignalFail_RuleOnly(t *testing.T) {
+	today := time.Now().Format("2006-01-02")
 	p, svc, _ := buildPipeline(t,
 		&fakeCollector{err: errors.New("lookup down")},
 		&fakeRouter{},
@@ -208,7 +210,7 @@ func TestPipeline_SignalFail_RuleOnly(t *testing.T) {
 		t.Errorf("GeneratedBy = %q, want rule_only", advice.Strategy.GeneratedBy)
 	}
 	// Persisted as rule_only.
-	got, err := svc.GetToday(ctxWith(7001, 7100), 7100, "2026-07-28")
+	got, err := svc.GetToday(ctxWith(7001, 7100), 7100, today)
 	if err != nil {
 		t.Fatalf("GetToday: %v", err)
 	}

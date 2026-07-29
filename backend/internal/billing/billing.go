@@ -78,6 +78,14 @@ type OrderRepo interface {
 	// stores of the tenant.
 	ListByDate(ctx context.Context, tenantID, storeID int64, day time.Time) ([]*Order, error)
 
+	// ListByMember returns ALL orders (with Items) owned by memberID within
+	// tenantID, ordered by created_at DESC then id DESC (newest first). A
+	// walk-in order (MemberID=0) is never returned. Cross-tenant orders are
+	// excluded by tenantID. An empty result returns a non-nil empty slice
+	// (never nil), so the caller can range without a nil check. This backs the
+	// C-side GET /v1/wxshop/orders "我的订单" list (CONTRACT §16.3(7)/§16.8).
+	ListByMember(ctx context.Context, tenantID, memberID int64) ([]*Order, error)
+
 	// OrderTotalByMembers sums the total_cents of the tenant's PAID orders
 	// whose MemberID is in memberIDs and whose paid time falls in [since,
 	// until] (inclusive both ends). Empty memberIDs or since.After(until)

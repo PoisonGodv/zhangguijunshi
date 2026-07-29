@@ -367,6 +367,19 @@ func (s *Service) GetOrder(ctx context.Context, id int64) (*Order, error) {
 	return s.repo.GetByID(ctx, tenantID, id)
 }
 
+// ListByMember returns ALL orders (with Items) for memberID within the ctx
+// tenant, ordered by created_at DESC then id DESC (newest first). Cross-tenant
+// orders are excluded by tenantID (ARCH-01: a foreign tenant's order for the
+// same member id is invisible). The result is always a non-nil slice. This
+// backs the C-side GET /v1/wxshop/orders "我的订单" list (CONTRACT §16.3(7)).
+func (s *Service) ListByMember(ctx context.Context, memberID int64) ([]*Order, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.ListByMember(ctx, tenantID, memberID)
+}
+
 // OrderTotalByMembers sums the total_cents of the ctx tenant's PAID orders
 // whose MemberID is in memberIDs and whose paid time falls in [since, until]
 // (inclusive). Empty memberIDs or since.After(until) returns 0,nil. This is

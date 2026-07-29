@@ -158,6 +158,19 @@ func (s *Service) GetMember(ctx context.Context, id int64) (*Member, error) {
 	return s.repo.GetMember(ctx, tenantID, id)
 }
 
+// GetAccount loads the stored-value (储值) account for memberID within the ctx
+// tenant (CONTRACT §16.8: backs the C-side GET /v1/wxshop/member/balance read).
+// Cross-tenant or absent account → ErrNotFound (the C 端 balance handler
+// degrades a member with no account yet to 0/0 rather than 404). tenantID is
+// resolved from ctx (ARCH-01), NEVER trusted from the caller.
+func (s *Service) GetAccount(ctx context.Context, memberID int64) (*BalanceAccount, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.GetAccount(ctx, tenantID, memberID)
+}
+
 // ListMembers enumerates the ctx tenant's members matching f (M3-S2 signal real
 // enumeration). Empty filter fields are not filtering; Limit<=0 defaults to 500.
 // Cross-tenant members are never visible (repo enforces this).

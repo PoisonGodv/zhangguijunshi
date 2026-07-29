@@ -363,6 +363,125 @@ func seedPaidOrderWithMember(repo *MemoryOrderRepo, tenantID, memberID int64, to
 	}
 }
 
+// seedOrderAt writes a PAID order for tenantID+memberID with a controlled
+// CreatedAt so ListByMember ordering is deterministic. Items are populated to
+// prove the deep-copied Items travel with the order.
+func seedOrderAt(repo *MemoryOrderRepo, tenantID, memberID, total int64, createdAt time.Time) {
+	o := &Order{
+		TenantID:   tenantID,
+		MemberID:   memberID,
+		Status:     orderStatusPaid,
+		TotalCents: total,
+		PaidCents:  total,
+		PaidAt:     &createdAt,
+		CreatedAt:  createdAt,
+		Items:      []OrderItem{{ProductID: 1, NameSnapshot: "品", Unit: "个", Qty: 1, PriceCents: total, CostCents: total / 2}},
+	}
+	if _, err := repo.Create(context.Background(), o); err != nil {
+		panic(err)
+	}
+}
+
+func TestListByMember_TenantAndMemberScoped(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+
+	// Tenant A member 7 has two orders; member 8 has one; a walk-in
+	// (MemberID=0) order must NOT appear in any member list.
+	seedPaidOrderWithMember(repo, 100, 7, 300, fixedNow)
+	seedPaidOrderWithMember(repo, 100, 7, 600, fixedNow)
+	seedPaidOrderWithMember(repo, 100, 8, 900, fixedNow)
+	seedPaidOrderWithMember(repo, 100, 0, 9999, fixedNow) // 散客, never listed
+	// Tenant B, SAME member id 7 — must be invisible to tenant A.
+	seedPaidOrderWithMember(repo, 200, 7, 7777, fixedNow)
+
+	got, err := svc.ListByMember(ctxFor(100, 10, 7), 7)
+	if err != nil {
+		t.Fatalf("ListByMember: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("member 7 orders = %d, want 2", len(got))
+	}
+	for _, o := range got {
+		if o.TenantID != 100 || o.MemberID != 7 {
+			t.Errorf("leaked foreign/walk-in order: %+v", o)
+		}
+	}
+
+	// Member 8 sees exactly one.
+	got8, err := svc.ListByMember(ctxFor(100, 10, 7), 8)
+	if err != nil {
+		t.Fatalf("ListByMember m8: %v", err)
+	}
+	if len(got8) != 1 || got8[0].TotalCents != 900 {
+		t.Errorf("member 8 = %+v, want 1 order total 900", got8)
+	}
+
+	// Unknown member → empty (non-nil) slice.
+	gotEmpty, err := svc.ListByMember(ctxFor(100, 10, 7), 999)
+	if err != nil {
+		t.Fatalf("ListByMember unknown: %v", err)
+	}
+	if gotEmpty == nil || len(gotEmpty) != 0 {
+		t.Errorf("unknown member orders = %#v, want non-nil empty", gotEmpty)
+	}
+}
+
+func TestListByMember_CrossTenantIsolated(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	// Same member id 7 in two tenants; each tenant must see ONLY its own order.
+	seedPaidOrderWithMember(repo, 100, 7, 1000, fixedNow)
+	seedPaidOrderWithMember(repo, 200, 7, 2000, fixedNow)
+
+	a, err := svc.ListByMember(ctxFor(100, 10, 7), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a) != 1 || a[0].TotalCents != 1000 || a[0].TenantID != 100 {
+		t.Errorf("tenant A member 7 = %+v, want 1 order total 1000 tenant 100", a)
+	}
+	b, err := svc.ListByMember(ctxFor(200, 10, 7), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != 1 || b[0].TotalCents != 2000 || b[0].TenantID != 200 {
+		t.Errorf("tenant B member 7 = %+v, want 1 order total 2000 tenant 200", b)
+	}
+}
+
+func TestListByMember_DescOrderAndItems(t *testing.T) {
+	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	t1 := fixedNow
+	t2 := fixedNow.Add(time.Minute)
+	t3 := fixedNow.Add(2 * time.Minute)
+	seedOrderAt(repo, 100, 7, 100, t1)
+	seedOrderAt(repo, 100, 7, 200, t2)
+	seedOrderAt(repo, 100, 7, 300, t3)
+
+	got, err := svc.ListByMember(ctxFor(100, 10, 7), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3", len(got))
+	}
+	// newest-first (created_at DESC): 300, 200, 100.
+	if got[0].TotalCents != 300 || got[1].TotalCents != 200 || got[2].TotalCents != 100 {
+		t.Errorf("not DESC by created_at: %+v", []int64{got[0].TotalCents, got[1].TotalCents, got[2].TotalCents})
+	}
+	// Items travel with the order (defensive copy).
+	if len(got[0].Items) != 1 || got[0].Items[0].PriceCents != 300 {
+		t.Errorf("items wrong on newest order: %+v", got[0].Items)
+	}
+}
+
+func TestListByMember_NoTenant(t *testing.T) {
+	svc, _ := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
+	_, err := svc.ListByMember(context.Background(), 7)
+	if !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
+	}
+}
+
 func TestOrderTotalByMembers_Numbers(t *testing.T) {
 	svc, repo := newService(&fakePricer{byID: map[int64]*PricedProduct{}})
 	ctx := ctxFor(100, 10, 7)

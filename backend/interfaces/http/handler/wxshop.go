@@ -35,7 +35,7 @@ type WxshopHandler struct {
 	membership *membership.Service
 	marketing  *marketing.Service
 	groupbuy   *groupbuy.Service
-	billing    *billing.Service // nil → /orders degrades to empty list (TODO §16.8)
+	billing    *billing.Service // optional; nil → /orders degrades to empty list (minimal fixture)
 	now        func() time.Time
 }
 
@@ -401,17 +401,109 @@ func (h *WxshopHandler) GroupbuyJoin(c *gin.Context) {
 	httpx.OK(c, gin.H{"participant": p, "groupbuy": g})
 }
 
-// Orders lists the caller's交易记录. billing 尚无"按 member 查询"的公开方法,故
-// 本期降级返回空数组(CONTRACT §16.8 TODO),不硬塞散客/全店订单以防越权。
+// orderItemDTO is one C-side order line. Only consumer-visible fields are
+// exposed: the snapshot name/unit, quantity and the unit price the member paid.
+// CostCents (margin/归因) and ProductID (internal) are deliberately hidden.
+type orderItemDTO struct {
+	Name       string `json:"name"`
+	Unit       string `json:"unit"`
+	Qty        int64  `json:"qty"`
+	PriceCents int64  `json:"price_cents"`
+}
+
+// orderDTO is the C-side 我的订单 row (CONTRACT §16.3(7)). It deliberately
+// exposes ONLY what a consumer should see — NEVER CostCents, MemberID,
+// TenantID, StoreID, OperatorID, DiscountCents or PaymentRef (those are
+// internal/boss-only). Items collapse to their consumer-facing subset.
+type orderDTO struct {
+	ID         int64          `json:"id"`
+	OrderNo    string         `json:"order_no"`
+	Status     string         `json:"status"` // pending|paid|refunded|voided
+	TotalCents int64          `json:"total_cents"`
+	PaidCents  int64          `json:"paid_cents"`
+	CreatedAt  time.Time      `json:"created_at"`
+	Items      []orderItemDTO `json:"items"`
+}
+
+// toOrderDTO maps a billing.Order into the consumer-facing DTO, dropping every
+// internal field. Items are always a non-nil slice so the JSON renders [].
+func toOrderDTO(o *billing.Order) orderDTO {
+	items := make([]orderItemDTO, 0, len(o.Items))
+	for _, it := range o.Items {
+		items = append(items, orderItemDTO{
+			Name:       it.NameSnapshot,
+			Unit:       it.Unit,
+			Qty:        it.Qty,
+			PriceCents: it.PriceCents,
+		})
+	}
+	return orderDTO{
+		ID:         o.ID,
+		OrderNo:    o.OrderNo,
+		Status:     o.Status,
+		TotalCents: o.TotalCents,
+		PaidCents:  o.PaidCents,
+		CreatedAt:  o.CreatedAt,
+		Items:      items,
+	}
+}
+
+// Orders lists the caller's交易记录 (我的订单). The member is resolved idempotently
+// from the verified claims (proof of identity + tenant); the orders are then
+// scoped to that member within the ctx tenant via billing.ListByMember —
+// walk-in (MemberID=0) and cross-tenant orders are never returned (ARCH-01).
+// When billing is not wired (minimal fixture) the endpoint degrades to an empty
+// list rather than 404 (CONTRACT §16.3(7)).
 // GET /v1/wxshop/orders
 func (h *WxshopHandler) Orders(c *gin.Context) {
-	// Resolve the member (idempotent) purely to prove identity + tenant; the
-	// result is unused until billing exposes ListByMember.
-	if h.memberFromClaims(c, "") == nil {
+	m := h.memberFromClaims(c, "")
+	if m == nil {
 		return
 	}
-	// TODO(CONTRACT §16.8): billing.ListByMember(ctx, memberID) 就绪后返回真实订单。
-	httpx.OK(c, []any{})
+	if h.billing == nil {
+		// Billing not wired (minimal fixture without the billing stack): degrade
+		// to an empty list, never a 404 (CONTRACT §16.3(7)/§16.8).
+		httpx.OK(c, []any{})
+		return
+	}
+	orders, err := h.billing.ListByMember(c.Request.Context(), m.ID)
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	out := make([]orderDTO, 0, len(orders))
+	for _, o := range orders {
+		out = append(out, toOrderDTO(o))
+	}
+	httpx.OK(c, out)
+}
+
+// Balance returns the caller's stored-value (储值) balance, split into the real
+// paid-in balance and the bonus/gift part (CONTRACT §16.8). The member is
+// resolved idempotently from the verified claims; the account is read within
+// the ctx tenant via membership.GetAccount. A member with no account yet (e.g.
+// a brand-new enrolment whose account open was bypassed) gets 0/0 — never a
+// 404 — because Join normally opens a zero-balance account.
+// GET /v1/wxshop/member/balance
+func (h *WxshopHandler) Balance(c *gin.Context) {
+	m := h.memberFromClaims(c, "")
+	if m == nil {
+		return
+	}
+	acc, err := h.membership.GetAccount(c.Request.Context(), m.ID)
+	if err != nil {
+		if errors.Is(err, membership.ErrNotFound) {
+			// No account row → a new member: report zero balances, not 404.
+			httpx.OK(c, gin.H{"balance_cents": int64(0), "gift_cents": int64(0)})
+			return
+		}
+		httpx.FailError(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{
+		"balance_cents": acc.BalanceCents,
+		"gift_cents":    acc.GiftCents,
+	})
 }
 
 // failWxMarketing maps marketing domain errors to HTTP codes (C 端口径).

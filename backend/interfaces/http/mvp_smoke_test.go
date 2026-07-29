@@ -55,6 +55,9 @@ func newMVPRouter(t *testing.T) (*gin.Engine, *jwt.Manager) {
 	)
 	gbSvc := groupbuy.New(groupbuy.NewMemoryGroupbuyRepo(), groupbuy.WithMemberLookuper(wxMembershipLookuper{memSvc}))
 	wxGroupbuySvc = gbSvc // let the wxshop fixture helpers seed squads if needed
+	wxBillingSvc = bilSvc
+	wxCatalogSvc = catSvc
+	wxMembershipSvc = memSvc
 
 	return New(Deps{
 		Cfg:        &config.Config{App: config.AppConfig{Env: "test"}},
@@ -134,6 +137,8 @@ func TestMVP_EndToEnd(t *testing.T) {
 	// 会员档案 + 动态码。
 	prof, _ := wxGet(t, r, "/v1/wxshop/member/profile", token).Data.(map[string]any)
 	assert.EqualValues(t, 50021, prof["tenant_id"])
+	memberID := int64(prof["member_id"].(float64))
+	require.Positive(t, memberID)
 	code := wxPost(t, r, "/v1/wxshop/member/code", nil, token)
 	require.Equal(t, 0, code.Code)
 	assert.NotEmpty(t, code.Data.(map[string]any)["code"])
@@ -149,9 +154,25 @@ func TestMVP_EndToEnd(t *testing.T) {
 	again := wxPost(t, r, "/v1/wxshop/groupbuys/"+itoa(gbID)+"/join", nil, token)
 	assert.Equal(t, 60015, again.Code)
 
-	// C 端订单 (降级空, CONTRACT §16.8)。
+	// C 端订单: B 端散客单(MemberID=0) 不应出现在该 member 的订单列表 (防越权)。
 	orders, _ := wxGet(t, r, "/v1/wxshop/orders", token).Data.([]any)
-	assert.Empty(t, orders)
+	assert.Empty(t, orders, "散客/walk-in 单不应出现在 member 的订单列表")
+
+	// 让该 member 真有一单 (member 单) → C 端 GET /orders 能看到。
+	mvpCtx := ctxForTenant(50021, 9)
+	_, err = bilSvcOf(r).CreateOrder(mvpCtx, billing.CreateOrderInput{
+		StoreID:  9,
+		MemberID: memberID,
+		Items:    []billing.CreateOrderItem{{ProductID: pid, Qty: 1}}, // 1 件草莓 = 1990
+	})
+	require.NoError(t, err)
+	envOrders := wxGet(t, r, "/v1/wxshop/orders", token)
+	require.Equal(t, 0, envOrders.Code, "orders: %s", envOrders.Message)
+	orders2, _ := envOrders.Data.([]any)
+	require.Len(t, orders2, 1, "member 单应能在 C 端订单列表看到")
+	o0, _ := orders2[0].(map[string]any)
+	assert.EqualValues(t, 1990, o0["total_cents"])
+	assert.Equal(t, "paid", o0["status"])
 }
 
 // TestMVP_CrossTenant 串户隔离: tenant B 看不到 tenant A 的商品/订单/券/拼团。

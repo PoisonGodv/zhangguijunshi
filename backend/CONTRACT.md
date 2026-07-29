@@ -3158,3 +3158,112 @@ C 端 JWT 不带 memberID（只带 openid/tenant/store）。**每个 C 端接口
 - `TestMVP_EndToEnd`: B 端 建品→扫码查品→入库20→现金开单2件(扣库存20→18)→挂单3件→收款(→15)→当日流水(2单/NetCents=9950); C 端 JWT→领新人券(幂等)→券包1→档案→动态码→建拼团→列表→参团→重复参团60015→订单空。双端在同一 fixture(同一 tenant 50021/store 9)共享 catalog/inventory/billing/membership/marketing/groupbuy 状态,端到端证明 MVP 闭环。
 - `TestMVP_CrossTenant`: tenant A 建品+开单+领券后, tenant B(同 openid)商品列表空/流水0/券包空/拼团空 —— ARCH-01 串户隔离端到端证明。
 - 退出码: `go test ./interfaces/http/ -run TestMVP_ -count=1`=0(连续5次稳定)。
+
+## 17. M4-S2 增量契约（pgx 全局替换：10 域 memory→pg，2026-07-29）
+
+### 17.1 范围与目标
+把 10 个仍只有 memory 实现的域补齐 pgx 实现 + pgxmock 测试，达到 production-ready（配置 PG 后可直接切换，无需改 service/handler）。已有 pg 实现的 3 域（payment / aiengine.attribution / aiengine.bandit）**不动**。**纯加性**：不改任何域的 Repo 接口签名、不改 memory_repo.go、不改 service.go、不改 handler、不改现有 migration 000001–000013。唯一新增 migration：**000014 wx_sessions**（仅 auth 域需要，见 §17.7）。main.go 的 memory↔pg 切换装配由**主线程统一**做（§17.9），pgx agent **不碰 main.go**。
+
+### 17.2 唯一权威样板（动手前必读）
+**先完整读这两个文件，它们是本节的权威实现，本节只是其摘要**：
+- `internal/payment/pg_repo.go`（472 行，PG 实现样板）
+- `internal/payment/pg_repo_test.go`（240 行，pgxmock 测试样板）
+
+每域 pgx 实现必须**一字不差遵循**以下 idiom（全部摘自 payment 样板）：
+
+1. **PGPool 接口**（每域在本域包内定义，结构各域一致；main 用一个 `*pgxpool.Pool` 共享，它同时满足所有域的 PGPool + queryer）：
+   ```go
+   type PGPool interface {
+       QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+       Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+   }
+   // 多行读：PGPool 故意不含 Query，list 方法对 pool 做 type-assert；缺 Query 返回空 slice 而非报错
+   type queryer interface{ Query(ctx context.Context, q string, args ...any) (pgx.Rows, error) }
+   type rowScanner interface{ Scan(dest ...any) error }
+   ```
+2. **SQL 常量**：`const ( sqlXxxCreate = \`...\` ... )`，**每条读写语句的 WHERE 都带 `tenant_id = $N`**（租户行级隔离，ARCH-01）。INSERT 用 `RETURNING id` 取分配的主键。
+3. **scan helpers**：`func scanXxx(s rowScanner) (*Xxx, error)`。nullable 列用 `database/sql.NullString` / `sql.NullTime`；JSONB 列 scan 进 `[]byte`，`json.Unmarshal` 到 map/struct；枚举列 scan 进 `string` 再转本域枚举类型。
+4. **PGxxxRepo 结构**：`type PGxxxRepo struct{ pool PGPool }` + `func NewPGxxxRepo(pool PGPool) *PGxxxRepo`。
+5. **nil-pool 安全降级**（关键）：每个方法首行 `if r == nil || r.pool == nil { return ErrNotFound / 空 slice / 零值 }`——配置缺失时优雅降级，绝不 panic。写方法（Create/Update）nil pool 时按 payment 样板：要么返回 ErrNotFound，要么（如 ledger Append）返回克隆的入参作 no-op——**照该域 memory 在"无持久化"时的语义选最贴近的**。
+6. **错误映射**：`errors.Is(err, pgx.ErrNoRows) → 本域 ErrNotFound`；其他 `fmt.Errorf("domain: pg xxx: %w", err)`（保留 errors.Is/As 链）。
+7. **不连真实 DB**：所有验证用 pgxmock（见 §17.3）。
+
+### 17.3 pgxmock 测试规范（照 payment/pg_repo_test.go）
+- 文件名 `pg_repo_test.go`，**同包**（`package xxx`，非 `xxx_test`），以便引用未导出的 `sqlXxx` 常量。
+- `newMockPool(t)`：`pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))`（SQL 含正则元字符，必须等值匹配）+ `t.Cleanup(mock.Close)`。
+- **每个 repo 方法至少 2 个 case**：happy（含 RETURNING id / scan 字段往返）+ 关键 error（ErrNoRows→ErrNotFound / 跨租户不可见）。
+- 列名 helper：`func xxxColumns() []string { return []string{...} }`，顺序与 `scanXxx` 的 Scan 顺序**完全一致**——这是 pgxmock 行映射能成立的前提。
+- WithArgs 的参数值要和实现真正传给 SQL 的值**类型+顺序一致**（如 `nullTime(t)`、`int64(1)`、枚举的底层 string）。
+- **必加 `TestPGRepo_NilPoolIsSafe`**：覆盖 nil repo/nil pool 的降级返回。
+- 每个 case 末尾 `require.NoError(t, mock.ExpectationsWereMet())`。
+
+### 17.4 10 域映射表（每域 agent 的开工清单）
+| 域 | migration | 主要表 | repo 方法数 | 参考文件（必读） |
+|---|---|---|---|---|
+| auth | **新 000014** | wx_sessions | 2 | internal/auth/{consumer.go,memory_repo.go} + §17.7 |
+| billing | 000003 | orders, order_items | 7（**含本期 A2 新增 ListByMember**） | internal/billing/{billing.go,memory_repo.go} + migrations/000003 |
+| catalog | 000002 | products | 5 | internal/catalog/{catalog.go,memory_repo.go} + 000002 |
+| crm | 000006 | community_groups, wework_living_codes | 8 | internal/crm/{crm.go,memory_repo.go} + 000006 |
+| groupbuy | 000006 | groupbuys, groupbuy_participants | 9（含 M3-S3 ListByStrategy） | internal/groupbuy/{groupbuy.go,memory_repo.go} + 000006 |
+| inventory | 000002 | inventory_batches, inventory_movements | 8 | internal/inventory/{inventory.go,memory_repo.go} + 000002 |
+| marketing | 000005 | coupons, member_coupons | 10 | internal/marketing/{marketing.go,memory_repo.go} + 000005 |
+| membership | 000004 | members, member_balance_accounts, member_balance_log, member_points_log | 13（接口实际 13；另 5 是 memory 测试 helper，非接口方法） | internal/membership/{membership.go,memory_repo.go} + 000004 |
+| reach | 000006 | reach_tasks, subscribe_auth, unsubscribe_records (+ living_codes/community_groups 若 memory 操作) | 10 | internal/reach/{reach.go,memory_repo.go} + 000006 |
+| strategy | 000007 | strategies, strategy_items, strategy_feedback | 7 | internal/strategy/{strategy.go,memory_repo.go} + 000007 |
+
+> 注：crm 与 reach 共处 migration 000006，但操作**不同表**（crm=community_groups/living_codes，reach=reach_tasks/subscribe_auth/unsubscribe_records）；以各自 memory_repo 实际操作的字段为准。strategy_attribution 表归属 aiengine.attribution（已有 pg，本期不动）。
+
+### 17.5 硬约束（M4-S2 全员，违反即 reject）
+1. **接口冻结**：本域 Repo 接口签名一字不改；新 pg 实现必须满足现有接口（编译期保证）。
+2. **文件所有权**：每域只新建 `internal/<domain>/pg_repo.go` + `internal/<domain>/pg_repo_test.go`。**绝不改** memory_repo.go / service.go / handler / 其他域文件 / main.go / 现有 migration。
+3. **唯一例外**：auth 域新建 `migrations/000014_wx_sessions.{up,down}.sql`（§17.7）。
+4. **租户隔离**：每条 SQL 的 WHERE 带 tenant_id；跨租户查询返回 ErrNotFound / 空，与"不存在"不可区分。
+5. **金额 int64 分**；时间用 `time.Time` / `sql.NullTime`；不改任何 PascalCase json 输出契约。
+6. **不连真实 DB/Redis**；本机无 PG，验证只用 pgxmock。
+7. **不 git commit**（主线程统一提交）。
+
+### 17.6 DoD（每域 pgx agent）
+- `internal/<domain>/pg_repo.go` 实现该域 Repo 接口**全部**方法（含 billing 的 ListByMember）。
+- `internal/<domain>/pg_repo_test.go` 覆盖每方法 happy + error/not-found + nil-pool。
+- `cd backend && go build ./...` 通过；`go test ./internal/<domain>/ -count=1` 全绿。
+- 现有 `service_test.go` / `memory_repo_test.go` **不被破坏**（pg 实现是加性的，service 仍测 memory）。
+
+### 17.7 auth 新增 migration 000014（唯一新表）
+auth 的 ConsumerRepo 当前无表（memory only）。新建 `migrations/000014_wx_sessions.up.sql` + `.down.sql`，表结构对齐 `auth.Consumer`：
+```sql
+CREATE TABLE wx_sessions (
+  id           BIGSERIAL PRIMARY KEY,
+  tenant_id    BIGINT      NOT NULL,
+  openid       TEXT        NOT NULL,
+  unionid      TEXT        NOT NULL DEFAULT '',
+  member_id    BIGINT      NOT NULL DEFAULT 0,
+  session_key  TEXT        NOT NULL DEFAULT '',   -- SERVER-SIDE ONLY
+  version      BIGINT      NOT NULL DEFAULT 0,    -- token version
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, openid)
+);
+CREATE INDEX idx_wx_sessions_tenant_openid ON wx_sessions (tenant_id, openid);
+-- down: DROP TABLE IF EXISTS wx_sessions;
+```
+`PGConsumerRepo.UpsertByOpenID` = `INSERT ... ON CONFLICT (tenant_id, openid) DO UPDATE SET session_key=EXCLUDED.session_key, unionid=EXCLUDED.unionid, updated_at=now() RETURNING *`（等价 memory 的 upsert 语义）；`GetByID` = `SELECT ... WHERE tenant_id=$1 AND id=$2`。MemberID 在 auth 层先留 0（membership Join 时回填属另一期，本期不实现跨域回填）。
+
+### 17.8 显式延后（不在 M4-S2）
+- 真实 PG / Redis 接入联调（仍 pgxmock）。
+- membership.Join 时回填 wx_sessions.member_id 的跨域写。
+- main.go 切换装配后的端到端真 PG 冒烟。
+- consumer-mp 前端 pg 相关改造（无，前端只认 HTTP 契约）。
+
+### 17.9 集成（主线程，全部 10 域 pgx agent 收尾后）
+- main.go 加 memory↔pg 切换：当 `database`（`*db.DB`，boot 时 `db.New` 返回）非 nil 且 Ping 通过时，各域用 `NewPGXxxRepo(database.Pool())`，否则 fallback 现有 `NewMemoryXxxRepo()`（dev 无 PG 行为不变）。
+- 切换点集中在 main.go 现有 repo 装配段（约 128–262 行），逐域 `if database != nil { pg } else { mem }`。
+- 验证：`go build ./...` + `go test -race ./... -count=1` 全绿（含 m4s1/m3s3/mvp 冒烟）；pgxmock 测试随各自包一起跑。
+
+### 17.10 集成落地（2026-07-29，主线程收尾）
+- **main.go 切换装配完成**：`cmd/api/main.go` 的 15 个 repo 装配点（本期 10 新 pgx 域 + payment 3 + attribution/bandit 2）改为 `var x <域接口> = NewMemoryXxx(); if database != nil { x = NewPGXxx(database.Pool()) }`；`*pgxpool.Pool` 隐式满足各域 `PGPool`+`queryer`。**dev 无 PG（database nil）行为不变**（全走 memory）；配置 PG 后整链路切 pg。subscription 保持 memory（无 pg 实现）。
+- **两个新 migration**：000014 wx_sessions（auth，§17.7）+ **000015 orders.payment_ref**（M4-S1 给 `Order.PaymentRef` 加了领域字段但当时 billing 全 memory、无人补 DB 列；pgx 化 billing 暴露此 schema gap，pgxmock 不校验 schema 故测试不可见，必须由主线程补列）。
+- **方法数校正**（§17.4 已回填实际接口方法数）：membership 13（非 18，另 5 是 memory 测试 helper）、strategy 7（非 8）、groupbuy 9（非 10）。
+- **验证**：`go build ./...` 通过；`go test -race ./...` **40 包全绿**（含 MVP 冒烟 TestMVP_EndToEnd/CrossTenant、10 域 pgxmock pg_repo_test、现有 memory/service 测试、aiengine 3 个日期测试 A1 已修）。
+- **pgx 实现亮点**：跨表原子（inventory `ConsumeFIFOAtomic`、membership `Redeem`/`recharge`、groupbuy `JoinAtomic`）用各域包内本地 `txBeginner` interface（领域包不耦合 pkg/db）+ 条件 UPDATE / `SELECT...FOR UPDATE`；并发原子（payment `MarkSuccess`、marketing 配额自增、reach 订阅计数、billing 状态机）用条件 UPDATE 的 `ErrNoRows` 检测；哨兵优先级严格对齐 memory；nil-pool 安全降级（审计写返回 nil 对齐 memory "审计不可失败"语义）；显式 RETURNING 列（非 `*`，对齐 payment 样板 + 兼容 pgxmock）。
+- **固有特性（非 bug，已记录）**：JSONB 数字经 `map[string]any` 往返 int64→float64（strategy 测试记录）；memory↔pg 切换时这是固有不对称，真接 PG 时下游需注意。
+- **显式延后**（仍不在本期）：真 PG/Redis 联调（验证均 pgxmock）；membership.Join 回填 wx_sessions.member_id；切换后真 PG 端到端冒烟。

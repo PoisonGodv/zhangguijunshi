@@ -120,30 +120,49 @@ func run() error {
 		if cfg.WX.Timeout > 0 {
 			wxOpts = append(wxOpts, wxsdk.WithTimeout(cfg.WX.Timeout))
 		}
+		var consumerRepo auth.ConsumerRepo = auth.NewMemoryConsumerRepo()
+		if database != nil {
+			consumerRepo = auth.NewPGConsumerRepo(database.Pool())
+		}
 		authSvc = auth.New(auth.Config{
 			AppID:      cfg.WX.AppID,
 			Secret:     cfg.WX.Secret,
 			AccessTTL:  cfg.JWT.AccessTTL,
 			RefreshTTL: cfg.JWT.RefreshTTL,
-		}, wxsdk.New(wxOpts...), jwtMgr, store, auth.NewMemoryConsumerRepo())
+		}, wxsdk.New(wxOpts...), jwtMgr, store, consumerRepo)
 	}
 
 	// M1-S1 domain services (CONTRACT §8). Repositories are in-memory until
 	// PostgreSQL is wired (the services depend only on the repo interfaces, so a
 	// pgx implementation drops in later without touching the HTTP layer).
-	catalogRepo := catalog.NewMemoryProductRepo()
+	var catalogRepo catalog.ProductRepo = catalog.NewMemoryProductRepo()
+	if database != nil {
+		catalogRepo = catalog.NewPGProductRepo(database.Pool())
+	}
 	catalogSvc := catalog.NewService(catalogRepo)
 
 	// M1-S2 domain services (CONTRACT §9). Inventory enforces product-tenant
 	// ownership through the catalog adapter; billing consumes stock FIFO after a
 	// committed sale; membership issues/validates dynamic member codes.
-	inventorySvc := inventory.New(inventory.NewMemoryBatchRepo(), catalogProductLookuper{catalogSvc})
+	var inventoryBatchRepo inventory.BatchRepo = inventory.NewMemoryBatchRepo()
+	if database != nil {
+		inventoryBatchRepo = inventory.NewPGBatchRepo(database.Pool())
+	}
+	inventorySvc := inventory.New(inventoryBatchRepo, catalogProductLookuper{catalogSvc})
+	var billingOrderRepo billing.OrderRepo = billing.NewMemoryOrderRepo()
+	if database != nil {
+		billingOrderRepo = billing.NewPGOrderRepo(database.Pool())
+	}
 	billingSvc := billing.New(
-		billing.NewMemoryOrderRepo(),
+		billingOrderRepo,
 		catalogPricer{catalogSvc},
 		billing.WithStockConsumer(inventoryStockConsumer{inventorySvc}),
 	)
-	membershipSvc := membership.New(membership.NewMemoryMemberRepo(), membership.NewMemoryMemberCoder(nil))
+	var membershipMemberRepo membership.MemberRepo = membership.NewMemoryMemberRepo()
+	if database != nil {
+		membershipMemberRepo = membership.NewPGMemberRepo(database.Pool())
+	}
+	membershipSvc := membership.New(membershipMemberRepo, membership.NewMemoryMemberCoder(nil))
 
 	// M2-S1 domain services (CONTRACT §10). Marketing depends on the
 	// membership (member existence) and margin (gross-margin rail) anti-
@@ -151,8 +170,12 @@ func run() error {
 	// fetches the tenant's products from catalog and rejects any coupon that
 	// would drop a product below the floor; an empty catalog yields no
 	// validation (best-effort).
+	var marketingCouponRepo marketing.CouponRepo = marketing.NewMemoryCouponRepo()
+	if database != nil {
+		marketingCouponRepo = marketing.NewPGCouponRepo(database.Pool())
+	}
 	marketingSvc := marketing.New(
-		marketing.NewMemoryCouponRepo(),
+		marketingCouponRepo,
 		marketing.WithMemberLookuper(membershipLookuper{membershipSvc}),
 		marketing.WithMarginGuard(catalogMarginGuard{
 			guard:      margin.Guard{MarginFloorPct: defaultMarginFloorPct},
@@ -167,17 +190,29 @@ func run() error {
 	// Groupbuy reuses the membership lookuper; crm is standalone.
 	freqSvc := freqcircuit.New()
 	contentFilter := contentfilter.New()
+	var reachRepo reach.ReachRepo = reach.NewMemoryReachRepo()
+	if database != nil {
+		reachRepo = reach.NewPGReachRepo(database.Pool())
+	}
 	reachSvc := reach.New(
-		reach.NewMemoryReachRepo(),
+		reachRepo,
 		reach.WithSender(reach.NewMemorySender()),
 		reach.WithFreqGate(freqGateAdapter{freqSvc}),
 		reach.WithContentFilter(cfFilterAdapter{contentFilter}),
 	)
+	var groupbuyRepo groupbuy.GroupbuyRepo = groupbuy.NewMemoryGroupbuyRepo()
+	if database != nil {
+		groupbuyRepo = groupbuy.NewPGGroupbuyRepo(database.Pool())
+	}
 	groupbuySvc := groupbuy.New(
-		groupbuy.NewMemoryGroupbuyRepo(),
+		groupbuyRepo,
 		groupbuy.WithMemberLookuper(membershipLookuper{membershipSvc}),
 	)
-	crmSvc := crm.New(crm.NewMemoryRepo())
+	var crmRepo crm.Repo = crm.NewMemoryRepo()
+	if database != nil {
+		crmRepo = crm.NewPGRepo(database.Pool())
+	}
+	crmSvc := crm.New(crmRepo)
 
 	// M3-S1 AI engine (CONTRACT §12). Five-stage pipeline + ActionExecutor.
 	// gateway.NewFromConfig builds a placeholder (empty-providers) gateway when
@@ -187,7 +222,11 @@ func run() error {
 	// both rule and exec so the three defense-in-depth checks share one source.
 	gw, _ := gateway.NewFromConfig(cfg.AI)
 	emb := gateway.NewEmbedderFromConfig(cfg.AI)
-	strategySvc := strategy.New(strategy.NewMemoryStrategyRepo())
+	var strategyRepo strategy.StrategyRepo = strategy.NewMemoryStrategyRepo()
+	if database != nil {
+		strategyRepo = strategy.NewPGStrategyRepo(database.Pool())
+	}
+	strategySvc := strategy.New(strategyRepo)
 	cacheL1 := cache.NewMemoryCache()
 	semCache := semantic.NewMemoryCache(emb)
 	signalCollector := aisignal.NewCollector("fruit", "", signalLookuperAdapter{
@@ -203,7 +242,10 @@ func run() error {
 	// groupbuy_success is attributed back by strategy_id, §14.9). A nil
 	// rewardSource/itemResolver would disable crediting; here we wire
 	// them so the 02:00 BanditUpdate cron credits real rewards.
-	attrRepo := attribution.NewMemoryRepo()
+	var attrRepo attribution.Repo = attribution.NewMemoryRepo()
+	if database != nil {
+		attrRepo = attribution.NewPGRepo(database.Pool())
+	}
 	attrComputer := attribution.NewComputer(
 		attribution.Sources{
 			Coupons:    couponStatsAdapter{marketingSvc},
@@ -213,7 +255,10 @@ func run() error {
 		},
 		itemLoaderAdapter{strategySvc},
 	)
-	banditRepo := bandit.NewMemoryRepo()
+	var banditRepo bandit.Repo = bandit.NewMemoryRepo()
+	if database != nil {
+		banditRepo = bandit.NewPGRepo(database.Pool())
+	}
 	banditLearner := bandit.NewLearner(banditRepo, bandit.DefaultConfig(),
 		bandit.WithRewardSource(attrComputer),
 		bandit.WithItemResolver(itemResolverAdapter{strategySvc}),
@@ -256,10 +301,21 @@ func run() error {
 	// the Memory repos with PG repos once PG + wx credentials are configured.
 	fakeWxPay := payment.NewFakeWxPay()
 	subscriptionSvc := subscription.NewService(subscription.NewMemoryStore())
+	var (
+		paySubMerchantRepo payment.SubMerchantRepo = payment.NewMemorySubMerchantRepo()
+		payPaymentRepo     payment.PaymentRepo     = payment.NewMemoryPaymentRepo()
+		payLedgerRepo      payment.LedgerRepo      = payment.NewMemoryLedgerRepo()
+	)
+	if database != nil {
+		pool := database.Pool()
+		paySubMerchantRepo = payment.NewPGSubMerchantRepo(pool)
+		payPaymentRepo = payment.NewPGPaymentRepo(pool)
+		payLedgerRepo = payment.NewPGLedgerRepo(pool)
+	}
 	paymentSvc := payment.NewService(
-		payment.NewMemorySubMerchantRepo(),
-		payment.NewMemoryPaymentRepo(),
-		payment.NewMemoryLedgerRepo(),
+		paySubMerchantRepo,
+		payPaymentRepo,
+		payLedgerRepo,
 		payment.WithApplier(fakeWxPay),
 		payment.WithPreparer(fakeWxPay),
 		payment.WithNotifyParser(fakeWxPay),

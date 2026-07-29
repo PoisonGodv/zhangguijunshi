@@ -9,6 +9,7 @@ package billing
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,6 +73,30 @@ func (r *MemoryOrderRepo) ListByDate(_ context.Context, tenantID, storeID int64,
 			out = append(out, cloneOrder(o))
 		}
 	}
+	return out, nil
+}
+
+// ListByMember implements OrderRepo. It returns every order owned by
+// (tenantID, memberID) — walk-in orders (MemberID=0) never match — as defensive
+// copies ordered by created_at DESC then id DESC. Cross-tenant orders are
+// skipped. The result is always a non-nil slice (empty when no match).
+func (r *MemoryOrderRepo) ListByMember(_ context.Context, tenantID, memberID int64) ([]*Order, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]*Order, 0)
+	for _, o := range r.byID {
+		if o.TenantID != tenantID || o.MemberID != memberID {
+			continue
+		}
+		out = append(out, cloneOrder(o))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
 	return out, nil
 }
 
