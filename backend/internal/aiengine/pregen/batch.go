@@ -11,14 +11,18 @@ import (
 
 // BatchGenerate pre-generates today's advice for every active tenant (§7.7.2).
 // Tenants are processed in batches of batchSize (default 50) with at most
-// `workers` (default 8) concurrent pipeline runs. Each tenant retries up to
-// len(backoffs) times on failure (default ≤3, exponential 1s/2s/4s).
+// `workers` (default 8) concurrent pipeline runs. Each tenant's run retries up
+// to len(backoffs) times on failure (default ≤3, exponential 1s/2s/4s). When a
+// StoreEnumerator is wired, each tenant runs the pipeline PER STORE (StoreID
+// injected into ctx); otherwise it falls back to a single storeID=0 run.
 //
-// Returns (processed, err): processed is the count of tenants whose Advice
-// landed in both caches; err is non-nil if any tenant exhausted its retries —
-// the batch still completes, because one tenant's failure must NOT abort the
-// rest (§7.7.4 "保证白天打开 App 有建议"). An empty ActiveTenantIDs result
-// returns (0, nil) — no tenants is not an error (CONTRACT §13.5.8).
+// Returns (processed, err): processed is the count of per-store runs whose
+// Advice landed in both caches (with no StoreEnumerator this equals the tenant
+// count, since each tenant is one storeID=0 run); err is non-nil if any run
+// exhausted its retries — the batch still completes, because one tenant's/store's
+// failure must NOT abort the rest (§7.7.4 "保证白天打开 App 有建议"). An empty
+// ActiveTenantIDs result returns (0, nil) — no tenants is not an error
+// (CONTRACT §13.5.8).
 func (s *Scheduler) BatchGenerate(ctx context.Context) (int, error) {
 	if s.repo == nil {
 		return 0, fmt.Errorf("pregen: tenant enumerator not configured")
@@ -44,13 +48,14 @@ func (s *Scheduler) BatchGenerate(ctx context.Context) (int, error) {
 		for _, tid := range batch {
 			tid := tid
 			grp.Go(func() error {
-				if rerr := s.runWithRetry(gctx, tid); rerr != nil {
-					atomic.AddInt64(&failed, 1)
+				p, f := s.runTenantStores(gctx, tid, s.runWithRetry)
+				atomic.AddInt64(&processed, int64(p))
+				if f > 0 {
+					atomic.AddInt64(&failed, int64(f))
 					s.log.Warn("pregen tenant exhausted retries",
-						zap.Int64("tenant_id", tid), zap.Error(rerr))
-					return nil
+						zap.Int64("tenant_id", tid),
+						zap.Int("failed_stores", f))
 				}
-				atomic.AddInt64(&processed, 1)
 				return nil
 			})
 		}

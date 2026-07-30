@@ -130,6 +130,60 @@ func TestPGReachRepo_UpdateTaskStatusNotFound(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPGReachRepo_UpdateTask(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGReachRepo(mock)
+	// Worker finalizing the pending row: status="sent", blockedReason="" (NULLIF →
+	// NULL), sentAt=fixedTime (non-zero → overwrite), target_count=1. Args order
+	// matches sqlReachTaskUpdate: status, blockedReason, sentAtArg, target_count,
+	// tenant, id.
+	mock.ExpectQuery(sqlReachTaskUpdate).
+		WithArgs(StatusSent, "", fixedTime, 1, int64(1), int64(5)).
+		WillReturnRows(pgxmock.NewRows(taskColumns()).AddRow(
+			int64(5), int64(1), int64(10), ChannelWeworkOneV, TplRecall30, 1, "sent", nil, int64(7), fixedTime, fixedTime, fixedTime,
+		))
+	got, err := repo.UpdateTask(context.Background(), &ReachTask{
+		ID: 5, TenantID: 1, TargetCount: 1, Status: StatusSent, SentAt: fixedTime,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(5), got.ID)
+	require.Equal(t, StatusSent, got.Status)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGReachRepo_UpdateTaskZeroSentAtKeepsPrevious(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGReachRepo(mock)
+	// Zero SentAt → NULL arg (COALESCE keeps stored sent_at), e.g. a block.
+	mock.ExpectQuery(sqlReachTaskUpdate).
+		WithArgs(StatusBlocked, BlockContentFilter, nil, 1, int64(1), int64(5)).
+		WillReturnRows(pgxmock.NewRows(taskColumns()).AddRow(
+			int64(5), int64(1), int64(10), ChannelWeworkOneV, TplRecall30, 1, "blocked", BlockContentFilter, int64(7), fixedTime, nil, fixedTime,
+		))
+	got, err := repo.UpdateTask(context.Background(), &ReachTask{
+		ID: 5, TenantID: 1, TargetCount: 1, Status: StatusBlocked, BlockedReason: BlockContentFilter,
+	})
+	require.NoError(t, err)
+	require.Equal(t, StatusBlocked, got.Status)
+	require.Equal(t, BlockContentFilter, got.BlockedReason)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGReachRepo_UpdateTaskNotFound(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGReachRepo(mock)
+	// No row matches (tenant_id + id) → ErrNoRows → ErrNotFound (cross-tenant or
+	// absent are indistinguishable).
+	mock.ExpectQuery(sqlReachTaskUpdate).
+		WithArgs(StatusSent, "", nil, 1, int64(1), int64(99)).
+		WillReturnError(pgx.ErrNoRows)
+	_, err := repo.UpdateTask(context.Background(), &ReachTask{
+		ID: 99, TenantID: 1, TargetCount: 1, Status: StatusSent,
+	})
+	require.ErrorIs(t, err, ErrNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPGReachRepo_GrantSubscribeNew(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGReachRepo(mock)
@@ -281,6 +335,9 @@ func TestPGRepo_NilPoolIsSafe(t *testing.T) {
 	require.Empty(t, out)
 
 	_, err = repo.UpdateTaskStatus(context.Background(), 1, 1, StatusSent, "", fixedTime)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	_, err = repo.UpdateTask(context.Background(), &ReachTask{ID: 1, TenantID: 1, Status: StatusSent})
 	require.ErrorIs(t, err, ErrNotFound)
 
 	_, err = repo.GrantSubscribe(context.Background(), 1, 1, "t", 1, fixedTime)

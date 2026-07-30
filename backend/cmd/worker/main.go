@@ -202,10 +202,13 @@ func (d *dispatcher) handleReachDueSend(ctx context.Context, job jobqueue.Job) e
 		TenantID: job.TenantID,
 		Source:   multitenancy.SourceSystem, // background job, not a user request
 	})
-	// A compliance-blocked send returns (task, nil) — NOT an error — so it is
-	// ACKed. Only a real system failure (tenant/render/repo) returns err and is
-	// redelivered.
-	_, err := d.svc.Reach.Send(tctx, in)
+	// Finalize the pending ReachTask row that was persisted at enqueue time
+	// (payload.TaskID > 0) so delivery UPDATES that row instead of inserting a
+	// duplicate; legacy jobs enqueued before that field existed carry TaskID==0
+	// and fall back to creating a fresh row. A compliance-blocked send returns
+	// (task, nil) — NOT an error — so it is ACKed. Only a real system failure
+	// (tenant/render/repo) returns err and is redelivered.
+	_, err := d.svc.Reach.SendFinalize(tctx, in, payload.TaskID)
 	return err
 }
 

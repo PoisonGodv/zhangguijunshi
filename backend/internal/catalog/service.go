@@ -173,6 +173,43 @@ func (s *Service) List(ctx context.Context, f ProductFilter) ([]*Product, error)
 	return products, nil
 }
 
+// UpdateTags replaces a product's BE-A-09 tag set (临期/滞销/高毛利) within the
+// ctx tenant and returns the updated record. It touches ONLY the tags column —
+// never price/cost/name — so it cannot trip the pricing rule or the uniqueness
+// indexes. Cross-tenant / unknown -> ErrNotFound; no tenant in ctx -> ErrNoTenant.
+func (s *Service) UpdateTags(ctx context.Context, productID int64, tags []string) (*Product, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.repo.UpdateTags(ctx, tenantID, productID, tags)
+	if err != nil {
+		return nil, mapRepoErr(err)
+	}
+	return p, nil
+}
+
+// SetProductTags writes a computed tag set onto one product. It satisfies
+// dataquality.TagWriter, so catalog.Service can be handed straight to the BE-A-09
+// tagging step with no adapter. Per ARCH-01 the tenant is resolved from ctx (the
+// cron injects it via multitenancy.WithContext); the explicit tenantID is the
+// port's contract and is asserted to match the ctx tenant so a mismatched caller
+// fails closed with ErrNotFound (tenantID==0 defers entirely to ctx).
+func (s *Service) SetProductTags(ctx context.Context, tenantID, productID int64, tags []string) error {
+	ctxTenant, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return err
+	}
+	if tenantID != 0 && tenantID != ctxTenant {
+		return ErrNotFound
+	}
+	_, err = s.repo.UpdateTags(ctx, ctxTenant, productID, tags)
+	if err != nil {
+		return mapRepoErr(err)
+	}
+	return nil
+}
+
 // mapRepoErr translates repository errors into errcode sentinels. ErrNotFound is
 // passed through so the HTTP layer can emit 404; a uniqueness conflict becomes
 // ErrParam; anything else is an internal error.

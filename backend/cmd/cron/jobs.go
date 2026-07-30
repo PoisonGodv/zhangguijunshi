@@ -41,13 +41,35 @@ type jobs struct {
 	svc *bootstrap.Services
 	log *zap.Logger
 	now func() time.Time
+
+	// BE-A-08/BE-A-09 persistence (migration 000019). dailySales lands the fused
+	// per-product daily sales; tagWriter writes the computed tags back onto the
+	// product. Both are wired in registerJobs from svc and nil-guarded in
+	// dataqualityTenant, so the job degrades to a clean compute+log pass when
+	// either is unset.
+	dailySales dataquality.SalesRepo
+	tagWriter  dataquality.TagWriter
 }
 
 // registerJobs wires the 3 non-pregen jobs onto c, logging each registration and
 // returning the first AddFunc error (the specs are hard-coded + valid, so an
 // error is effectively impossible — the path is kept for contract fidelity).
 func registerJobs(c *cron.Cron, svc *bootstrap.Services, log *zap.Logger) error {
-	j := &jobs{svc: svc, log: log, now: time.Now}
+	// BE-A-08 fused daily-sales persistence: PG when a database is wired, else
+	// the in-memory repo (dev). Mirrors bootstrap's memory↔pg repo convention so
+	// the cron binary is self-sufficient (no extra Services field required).
+	var salesRepo dataquality.SalesRepo = dataquality.NewMemorySalesRepo()
+	if svc != nil && svc.DB != nil {
+		salesRepo = dataquality.NewPGSalesRepo(svc.DB.Pool())
+	}
+	// BE-A-09 tag write-back: catalogSvc satisfies dataquality.TagWriter directly
+	// (its SetProductTags method), so no adapter is needed.
+	var tagWriter dataquality.TagWriter
+	if svc != nil && svc.Catalog != nil {
+		tagWriter = svc.Catalog
+	}
+
+	j := &jobs{svc: svc, log: log, now: time.Now, dailySales: salesRepo, tagWriter: tagWriter}
 
 	specs := []struct {
 		spec, name string
@@ -126,10 +148,12 @@ func (j *jobs) subscriptionExpireDue() {
 
 // ---- dataquality ("0 1 * * *") — BE-A-08 销售反推 + BE-A-09 标签 --------------
 //
-// BEST-EFFORT SCOPE: this job COMPUTES and LOGS the fused per-product daily
-// sales and the per-product tags. Persisting the fused daily-sales rows and the
-// computed tags back onto the product (and feeding them to the AI pipeline) is a
-// documented FOLLOW-UP — see the TODO notes in dataqualityTenant.
+// SCOPE: this job COMPUTES the fused per-product daily sales and the per-product
+// tags, then PERSISTS both: the fused sales land in daily_product_sales
+// (migration 000019) via SalesRepo, and the computed tags are written back onto
+// the product via TagWriter (catalog.Service). Feeding the persisted results to
+// the AI pipeline is a documented FOLLOW-UP. When either persistence dep is nil
+// the job degrades to compute+log only.
 
 func (j *jobs) dataquality() {
 	if j.svc == nil || j.svc.Inventory == nil || j.svc.Catalog == nil || j.svc.Tenants == nil {
@@ -163,10 +187,22 @@ func (j *jobs) dataqualityTenant(tctx context.Context, tenantID int64, day, now 
 		j.log.Info("dataquality: daily sales (BE-A-08)",
 			zap.Int64("tenant_id", tenantID),
 			zap.String("day", day.Format("2006-01-02")),
-			zap.Int("products", len(sales)),
-			zap.Any("sales", sales))
-		// FOLLOW-UP (persistence): write `sales` into the fused daily-sales
-		// store (one of the three BE-A-08 sources) once that table/repo lands.
+			zap.Int("products", len(sales)))
+		// Persist the fused daily sales (migration 000019). The upsert is
+		// idempotent on the unique (tenant, store, product, date) cell, so
+		// re-running a day overwrites rather than duplicates.
+		if j.dailySales != nil {
+			n, uerr := j.dailySales.UpsertDailySales(tctx, tenantID, 0, day, sales)
+			if uerr != nil {
+				j.log.Warn("dataquality: persist daily sales failed",
+					zap.Int64("tenant_id", tenantID), zap.Error(uerr))
+			} else {
+				j.log.Info("dataquality: daily sales persisted (BE-A-08)",
+					zap.Int64("tenant_id", tenantID),
+					zap.String("day", day.Format("2006-01-02")),
+					zap.Int("rows", n))
+			}
+		}
 	}
 
 	// BE-A-09 标签标记: compute 临期/滞销/高毛利 tags for each product.
@@ -178,19 +214,36 @@ func (j *jobs) dataqualityTenant(tctx context.Context, tenantID int64, day, now 
 	}
 	rule := dataquality.TagRule{NearingDays: 3, StaleDays: 30, HighMarginMinPct: 40}
 	tagged := 0
+	written := 0
 	for _, p := range products {
 		view := dataquality.TagProductView{
 			ProductID:     int(p.ID),
 			CostCents:     p.CostCents,
 			PriceCents:    p.PriceCents,
 			ShelfLifeDays: p.ShelfLifeDays,
-			// FOLLOW-UP (accuracy): DaysSinceLastSale should come from the fused
-			// daily-sales (BE-A-08) once persisted; EarliestExpiry should come
-			// from inventory.ListNearingBatches / the soonest active batch. Both
-			// are left at their zero values here (0 / nil) so 滞销 and 临期 do not
-			// fire spuriously — only the pure 高毛利 tag is meaningful today.
-			DaysSinceLastSale: 0,
-			EarliestExpiry:    nil,
+			// LIMITATION (documented, CONTRACT §9.3): EarliestExpiry stays nil.
+			// inventory.ListNearingBatches is per-store and returns nothing for
+			// the whole-tenant storeID=0 sweep, so a per-product earliest expiry
+			// is not cheaply available here. 临期 tagging awaits a whole-tenant
+			// batch-listing port; today only 滞销/高毛利 are meaningful.
+			EarliestExpiry: nil,
+		}
+		// DaysSinceLastSale comes from the freshly-persisted fused daily sales
+		// (BE-A-08): the product's most recent sale_date. A product with no
+		// recorded sale keeps DaysSinceLastSale=0 so 滞销 does NOT fire
+		// spuriously on products we simply have no sales history for yet.
+		if j.dailySales != nil {
+			last, ok, lerr := j.dailySales.LastSaleDate(tctx, tenantID, 0, p.ID)
+			if lerr != nil {
+				j.log.Warn("dataquality: last sale date failed",
+					zap.Int64("tenant_id", tenantID), zap.Int64("product_id", p.ID), zap.Error(lerr))
+			} else if ok {
+				days := int(now.Sub(last).Hours() / 24)
+				if days < 0 {
+					days = 0
+				}
+				view.DaysSinceLastSale = days
+			}
 		}
 		tags := dataquality.ComputeTags(view, rule, now)
 		if len(tags) == 0 {
@@ -201,13 +254,39 @@ func (j *jobs) dataqualityTenant(tctx context.Context, tenantID int64, day, now 
 			zap.Int64("tenant_id", tenantID),
 			zap.Int64("product_id", p.ID),
 			zap.Strings("tags", tags))
-		// FOLLOW-UP (persistence): write `tags` onto the product once the tag
-		// write-back path lands.
+		// Write the tags back onto the product only when the set actually
+		// changed, so an unchanged product is not re-written (and its updated_at
+		// re-stamped) on every sweep.
+		if j.tagWriter != nil && !tagsEqual(p.Tags, tags) {
+			if werr := j.tagWriter.SetProductTags(tctx, tenantID, p.ID, tags); werr != nil {
+				j.log.Warn("dataquality: set product tags failed",
+					zap.Int64("tenant_id", tenantID), zap.Int64("product_id", p.ID), zap.Error(werr))
+			} else {
+				written++
+			}
+		}
 	}
 	j.log.Info("dataquality: tenant done",
 		zap.Int64("tenant_id", tenantID),
 		zap.Int("products", len(products)),
-		zap.Int("tagged", tagged))
+		zap.Int("tagged", tagged),
+		zap.Int("tags_written", written))
+}
+
+// tagsEqual reports whether two tag sets are identical. The comparison is
+// order-sensitive on purpose: dataquality.ComputeTags returns tags in a fixed
+// canonical order, so a plain element-wise compare also detects (and lets the
+// job normalise) any out-of-order / stale stored set.
+func tagsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- SalesReverser adapter over inventory -----------------------------------

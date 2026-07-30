@@ -213,3 +213,24 @@ func (r *MemoryProductRepo) List(_ context.Context, tenantID int64, f ProductFil
 	}
 	return matched, nil
 }
+
+// UpdateTags implements ProductRepo. It replaces ONLY the tag set of the product
+// addressed by productID within tenantID (BE-A-09 write-back), leaving every
+// other field — and the uniqueness indexes — untouched. ErrNotFound if the
+// product is absent or owned by another tenant. The stored tags are a defensive
+// copy so the caller can never mutate them through the passed slice.
+func (r *MemoryProductRepo) UpdateTags(_ context.Context, tenantID, productID int64, tags []string) (*Product, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	old, ok := r.byID[productID]
+	if !ok || old.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+
+	c := clone(old)
+	c.Tags = append([]string(nil), tags...)
+	c.UpdatedAt = time.Now()
+	r.byID[productID] = c
+	return clone(c), nil
+}

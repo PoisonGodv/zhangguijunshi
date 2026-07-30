@@ -52,11 +52,26 @@ type TenantEnumerator interface {
 	ActiveTenantIDs(ctx context.Context) ([]int64, error)
 }
 
+// StoreEnumerator is the anti-corruption port for "all active store ids of one
+// tenant". The main thread adapts the real store repository/service to it; tests
+// inject a fake. Wiring it (WithStoreEnumerator) makes pregen run the pipeline
+// PER STORE with StoreID injected into ctx — required because the strategy
+// domain rejects StoreID==0, and pipeline.Run reads storeID from
+// multitenancy.Context.StoreID. A nil StoreEnumerator preserves the legacy
+// single-run-with-storeID=0 behaviour so M3-S2/S3 callers stay
+// backward-compatible (dev / no-store tenants).
+type StoreEnumerator interface {
+	ActiveStoreIDs(ctx context.Context, tenantID int64) ([]int64, error)
+}
+
 // IncrementalJob is one unit of daytime re-compute work (§7.7.3). Reason is
 // inventory_change|weather_change|manual_refresh|holiday_rollover and is for
-// observability only.
+// observability only. StoreID scopes the refresh: 0 = re-run every active store
+// of the tenant (or the legacy storeID=0 run when no StoreEnumerator is wired);
+// >0 = a targeted single-store refresh that runs ONLY that store.
 type IncrementalJob struct {
 	TenantID int64
+	StoreID  int64
 	Reason   string
 }
 
@@ -87,10 +102,13 @@ type Scheduler struct {
 	ch       cache.Cache
 	sem      semantic.SemanticCache
 	repo     TenantEnumerator
-	log      *zap.Logger
-	cron     *cron.Cron
-	incr     chan IncrementalJob
-	now      func() time.Time
+	// storeEnum resolves a tenant's active stores so pregen runs the pipeline
+	// per store (with StoreID in ctx). nil = legacy single-run storeID=0.
+	storeEnum StoreEnumerator
+	log       *zap.Logger
+	cron      *cron.Cron
+	incr      chan IncrementalJob
+	now       func() time.Time
 
 	// M3-S3 attribution-backfill + bandit-update (CONTRACT §14.7). All four are
 	// nil-safe: a nil on any path makes the corresponding cron a clean no-op so
@@ -176,6 +194,16 @@ func WithLocation(loc *time.Location) Option {
 		if loc != nil {
 			s.location = loc
 		}
+	}
+}
+
+// WithStoreEnumerator wires the per-tenant store enumerator (enables per-store
+// pre-generation with StoreID injected into ctx). nil (or omitting this option)
+// preserves the legacy behaviour — a single run per tenant with storeID=0 — so
+// M3-S2/S3 callers and dev/no-store tenants stay backward-compatible.
+func WithStoreEnumerator(e StoreEnumerator) Option {
+	return func(s *Scheduler) {
+		s.storeEnum = e
 	}
 }
 

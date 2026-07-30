@@ -27,6 +27,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/internal/payment"
 	"github.com/zhangguijunshi/backend/internal/reach"
+	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/internal/subscription"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
@@ -35,6 +36,37 @@ import (
 // defaultMarginFloorPct is the gross-margin floor (10%) the marketing margin
 // guard enforces on coupon issuance.
 const defaultMarginFloorPct = 10
+
+// ---- store ↔ pregen (M6 ①: per-store pregen resolution) ----
+
+// storeEnumeratorAdapter adapts store.Service onto pregen's StoreEnumerator port
+// so the pregen scheduler runs the pipeline once per active store instead of a
+// single storeID=0 run that the strategy domain rejects (CONTRACT §20 / M6 ①).
+// store.Service.ListStores resolves the tenant from ctx, so the adapter injects
+// a system-source tenant context before calling. A nil svc yields no stores,
+// which makes the scheduler fall back to its legacy single storeID=0 run.
+type storeEnumeratorAdapter struct{ svc *store.Service }
+
+func (a storeEnumeratorAdapter) ActiveStoreIDs(ctx context.Context, tenantID int64) ([]int64, error) {
+	if a.svc == nil {
+		return nil, nil
+	}
+	tctx := multitenancy.WithContext(ctx, multitenancy.Context{
+		TenantID: tenantID,
+		Source:   multitenancy.SourceSystem,
+	})
+	stores, err := a.svc.ListStores(tctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0, len(stores))
+	for _, st := range stores {
+		ids = append(ids, st.ID)
+	}
+	return ids, nil
+}
+
+var _ pregen.StoreEnumerator = storeEnumeratorAdapter{}
 
 // ---- catalog ↔ billing / inventory / marketing / margin ----
 

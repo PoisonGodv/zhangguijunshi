@@ -42,8 +42,16 @@ func (s *Service) Render(in RenderInput) (Rendered, error) {
 	return Render(in)
 }
 
-// Send runs the full reach pipeline for one attempt. Guard order is FIXED
-// (CONTRACT §11.3.2 / §11.5.6 — do not reorder):
+// Send runs the full reach pipeline for one attempt and persists a NEW audit
+// row. It is the user/merchant-facing entry point and is exactly
+// SendFinalize(ctx, in, 0). See SendFinalize for the fixed guard order and the
+// (task, nil)-on-block vs (nil, err)-on-failure contract.
+func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
+	return s.SendFinalize(ctx, in, 0)
+}
+
+// SendFinalize runs the full reach pipeline for one attempt. Guard order is
+// FIXED (CONTRACT §11.3.2 / §11.5.6 — do not reorder):
 //
 //  1. EnforceTenant (no tenant ⇒ hard error)
 //  2. Render (unknown template code ⇒ ErrTemplateUnknown, a HARD error not a
@@ -55,11 +63,21 @@ func (s *Service) Render(in RenderInput) (Rendered, error) {
 //     blocked(subscribe_quota)
 //  7. Sender (if wired).Send ⇒ failure status=failed / success status=sent
 //
+// taskID selects the persistence mode at every terminal point (block / fail /
+// sent):
+//
+//	taskID == 0 ⇒ CreateTask a NEW row (user-facing Send, and legacy jobs).
+//	taskID >  0 ⇒ UpdateTask the EXISTING row with that id (the deferred-send
+//	              worker finalizes the pending row persisted at enqueue time
+//	              instead of creating a duplicate). The tenant is still resolved
+//	              from ctx, and UpdateTask matches on tenant_id + id, so a
+//	              cross-tenant finalize is ErrNotFound — isolation holds.
+//
 // A blocked outcome is persisted as a ReachTask (status=blocked + reason) and
 // returned as (task, nil). A real system failure is returned as (nil, err). A
 // blocked attempt consumes no count beyond the subscribe quota (and the
 // frequency circuit rolls its own Incr back inside Allow on its own block).
-func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
+func (s *Service) SendFinalize(ctx context.Context, in SendInput, taskID int64) (*ReachTask, error) {
 	// ① tenant from ctx, never from the request body.
 	tenantID, err := multitenancy.EnforceTenant(ctx)
 	if err != nil {
@@ -71,16 +89,20 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 
 	now := s.now()
 
-	// Deferred send (CONTRACT §19): a future ScheduledAt with a wired producer
-	// is enqueued for async delivery; the worker re-drives it through Send (with
-	// ScheduledAt cleared) when the window opens. No row is persisted here — the
-	// queue's pending redelivery is the at-least-once guarantee. Without a
-	// producer (dev, no Redis) this branch is skipped and the send is immediate.
+	// Deferred send (CONTRACT §19 / §19.9): a future ScheduledAt with a wired
+	// producer first persists a PENDING ReachTask row (so a scheduled send is
+	// visible via ListTasks immediately — the audit trail must not be silent),
+	// then enqueues the job with that row's id in the payload. The worker
+	// re-drives it through SendFinalize (ScheduledAt cleared, TaskID set) which
+	// finalizes THIS row rather than inserting a duplicate. The row is persisted
+	// BEFORE enqueueing; if the enqueue then fails the row is best-effort flipped
+	// to failed (never left dangling as a pending that will never fire) and the
+	// enqueue error is returned. This branch is only reachable with taskID==0 —
+	// the worker clears ScheduledAt before calling — so it always creates a NEW
+	// row. Without a producer (dev, no Redis) the branch is skipped and the send
+	// is immediate.
 	if !in.ScheduledAt.IsZero() && in.ScheduledAt.After(now) && s.scheduledProducer != nil {
-		if err := s.scheduledProducer.EnqueueScheduledSend(ctx, in, in.ScheduledAt); err != nil {
-			return nil, err
-		}
-		return &ReachTask{
+		created, cerr := s.repo.CreateTask(ctx, &ReachTask{
 			TenantID:     tenantID,
 			StoreID:      in.StoreID,
 			StrategyID:   in.StrategyID,
@@ -90,7 +112,19 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 			Status:       StatusPending,
 			ScheduledAt:  in.ScheduledAt,
 			CreatedAt:    now,
-		}, nil
+		})
+		if cerr != nil {
+			return nil, cerr
+		}
+		if err := s.scheduledProducer.EnqueueScheduledSend(ctx, in, in.ScheduledAt, created.ID); err != nil {
+			// Best-effort: mark the pre-persisted row failed so it is not left as
+			// a pending row that nothing will ever deliver. Surface the enqueue
+			// error regardless (the update is fire-and-forget).
+			created.Status = StatusFailed
+			_, _ = s.repo.UpdateTask(ctx, created)
+			return nil, err
+		}
+		return created, nil
 	}
 
 	// ② render (unknown code = hard error, not a block).
@@ -124,7 +158,7 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 	if s.cf != nil {
 		res := s.cf.Do(body)
 		if !res.Passed {
-			return s.block(ctx, task, BlockContentFilter)
+			return s.block(ctx, task, BlockContentFilter, taskID)
 		}
 		if res.Text != "" {
 			body = res.Text
@@ -138,7 +172,7 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 			return nil, ferr
 		}
 		if !allowed {
-			return s.block(ctx, task, BlockFreqCircuit)
+			return s.block(ctx, task, BlockFreqCircuit, taskID)
 		}
 	}
 
@@ -148,7 +182,7 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 		return nil, uerr
 	}
 	if unsub {
-		return s.block(ctx, task, BlockUnsubscribed)
+		return s.block(ctx, task, BlockUnsubscribed, taskID)
 	}
 
 	// ⑥ subscribe-message one-time quota. TemplateCode is the subscribe template
@@ -156,7 +190,7 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 	if in.Channel == ChannelSubscribeMsg {
 		if _, cerr := s.repo.ConsumeSubscribe(ctx, tenantID, in.MemberID, in.TemplateCode, now); cerr != nil {
 			if errors.Is(cerr, ErrSubscribeExhausted) {
-				return s.block(ctx, task, BlockSubscribeQuota)
+				return s.block(ctx, task, BlockSubscribeQuota, taskID)
 			}
 			return nil, cerr
 		}
@@ -174,21 +208,34 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 			Body:         body,
 		}); serr != nil {
 			task.Status = StatusFailed
-			return s.repo.CreateTask(ctx, task)
+			return s.persist(ctx, task, taskID)
 		}
 	}
 
 	task.Status = StatusSent
 	task.SentAt = now
+	return s.persist(ctx, task, taskID)
+}
+
+// persist writes the finalized task: taskID>0 updates the pre-persisted pending
+// row in place (worker delivery — no duplicate row); taskID==0 creates a new row
+// (user-facing send). Every terminal branch of SendFinalize funnels through here.
+func (s *Service) persist(ctx context.Context, task *ReachTask, taskID int64) (*ReachTask, error) {
+	if taskID > 0 {
+		task.ID = taskID
+		return s.repo.UpdateTask(ctx, task)
+	}
 	return s.repo.CreateTask(ctx, task)
 }
 
 // block persists task as blocked with the given reason and returns (task, nil).
-// Used by every guard-rejection branch in Send.
-func (s *Service) block(ctx context.Context, task *ReachTask, reason string) (*ReachTask, error) {
+// Used by every guard-rejection branch in SendFinalize. Honours taskID (see
+// persist): a worker-driven block updates the pending row rather than inserting
+// a new blocked row.
+func (s *Service) block(ctx context.Context, task *ReachTask, reason string, taskID int64) (*ReachTask, error) {
 	task.Status = StatusBlocked
 	task.BlockedReason = reason
-	return s.repo.CreateTask(ctx, task)
+	return s.persist(ctx, task, taskID)
 }
 
 // varOr returns vars[key] or "" — a small helper to bridge SendInput.Vars into

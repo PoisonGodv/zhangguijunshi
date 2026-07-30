@@ -5,12 +5,11 @@ package auth
 // within the configured PlatformTenantID and requires role == platform_ops; any
 // other outcome collapses into ErrLoginFailed (no enumeration).
 //
-// Username trade-off (CONTRACT §19 note): the users table has no dedicated
-// username column, so the name column is reused for platform account lookup.
-// name is NOT globally unique; this is acceptable ONLY because the set of
-// platform_ops accounts is small and curated by ops. A future migration may add
-// a unique username column; the AccountRepo interface (FindByUsername) is the
-// seam that absorbs that change.
+// Username (migration 000018): users now has a dedicated, per-tenant-unique
+// username column (partial unique index excluding soft-deleted/NULL rows).
+// AdminLogin resolves accounts through AccountRepo.FindByUsername, which matches
+// that column — no longer the non-unique display name. Seeded platform accounts
+// must be given a username (the memory seed sets username "ops").
 
 import (
 	"context"

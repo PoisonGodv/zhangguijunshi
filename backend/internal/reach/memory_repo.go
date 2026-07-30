@@ -155,6 +155,31 @@ func (r *MemoryReachRepo) UpdateTaskStatus(_ context.Context, tenantID, id int64
 	return cloneTask(t), nil
 }
 
+// UpdateTask rewrites an existing task row matched by (t.TenantID, t.ID):
+// status / blocked_reason / target_count, and sent_at when t.SentAt is non-zero
+// (a zero SentAt leaves the stored value untouched, mirroring UpdateTaskStatus).
+// The deferred-send worker uses it to finalize the pending row persisted at
+// enqueue time instead of creating a duplicate. ErrNotFound when the row is
+// absent or owned by another tenant.
+func (r *MemoryReachRepo) UpdateTask(_ context.Context, t *ReachTask) (*ReachTask, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t == nil {
+		return nil, ErrNotFound
+	}
+	stored, ok := r.tasks[t.ID]
+	if !ok || stored.TenantID != t.TenantID {
+		return nil, ErrNotFound
+	}
+	stored.Status = t.Status
+	stored.BlockedReason = t.BlockedReason
+	stored.TargetCount = t.TargetCount
+	if !t.SentAt.IsZero() {
+		stored.SentAt = t.SentAt
+	}
+	return cloneTask(stored), nil
+}
+
 // GrantSubscribe idempotently accumulates quota for (tenant, member, tpl): an
 // existing auth gets GrantedQuota += quota (timestamps refreshed); otherwise a
 // new auth is created. Returns a defensive copy.

@@ -7,9 +7,15 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/zhangguijunshi/backend/internal/dataquality"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
+
+// Service satisfies dataquality.TagWriter directly (its SetProductTags method),
+// so the cron can hand the catalogue service to the BE-A-09 tagging step with no
+// adapter. Compile-time guard against signature drift.
+var _ dataquality.TagWriter = (*Service)(nil)
 
 const (
 	tenantA = 50021
@@ -316,5 +322,107 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	if len(list) != 50 {
 		t.Fatalf("want 50 products, got %d", len(list))
+	}
+}
+
+// --- BE-A-09 标签写回 --------------------------------------------------------
+
+func TestUpdateTags_ClosedLoop(t *testing.T) {
+	svc := newSvc()
+	ctx := ctxFor(tenantA, store1)
+
+	p, err := svc.Create(ctx, CreateInput{Barcode: "T001", Name: "鲜奶", Unit: "盒", CostCents: 100, PriceCents: 200})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(p.Tags) != 0 {
+		t.Fatalf("new product should have no tags, got %v", p.Tags)
+	}
+
+	want := []string{dataquality.TagNearingExpiry, dataquality.TagHighMargin}
+	up, err := svc.UpdateTags(ctx, p.ID, want)
+	if err != nil {
+		t.Fatalf("UpdateTags: %v", err)
+	}
+	if fmt.Sprint(up.Tags) != fmt.Sprint(want) {
+		t.Fatalf("UpdateTags returned %v, want %v", up.Tags, want)
+	}
+	// Price/cost are untouched by a tag write-back.
+	if up.CostCents != 100 || up.PriceCents != 200 {
+		t.Fatalf("tag write-back must not touch price/cost: %+v", up)
+	}
+	// Re-read to confirm persistence.
+	again, err := svc.GetByID(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if fmt.Sprint(again.Tags) != fmt.Sprint(want) {
+		t.Fatalf("tags not persisted: got %v, want %v", again.Tags, want)
+	}
+
+	// Overwrite with an empty set clears the tags.
+	cleared, err := svc.UpdateTags(ctx, p.ID, nil)
+	if err != nil {
+		t.Fatalf("UpdateTags(nil): %v", err)
+	}
+	if len(cleared.Tags) != 0 {
+		t.Fatalf("expected cleared tags, got %v", cleared.Tags)
+	}
+}
+
+func TestUpdateTags_CrossTenant(t *testing.T) {
+	svc := newSvc()
+	p, err := svc.Create(ctxFor(tenantA, store1), CreateInput{Barcode: "T002", Name: "酸奶", Unit: "盒", CostCents: 1, PriceCents: 2})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Tenant B may not rewrite tenant A's tags.
+	if _, err := svc.UpdateTags(ctxFor(tenantB, store1), p.ID, []string{dataquality.TagStale}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant UpdateTags: expected ErrNotFound, got %v", err)
+	}
+	// Unknown product within the right tenant -> ErrNotFound.
+	if _, err := svc.UpdateTags(ctxFor(tenantA, store1), 999999, []string{"x"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown product UpdateTags: expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestUpdateTags_NoTenant_Rejected(t *testing.T) {
+	svc := newSvc()
+	if _, err := svc.UpdateTags(context.Background(), 1, []string{"x"}); !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("expected ErrNoTenant, got %v", err)
+	}
+}
+
+// TestSetProductTags_SatisfiesTagWriter exercises the dataquality.TagWriter
+// surface the cron calls: tenant resolved from ctx, explicit tenantID matched.
+func TestSetProductTags_SatisfiesTagWriter(t *testing.T) {
+	svc := newSvc()
+	ctx := ctxFor(tenantA, store1)
+	p, err := svc.Create(ctx, CreateInput{Barcode: "T003", Name: "面包", Unit: "袋", CostCents: 100, PriceCents: 300})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Use the port type to prove Service is usable as a dataquality.TagWriter.
+	var tw dataquality.TagWriter = svc
+	tags := []string{dataquality.TagStale, dataquality.TagHighMargin}
+	if err := tw.SetProductTags(ctx, tenantA, p.ID, tags); err != nil {
+		t.Fatalf("SetProductTags: %v", err)
+	}
+	got, err := svc.GetByID(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if fmt.Sprint(got.Tags) != fmt.Sprint(tags) {
+		t.Fatalf("SetProductTags persisted %v, want %v", got.Tags, tags)
+	}
+
+	// A mismatched explicit tenantID fails closed (tenant always comes from ctx).
+	if err := tw.SetProductTags(ctx, tenantB, p.ID, []string{"x"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("mismatched tenantID: expected ErrNotFound, got %v", err)
+	}
+	// No tenant in ctx -> ErrNoTenant.
+	if err := tw.SetProductTags(context.Background(), tenantA, p.ID, []string{"x"}); !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no tenant: expected ErrNoTenant, got %v", err)
 	}
 }

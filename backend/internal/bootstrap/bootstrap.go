@@ -201,6 +201,12 @@ func BuildServices(ctx context.Context, cfg *config.Config, log *zap.Logger, inf
 	jwtMgr := infra.JWT
 	sessStore := infra.Sess
 
+	// M6 ②: log which external integrations came up with real credentials vs
+	// degraded to fake/nil (WX / COS / LLM / WX Pay / PG / Redis). Nil-safe on
+	// every arg; no secrets are logged, only presence/absence. One call covers
+	// the api / worker / cron binaries (all go through BuildServices).
+	LogClientDiagnostics(log, cfg, database, rdb)
+
 	s := &Services{Cfg: cfg, Log: log, DB: database, RDB: rdb, JWT: jwtMgr, Sess: sessStore}
 
 	// ---- Async job queue (CONTRACT §19). Producer is nil-safe: with no Redis
@@ -341,7 +347,7 @@ func BuildServices(ctx context.Context, cfg *config.Config, log *zap.Logger, inf
 	s.COS = buildCOS(cfg.COS)
 
 	// ---- M3-S1 AI engine + M3-S2/S3 pipeline + scheduler (CONTRACT §12/§13/§14). ----
-	ai := buildAIEngine(cfg, database, catalogSvc, inventorySvc, membershipSvc, billingSvc, marketingSvc, reachSvc, groupbuySvc)
+	ai := buildAIEngine(cfg, database, catalogSvc, inventorySvc, membershipSvc, billingSvc, marketingSvc, reachSvc, groupbuySvc, storeSvc)
 	s.Strategy = ai.strategy
 	s.Pipeline = ai.pipeline
 	s.Executor = ai.executor
@@ -472,8 +478,12 @@ func (e dbTenantEnumerator) ActiveTenantIDs(ctx context.Context) ([]int64, error
 // enforced it) so the worker can rebuild a tenant-scoped context on delivery.
 type reachScheduledProducer struct{ prod *jobqueue.Producer }
 
-func (a reachScheduledProducer) EnqueueScheduledSend(ctx context.Context, in reach.SendInput, sendAt time.Time) error {
-	payload, err := json.Marshal(reach.ScheduledSendPayload{In: in})
+// EnqueueScheduledSend implements reach.ScheduledSendProducer. taskID is the id
+// of the pending ReachTask row reach.Send persisted just before enqueueing
+// (CONTRACT §20 / M6 ③); it is stamped into the payload so the worker finalizes
+// THAT row on delivery instead of inserting a duplicate.
+func (a reachScheduledProducer) EnqueueScheduledSend(ctx context.Context, in reach.SendInput, sendAt time.Time, taskID int64) error {
+	payload, err := json.Marshal(reach.ScheduledSendPayload{In: in, TaskID: taskID})
 	if err != nil {
 		return fmt.Errorf("reach scheduled send: marshal payload: %w", err)
 	}

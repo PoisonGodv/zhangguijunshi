@@ -724,20 +724,22 @@ func TestConsumeSubscribe_Concurrent(t *testing.T) {
 
 // fakeScheduledProducer records deferred-send enqueues.
 type fakeScheduledProducer struct {
-	calls  int
-	gotIn  SendInput
-	gotAt  time.Time
-	retErr error
+	calls     int
+	gotIn     SendInput
+	gotAt     time.Time
+	gotTaskID int64
+	retErr    error
 }
 
-func (f *fakeScheduledProducer) EnqueueScheduledSend(_ context.Context, in SendInput, sendAt time.Time) error {
+func (f *fakeScheduledProducer) EnqueueScheduledSend(_ context.Context, in SendInput, sendAt time.Time, taskID int64) error {
 	f.calls++
 	f.gotIn = in
 	f.gotAt = sendAt
+	f.gotTaskID = taskID
 	return f.retErr
 }
 
-func TestSend_ScheduledFuture_EnqueuesAndSkipsDelivery(t *testing.T) {
+func TestSend_ScheduledFuture_PersistsPendingAndEnqueues(t *testing.T) {
 	repo := NewMemoryReachRepo()
 	snd := &fakeSender{}
 	prod := &fakeScheduledProducer{}
@@ -758,16 +760,177 @@ func TestSend_ScheduledFuture_EnqueuesAndSkipsDelivery(t *testing.T) {
 	if prod.gotIn.MemberID != 42 {
 		t.Errorf("producer got memberID = %d", prod.gotIn.MemberID)
 	}
-	if task.Status != StatusPending {
-		t.Errorf("task status = %q, want pending", task.Status)
+	// A pending audit row is persisted at enqueue time (the scheduled send must
+	// be visible immediately) and carries the future ScheduledAt.
+	if task == nil || task.Status != StatusPending {
+		t.Fatalf("task status = %+v, want pending", task)
+	}
+	if task.ID == 0 {
+		t.Fatal("pending task must have an allocated id")
+	}
+	if !task.ScheduledAt.Equal(future) {
+		t.Errorf("task.ScheduledAt = %v, want %v", task.ScheduledAt, future)
+	}
+	// The enqueued payload carries that row's id so the worker finalizes the
+	// SAME row rather than duplicating it.
+	if prod.gotTaskID != task.ID {
+		t.Errorf("payload TaskID = %d, want the persisted row id %d", prod.gotTaskID, task.ID)
 	}
 	if len(snd.payloads) != 0 {
 		t.Errorf("sender must NOT be called for a deferred send, got %d payloads", len(snd.payloads))
 	}
-	// No row persisted at enqueue time (the worker persists on delivery).
-	tasks, _ := repo.ListTasks(ctxWithTenant(7), 7, 1, "")
-	if len(tasks) != 0 {
-		t.Errorf("no task should be persisted at enqueue, got %d", len(tasks))
+	// The pending row is visible via ListTasks (status + ScheduledAt).
+	tasks, _ := repo.ListTasks(ctxWithTenant(7), 7, 1, StatusPending)
+	if len(tasks) != 1 {
+		t.Fatalf("expected exactly 1 pending row at enqueue, got %d", len(tasks))
+	}
+	if tasks[0].ID != task.ID || !tasks[0].ScheduledAt.Equal(future) {
+		t.Errorf("listed pending row mismatch: %+v", tasks[0])
+	}
+}
+
+// TestSendFinalize_UpdatesExistingPendingRow proves the worker path (TaskID>0)
+// flips the pre-persisted pending row to sent IN PLACE — no duplicate row.
+func TestSendFinalize_UpdatesExistingPendingRow(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	snd := &fakeSender{}
+	prod := &fakeScheduledProducer{}
+	s := New(repo, WithSender(snd), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	future := clock().Add(2 * time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+	pending, err := s.Send(ctxWithTenant(7), in)
+	if err != nil {
+		t.Fatalf("enqueue Send: %v", err)
+	}
+	if pending.Status != StatusPending || pending.ID == 0 {
+		t.Fatalf("precondition pending row with id, got %+v", pending)
+	}
+
+	// Worker path: ScheduledAt cleared (forces delivery) + TaskID set.
+	deliverIn := in
+	deliverIn.ScheduledAt = time.Time{}
+	finalized, err := s.SendFinalize(ctxWithTenant(7), deliverIn, pending.ID)
+	if err != nil {
+		t.Fatalf("SendFinalize: %v", err)
+	}
+	if len(snd.payloads) != 1 {
+		t.Errorf("worker delivery should send exactly 1 payload, got %d", len(snd.payloads))
+	}
+	if finalized.ID != pending.ID {
+		t.Errorf("finalize must reuse the pending row id: got %d want %d", finalized.ID, pending.ID)
+	}
+	if finalized.Status != StatusSent {
+		t.Errorf("finalized status = %q, want sent", finalized.Status)
+	}
+	if finalized.SentAt.IsZero() {
+		t.Errorf("finalized sent row must have SentAt set")
+	}
+	// Exactly ONE row exists: the worker updated, it did not create a duplicate.
+	tasks, _ := repo.ListTasks(ctxWithTenant(7), 7, 0, "")
+	if len(tasks) != 1 {
+		t.Fatalf("worker must update not duplicate: got %d rows", len(tasks))
+	}
+	if tasks[0].ID != pending.ID || tasks[0].Status != StatusSent {
+		t.Errorf("row not flipped in place: %+v", tasks[0])
+	}
+}
+
+// TestSendFinalize_BlockedUpdatesPendingRow proves a worker delivery that a guard
+// intercepts flips the SAME pending row to blocked and still returns (task, nil)
+// so the job ACKs.
+func TestSendFinalize_BlockedUpdatesPendingRow(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	prod := &fakeScheduledProducer{}
+	snd := &fakeSender{}
+	cf := &fakeCF{passed: false} // content rejects on delivery
+	s := New(repo, WithSender(snd), WithContentFilter(cf), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	future := clock().Add(2 * time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+	pending, err := s.Send(ctxWithTenant(7), in)
+	if err != nil {
+		t.Fatalf("enqueue Send: %v", err)
+	}
+
+	deliverIn := in
+	deliverIn.ScheduledAt = time.Time{}
+	blocked, err := s.SendFinalize(ctxWithTenant(7), deliverIn, pending.ID)
+	if err != nil {
+		t.Fatalf("a blocked delivery returns (task, nil), got err %v", err)
+	}
+	if blocked.ID != pending.ID || blocked.Status != StatusBlocked || blocked.BlockedReason != BlockContentFilter {
+		t.Errorf("expected the same row flipped to blocked(content_filter), got %+v", blocked)
+	}
+	// No duplicate row; nothing was delivered.
+	tasks, _ := repo.ListTasks(ctxWithTenant(7), 7, 0, "")
+	if len(tasks) != 1 || tasks[0].Status != StatusBlocked {
+		t.Errorf("exactly one blocked row expected, got %+v", tasks)
+	}
+	if len(snd.payloads) != 0 {
+		t.Errorf("blocked delivery must not send, got %d payloads", len(snd.payloads))
+	}
+}
+
+// TestSendFinalize_CrossTenantUpdateIsolated proves a finalize carrying a
+// foreign tenant's ctx cannot touch another tenant's pending row (UpdateTask
+// matches tenant_id + id ⇒ ErrNotFound ⇒ the worker error is surfaced).
+func TestSendFinalize_CrossTenantUpdateIsolated(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	prod := &fakeScheduledProducer{}
+	s := New(repo, WithSender(&fakeSender{}), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	future := clock().Add(2 * time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+	pending, err := s.Send(ctxWithTenant(7), in)
+	if err != nil {
+		t.Fatalf("enqueue Send: %v", err)
+	}
+	// Attacker tenant 99999 tries to finalize tenant 7's pending row id.
+	deliverIn := in
+	deliverIn.ScheduledAt = time.Time{}
+	if _, err := s.SendFinalize(ctxWithTenant(99999), deliverIn, pending.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant finalize must be ErrNotFound, got %v", err)
+	}
+	// The row is untouched (still pending, still tenant 7's).
+	got, _ := repo.GetTask(ctxWithTenant(7), 7, pending.ID)
+	if got.Status != StatusPending {
+		t.Errorf("foreign finalize must not touch the row, got %q", got.Status)
+	}
+}
+
+// TestUpdateTask_MemoryAndTenantIsolation exercises the repo method directly:
+// same-tenant update flips status/sent_at; a row claiming a foreign tenant is
+// ErrNotFound and leaves the stored row unchanged.
+func TestUpdateTask_MemoryAndTenantIsolation(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	created, err := repo.CreateTask(context.Background(), &ReachTask{
+		TenantID: 7, StoreID: 1, Channel: ChannelSMS, TemplateCode: TplRecall30,
+		TargetCount: 1, Status: StatusPending,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Same-tenant update flips status + sent_at.
+	created.Status = StatusSent
+	created.SentAt = clock()
+	upd, err := repo.UpdateTask(context.Background(), created)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if upd.Status != StatusSent || !upd.SentAt.Equal(clock()) {
+		t.Errorf("update mismatch: %+v", upd)
+	}
+	// A task claiming a foreign tenant cannot update tenant 7's row.
+	foreign := *created
+	foreign.TenantID = 99999
+	foreign.Status = StatusBlocked
+	if _, err := repo.UpdateTask(context.Background(), &foreign); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-tenant update must be ErrNotFound, got %v", err)
+	}
+	got, _ := repo.GetTask(context.Background(), 7, created.ID)
+	if got.Status != StatusSent {
+		t.Errorf("foreign update must not touch the row, got %q", got.Status)
 	}
 }
 
@@ -817,5 +980,13 @@ func TestSend_ScheduledEnqueueError_Propagates(t *testing.T) {
 	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelSubscribeMsg, TemplateCode: TplBirthday, ScheduledAt: clock().Add(time.Hour)}
 	if _, err := s.Send(ctxWithTenant(7), in); err == nil {
 		t.Fatal("enqueue error must propagate")
+	}
+	// The row persisted before the (failed) enqueue must not be left dangling as
+	// pending — it is best-effort flipped to failed so the audit trail is honest.
+	if pend, _ := repo.ListTasks(ctxWithTenant(7), 7, 0, StatusPending); len(pend) != 0 {
+		t.Errorf("failed enqueue must not leave a pending row, got %d", len(pend))
+	}
+	if failed, _ := repo.ListTasks(ctxWithTenant(7), 7, 0, StatusFailed); len(failed) != 1 {
+		t.Errorf("the pre-persisted row should be marked failed, got %d", len(failed))
 	}
 }

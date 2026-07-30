@@ -265,3 +265,34 @@ func TestPGRepo_NilPoolIsSafe(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, out)
 }
+
+func TestPGProductRepo_UpdateTags(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGProductRepo(mock)
+	// Only the tags column is written ($1); tenant_id ($2) + id ($3) address the
+	// row. RETURNING round-trips the full record.
+	mock.ExpectQuery(sqlProductUpdateTags).
+		WithArgs([]string{"临期", "高毛利"}, int64(1), int64(1001)).
+		WillReturnRows(pgxmock.NewRows(productColumns()).AddRow(
+			int64(1001), int64(1), int64(10), "6901234567890", "可乐", "饮料", "瓶",
+			int64(200), int64(300), "http://img", int64(7), []string{"临期", "高毛利"}, "active", fixedTime, fixedTime,
+		))
+	p, err := repo.UpdateTags(context.Background(), 1, 1001, []string{"临期", "高毛利"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"临期", "高毛利"}, p.Tags)
+	// Price/cost round-trip unchanged (the statement never rewrites them).
+	require.Equal(t, int64(200), p.CostCents)
+	require.Equal(t, int64(300), p.PriceCents)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGProductRepo_UpdateTagsNotFound(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGProductRepo(mock)
+	mock.ExpectQuery(sqlProductUpdateTags).
+		WithArgs([]string{"滞销"}, int64(1), int64(9999)).
+		WillReturnError(pgx.ErrNoRows)
+	_, err := repo.UpdateTags(context.Background(), 1, 9999, []string{"滞销"})
+	require.ErrorIs(t, err, ErrNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}

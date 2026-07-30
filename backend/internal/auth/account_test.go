@@ -34,6 +34,90 @@ func TestMemoryRepo_PhoneHashWriteReadAgree(t *testing.T) {
 	require.NotEmpty(t, acc.PasswordHash)
 }
 
+// TestMemoryRepo_FindByUsernameByUsername proves FindByUsername matches the
+// dedicated username column (migration 000018), not the display name. The dev
+// seed gives the platform ops account username "ops"; looking it up by its
+// display name ("ops" is also its name, so use a fresh account to disambiguate)
+// and by username both resolve.
+func TestMemoryRepo_FindByUsername(t *testing.T) {
+	repo := NewMemoryAccountRepo()
+
+	// Seeded platform ops: username "ops".
+	acc, err := repo.FindByUsername(t.Context(), 1, "ops")
+	require.NoError(t, err)
+	require.Equal(t, "platform_ops", acc.Role)
+	require.Equal(t, "ops", acc.Username)
+
+	// Seed an account whose display name differs from its username; the lookup
+	// must succeed by username and fail by the (non-unique) display name.
+	seeded, err := repo.SeedAccountWithUsername(1, 1, "Alice Display", "alice_admin", "13900000099", "manager", "pw12345")
+	require.NoError(t, err)
+	got, err := repo.FindByUsername(t.Context(), 1, "alice_admin")
+	require.NoError(t, err)
+	require.Equal(t, seeded.ID, got.ID)
+	require.Equal(t, "Alice Display", got.Name)
+
+	// Display name is NOT a username: lookup by name fails.
+	_, err = repo.FindByUsername(t.Context(), 1, "Alice Display")
+	require.ErrorIs(t, err, ErrAccountNotFound)
+
+	// Empty username never matches.
+	_, err = repo.FindByUsername(t.Context(), 1, "")
+	require.ErrorIs(t, err, ErrAccountNotFound)
+}
+
+// TestMemoryRepo_UsernameUniquePerTenant proves the username index is scoped per
+// tenant: the same username in two tenants resolves independently, and a
+// cross-tenant lookup misses (row-level isolation).
+func TestMemoryRepo_UsernameUniquePerTenant(t *testing.T) {
+	repo := NewMemoryAccountRepo()
+	a1, err := repo.SeedAccountWithUsername(1, 0, "ops t1", "shared", "", "platform_ops", "pw12345")
+	require.NoError(t, err)
+	a2, err := repo.SeedAccountWithUsername(2, 0, "ops t2", "shared", "", "platform_ops", "pw12345")
+	require.NoError(t, err)
+	require.NotEqual(t, a1.ID, a2.ID)
+
+	got1, err := repo.FindByUsername(t.Context(), 1, "shared")
+	require.NoError(t, err)
+	require.Equal(t, a1.ID, got1.ID)
+	require.Equal(t, int64(1), got1.TenantID)
+
+	got2, err := repo.FindByUsername(t.Context(), 2, "shared")
+	require.NoError(t, err)
+	require.Equal(t, a2.ID, got2.ID)
+	require.Equal(t, int64(2), got2.TenantID)
+
+	// Tenant 3 never saw "shared".
+	_, err = repo.FindByUsername(t.Context(), 3, "shared")
+	require.ErrorIs(t, err, ErrAccountNotFound)
+}
+
+// TestMemoryRepo_BumpVersion proves BumpVersion increments the stored version
+// monotonically and returns the new value (revoke-on-password-change hook).
+func TestMemoryRepo_BumpVersion(t *testing.T) {
+	repo := NewMemoryAccountRepo()
+	seeded, err := repo.SeedAccountWithUsername(1, 0, "v ops", "vops", "", "platform_ops", "pw12345")
+	require.NoError(t, err)
+	require.Equal(t, int64(0), seeded.Version)
+
+	v1, err := repo.BumpVersion(t.Context(), seeded.ID)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), v1)
+
+	v2, err := repo.BumpVersion(t.Context(), seeded.ID)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), v2)
+
+	// The bump is visible through a fresh lookup (version is live, not constant).
+	got, err := repo.FindByUsername(t.Context(), 1, "vops")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), got.Version)
+
+	// Unknown id degrades to ErrAccountNotFound.
+	_, err = repo.BumpVersion(t.Context(), 999999)
+	require.ErrorIs(t, err, ErrAccountNotFound)
+}
+
 func TestSentinels_AreErrcodeTyped(t *testing.T) {
 	// All three must satisfy errcode.Err so httpx.FailError maps them without a
 	// handler type switch, and must carry distinct, sensible codes.

@@ -21,11 +21,14 @@ import (
 
 // fakePipeline implements PipelineRunner. It records per-tenant call counts,
 // can fail the first failN calls per tenant (then succeed), supports alwaysErr,
-// and tracks max observed concurrency to verify the worker-pool cap.
+// and tracks max observed concurrency to verify the worker-pool cap. It also
+// records the StoreID it observed in ctx for each run so per-store tests can
+// assert pregen injected the right StoreID.
 type fakePipeline struct {
 	mu        sync.Mutex
 	failN     int // per-tenant: fail the first failN calls, then succeed
 	calls     map[int64]int
+	seen      []storeSeen // one entry per Run, recording the ctx (tenant,store)
 	tmpl      *strategy.Strategy
 	alwaysErr error
 	delay     time.Duration // hold the slot to let concurrency build up
@@ -33,6 +36,9 @@ type fakePipeline struct {
 	cur  int32
 	maxc int32
 }
+
+// storeSeen is one recorded pipeline invocation's ctx-resolved identity.
+type storeSeen struct{ tenantID, storeID int64 }
 
 func newFakePipeline(failN int, tmpl *strategy.Strategy) *fakePipeline {
 	return &fakePipeline{calls: map[int64]int{}, failN: failN, tmpl: tmpl}
@@ -58,6 +64,7 @@ func (f *fakePipeline) Run(ctx context.Context) (*output.Advice, error) {
 
 	f.mu.Lock()
 	f.calls[tid]++
+	f.seen = append(f.seen, storeSeen{tenantID: tid, storeID: mc.StoreID})
 	n := f.calls[tid]
 	failN := f.failN
 	err := f.alwaysErr
@@ -81,6 +88,19 @@ func (f *fakePipeline) callCount(tid int64) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls[tid]
+}
+
+// storesSeen returns the ctx StoreIDs observed for tenantID, in call order.
+func (f *fakePipeline) storesSeen(tid int64) []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []int64
+	for _, s := range f.seen {
+		if s.tenantID == tid {
+			out = append(out, s.storeID)
+		}
+	}
+	return out
 }
 
 func (f *fakePipeline) maxConc() int32 { return atomic.LoadInt32(&f.maxc) }
@@ -140,6 +160,35 @@ type fakeEnum struct {
 
 func (f *fakeEnum) ActiveTenantIDs(ctx context.Context) ([]int64, error) {
 	return f.ids, f.err
+}
+
+// fakeStoreEnum implements StoreEnumerator. It returns the configured store ids
+// per tenant (empty slice for an unknown tenant) and records call counts so
+// tests can assert enumeration happened. err, when set, fails every call.
+type fakeStoreEnum struct {
+	mu       sync.Mutex
+	byTenant map[int64][]int64
+	calls    map[int64]int
+	err      error
+}
+
+func (f *fakeStoreEnum) ActiveStoreIDs(ctx context.Context, tenantID int64) ([]int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.calls == nil {
+		f.calls = map[int64]int{}
+	}
+	f.calls[tenantID]++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.byTenant[tenantID], nil
+}
+
+func (f *fakeStoreEnum) callCount(tid int64) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls[tid]
 }
 
 // === helpers ===
@@ -509,4 +558,116 @@ func TestChunkInt64(t *testing.T) {
 	assert.Equal(t, [][]int64{{1}, {2}, {3}}, chunkInt64([]int64{1, 2, 3}, 1))
 	// n<=0 → single chunk (no chunking).
 	assert.Equal(t, [][]int64{{1, 2, 3}}, chunkInt64([]int64{1, 2, 3}, 0))
+}
+
+// === per-store resolution tests (StoreEnumerator) ===
+
+// TestBatchGenerate_PerStoreRuns verifies that with a StoreEnumerator wired the
+// batch runs the pipeline once per active store, injecting each StoreID into ctx
+// (the gap being fixed: previously every run carried storeID=0, which the
+// strategy domain rejects).
+func TestBatchGenerate_PerStoreRuns(t *testing.T) {
+	fp := newFakePipeline(0, testTemplate())
+	fc := &fakeCache{}
+	fs := &fakeSemantic{}
+	fe := &fakeEnum{ids: []int64{42}}
+	se := &fakeStoreEnum{byTenant: map[int64][]int64{42: {11, 12}}}
+	s := NewScheduler(fp, fc, fs, fe,
+		WithBackoffs(fastBackoffs),
+		WithStoreEnumerator(se),
+	)
+
+	n, err := s.BatchGenerate(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "one run per store")
+	assert.ElementsMatch(t, []int64{11, 12}, fp.storesSeen(42),
+		"pipeline ran once per store with the StoreID injected into ctx")
+	assert.Equal(t, 1, se.callCount(42), "store enumerated once for the tenant")
+	assert.Equal(t, 2, fc.count(), "L1 Put per store run")
+	assert.Equal(t, 2, fs.count(), "L2 Put per store run")
+}
+
+// TestBatchGenerate_NilStoreEnumerator_FallbackStore0 verifies the backward-
+// compatible path: with no StoreEnumerator wired, each tenant runs exactly once
+// with storeID=0 (legacy behaviour preserved for M3-S2/S3 callers / dev).
+func TestBatchGenerate_NilStoreEnumerator_FallbackStore0(t *testing.T) {
+	fp := newFakePipeline(0, testTemplate())
+	fc := &fakeCache{}
+	fe := &fakeEnum{ids: []int64{43}}
+	s := NewScheduler(fp, fc, &fakeSemantic{}, fe, WithBackoffs(fastBackoffs)) // no WithStoreEnumerator
+
+	n, err := s.BatchGenerate(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "single fallback run")
+	assert.Equal(t, []int64{0}, fp.storesSeen(43), "fallback runs once with storeID=0")
+	assert.Equal(t, 1, fc.count())
+}
+
+// TestBatchGenerate_StoreEnumeratorZeroStores_FallbackStore0 verifies that an
+// enumerator returning no stores for a tenant degrades to the single storeID=0
+// run (absence of stores == legacy behaviour, not an error).
+func TestBatchGenerate_StoreEnumeratorZeroStores_FallbackStore0(t *testing.T) {
+	fp := newFakePipeline(0, testTemplate())
+	fc := &fakeCache{}
+	fe := &fakeEnum{ids: []int64{44}}
+	se := &fakeStoreEnum{byTenant: map[int64][]int64{}} // tenant 44 → zero stores
+	s := NewScheduler(fp, fc, &fakeSemantic{}, fe,
+		WithBackoffs(fastBackoffs),
+		WithStoreEnumerator(se),
+	)
+
+	n, err := s.BatchGenerate(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.Equal(t, []int64{0}, fp.storesSeen(44), "zero stores → single storeID=0 fallback")
+}
+
+// TestRefreshTenant_PerStore verifies RefreshTenant fans out to every store of
+// the tenant (with retry) when a StoreEnumerator is wired.
+func TestRefreshTenant_PerStore(t *testing.T) {
+	fp := newFakePipeline(0, testTemplate())
+	fc := &fakeCache{}
+	se := &fakeStoreEnum{byTenant: map[int64][]int64{55: {21, 22}}}
+	s := NewScheduler(fp, fc, &fakeSemantic{}, &fakeEnum{},
+		WithBackoffs(fastBackoffs),
+		WithStoreEnumerator(se),
+	)
+
+	require.NoError(t, s.RefreshTenant(context.Background(), 55))
+	assert.ElementsMatch(t, []int64{21, 22}, fp.storesSeen(55))
+	assert.Equal(t, 2, fc.count())
+}
+
+// TestIncrementalRetry_TargetedStore verifies a job with StoreID>0 runs ONLY
+// that store (no enumeration, single attempt).
+func TestIncrementalRetry_TargetedStore(t *testing.T) {
+	fp := newFakePipeline(0, testTemplate())
+	fc := &fakeCache{}
+	fs := &fakeSemantic{}
+	se := &fakeStoreEnum{byTenant: map[int64][]int64{7100: {11, 12}}}
+	s := NewScheduler(fp, fc, fs, &fakeEnum{}, WithStoreEnumerator(se))
+
+	s.EnqueueIncremental(IncrementalJob{TenantID: 7100, StoreID: 12, Reason: "manual_refresh"})
+	n, err := s.IncrementalRetry(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "only the targeted store runs")
+	assert.Equal(t, []int64{12}, fp.storesSeen(7100), "only store 12 ran")
+	assert.Equal(t, 0, se.callCount(7100), "targeted store must not enumerate")
+	assert.Equal(t, 1, fc.count())
+}
+
+// TestIncrementalRetry_AllStores verifies a job with StoreID==0 re-runs every
+// active store of the tenant, each single-attempt (incremental best-effort).
+func TestIncrementalRetry_AllStores(t *testing.T) {
+	fp := newFakePipeline(0, testTemplate())
+	fc := &fakeCache{}
+	se := &fakeStoreEnum{byTenant: map[int64][]int64{7200: {21, 22, 23}}}
+	s := NewScheduler(fp, fc, &fakeSemantic{}, &fakeEnum{}, WithStoreEnumerator(se))
+
+	s.EnqueueIncremental(IncrementalJob{TenantID: 7200, Reason: "weather_change"}) // StoreID==0 → all
+	n, err := s.IncrementalRetry(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 3, n, "one run per store")
+	assert.ElementsMatch(t, []int64{21, 22, 23}, fp.storesSeen(7200))
+	assert.Equal(t, 3, fc.count())
 }

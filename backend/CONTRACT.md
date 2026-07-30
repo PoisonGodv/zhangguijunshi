@@ -3487,3 +3487,38 @@ services 层：catalog.ts/inventory.ts/membership.ts（A2a）+ billing.ts/market
 - dataquality：fused daily-sales 落库、tag 落产品、`DaysSinceLastSale`/`EarliestExpiry` 精确化（现 compute+log，仅高毛利 tag 有效）。
 - users `version` 列（改密/踢线 ver 失效）；admin 唯一 username 列；`internal/tenant` 跨租户平台运营后台。
 - 真 PG/Redis/WX/COS/LLM 密钥联调（本机构建真实集成代码 + env 注入，dev/测试用 Fake/httptest/miniredis/pgxmock）。
+
+## 20. M6 五缺口收尾：pregen 单店解析 / 密钥诊断 / reach 定时落库 / dataquality 落库 / users version+username（2026-07-30）
+
+关闭 §19.9 显式延后清单中的五项（多 agent 并行实现 + 主线程集成；`go build ./...` 54 包、`go test -race ./...` 全绿、gofmt/vet clean）。新增 migration **000018**（users）与 **000019**（daily_product_sales）。
+
+### 20.1 pregen 单店解析缺口（§19.9 第 1 项，修复）
+- 根因：`pregen.runAndCache` 只往 ctx 注入 `TenantID`，`pipeline.Run` 从 ctx 取 `StoreID`（缺省 0），`strategy.SaveAdvice → storeScope` 拒绝 `StoreID==0`（ErrParam）→ 按租户的 pregen 端到端失败。
+- 修法（`internal/aiengine/pregen/`）：新增反腐端口 `StoreEnumerator{ ActiveStoreIDs(ctx, tenantID) ([]int64, error) }` + `WithStoreEnumerator` Option（**nil = 旧行为**：单次 storeID=0 跑，向后兼容 M3-S2/S3 调用方）。`runAndCache(ctx, tenantID, storeID)` 现把 `multitenancy.Context{TenantID, StoreID, Source: SourceSystem}` 注入 ctx；新 `runTenantStores` 按店枚举逐店跑（各带 retry），枚举器 nil/空/报错时回落单次 storeID=0（弹性）。`BatchGenerate`/`IncrementalRetry`/`RefreshTenant` 全走 `runTenantStores`；`IncrementalJob` 加 `StoreID`（0=全店，>0=定向单店）。缓存键仍用管线输出的 `strat.StoreID`。
+- 装配（主线程）：`bootstrap/adapters.go` 新 `storeEnumeratorAdapter{ *store.Service }`（`ListStores` 从 ctx 取租户，适配器注入 system ctx）；`buildAIEngine` 签名增 `storeSvc *store.Service`，`NewScheduler` 增 `pregen.WithStoreEnumerator(...)`。worker `RefreshTenant(ctx, tenantID)` 无需改，自动按店扇出。
+- 行为变化：接入后 pregen 每租户跑 N 次（每活跃店一次），批量耗时/LLM 调用随店数线性增长（worker 上限仍约束并发）。测试：6 个新用例（per-store 跑、nil 回落 store0、零店回落、RefreshTenant per-store、定向/全店 incremental）。
+
+### 20.2 真密钥联调诊断（§19.9 第 6 项，可观测性补强）
+- 配置加载与 real-vs-fake 门控在 M5 已就绪（`PaymentConfig.Configured()`→V3Client 否则 FakeWxPay；COS 缺凭证→nil；AI 无 api_key→placeholder gateway 降级 rule-only）。本项补**启动诊断**：新 `internal/bootstrap/diagnostics.go` `LogClientDiagnostics(log, cfg, database, rdb)` + 纯函数 `ClientStatus(cfg, hasDB, hasRedis) map[string]bool`，对 postgres/redis/wx_miniprogram/cos/llm/wxpay_v3 各输出一条 `active=true/false + detail` 结构化日志（**不打密钥**，仅在场与否 + provider 名）。主线程在 `BuildServices` infra 就绪后调用一次，覆盖 api/worker/cron 三二进制。`.env.example` 补全 wx/ai/cos/payment/jwt/job_queue/scheduler 的 `ZG_*` 占位。
+- 已知小不一致（保留）：cos `active` 按 SecretID+SecretKey+Bucket 判定，`buildCOS` 亦接受 Endpoint 代替 Bucket（极少数有 endpoint 无 bucket 时诊断报 inactive 但仍建客户端）。
+
+### 20.3 reach 定时发送落库可见（§19.9 第 3 项，修复）
+- 根因：`Send` 的 deferred 分支入队 Redis 但**不落 ReachTask 行**，定时发送在投递前 `ListTasks` 不可见。
+- 修法（`internal/reach/`）：deferred 分支**先** `CreateTask` 一条 `status=pending`（带 `ScheduledAt`）行，再入队；`ScheduledSendPayload` 加 `TaskID`，payload 携带该行 id。入队失败则 best-effort 把该行翻 `failed`（不留悬挂 pending）并返回入队错误。新 `Service.SendFinalize(ctx, in, taskID)`：`taskID==0`→CreateTask 新行（用户侧 `Send` 与旧 job），`taskID>0`→`UpdateTask` 收尾既有行；`Send == SendFinalize(ctx,in,0)`。`ReachRepo` 加 `UpdateTask(ctx, *ReachTask)`（Memory+PG 双实现，`UPDATE ... WHERE id AND tenant_id` 保隔离）。worker `handleReachDueSend` 解码 `payload.TaskID`→`SendFinalize(..., taskID)` 更新同一行不重复。主线程 `reachScheduledProducer.EnqueueScheduledSend` 增 `taskID int64` 参并写 `payload.TaskID`（**破坏性接口变更**，必须同步改否则 worker/api 链接失败）。
+- 设计取舍（有意）：合规/freq/unsub/quota 仅在**预约时**校验一次，worker 只记投递结果（sent/failed）；若产品要求投递时复检（如 honoring 迟到退订）属后续决策。旧 `TaskID==0` 队列 job 回落 CreateTask 新行。
+
+### 20.4 dataquality 落库（§19.9 第 4 项，修复）
+- migration **000019** `daily_product_sales`（`tenant_id` FK + `UNIQUE(tenant_id,store_id,product_id,sale_date)` 用 `CREATE UNIQUE INDEX`、`store_id DEFAULT 0`=全店融合口径不加 FK、`CHECK qty>=0`、`updated_at` 触发器）。
+- `internal/dataquality/`（保持纯函数包，不引 pgx 于既有文件）：新端口 `SalesRepo{ UpsertDailySales; LastSaleDate }` + `TagWriter{ SetProductTags }`；`MemorySalesRepo`（dev/测试）+ `PGSalesRepo`（`daily_sales_pg_repo.go`，pgxmock 测试，`ON CONFLICT` upsert 幂等）。
+- `internal/catalog/`：`ProductRepo` 加 `UpdateTags`，`Service.SetProductTags(ctx, tenantID, productID, tags)`（**直接满足 `dataquality.TagWriter`**，无需适配器；`products.tags` 为 `TEXT[]` 直存）。
+- `cmd/cron/jobs.go`：`dataqualityTenant` 反推后 `UpsertDailySales` 落库；`DaysSinceLastSale` 改为从刚落库的融合销量经 `LastSaleDate` 实算（**滞销 tag 现可真实触发**）；tag 集变化时 `SetProductTags` 写回。jobs struct 新 `dailySales/tagWriter` 字段（nil-guarded，未接则 compute+log no-op）；registerJobs 按 memory↔pg 惯例自 `svc.DB`/`svc.Catalog` 装配。
+- 文档化限制：`临期`（EarliestExpiry）暂未触发——`inventory.ListNearingBatches` 按店、全店 storeID=0 sweep 拿不到逐商品最早批期，需全店批期端口；无销售记录的商品 `DaysSinceLastSale=0`（保守，不误报滞销）；tag 集整体替换（tags 列即自动 BE-A-09 集）；融合销量尚未喂 AI 管线（既有后续）。
+
+### 20.5 users version + 唯一 username（§19.9 第 5 项，修复）
+- migration **000018**：`users.version BIGINT NOT NULL DEFAULT 0`（token 失效版本号）+ `users.username TEXT` + 部分唯一索引 `idx_users_tenant_username ON (tenant_id, username) WHERE deleted_at IS NULL AND username IS NOT NULL`（`CREATE UNIQUE INDEX`，与 000001 phone_hash 一致）。
+- `internal/auth/`：`Account` 加 `Username`；PG repo `sqlAccountByPhone/Username` 改 SELECT 真 `version`（不再 `0 AS version`），`FindByUsername` 改匹配 `username` 列（不再复用非唯一 `name`）；`AccountRepo` 加 `BumpVersion(ctx, id) (int64, error)`（`UPDATE ... version+1 RETURNING version`，Memory+PG 双实现，为改密踢线提供钩子）；memory repo 加 username 索引 + `SeedAccountWithUsername`（平台运营 seed 用户名 `ops`，`AdminLogin("ops",...)` dev 不破）。
+- 后续：调用 `BumpVersion` 的改密流程；JWT 中间件比对 `ver` claim（Version 现为活值，校验仍 no-op 待中间件接入）；PG 平台运营 seed 行需填 username。
+
+### 20.6 仍延后
+- **reach 定时发送时机强制**（新发现，非本次范围）：`jobqueue.Job.RunAt` 仅为观测性 hint，Redis Stream 消费端 `XREADGROUP` 立即读取、无 ZSET 延迟投递——"定时"消息 worker 一拿到即发。20.3 解决"落库可见"，"按时投递"需给 `pkg/jobqueue` 加延迟队列（共享件，独立里程碑）。
+- §19.9 余项：WX V3 真 `sub_mch_id` 透传 + Apply 字段级 RSA-OAEP；`internal/tenant` 跨租户平台运营后台。

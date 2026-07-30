@@ -155,6 +155,13 @@ type ReachRepo interface {
 	GetTask(ctx context.Context, tenantID, id int64) (*ReachTask, error)
 	ListTasks(ctx context.Context, tenantID, storeID int64, status string) ([]*ReachTask, error)
 	UpdateTaskStatus(ctx context.Context, tenantID, id int64, status, blockedReason string, sentAt time.Time) (*ReachTask, error)
+	// UpdateTask rewrites an existing task row matched by (t.TenantID, t.ID):
+	// status / blocked_reason / sent_at / target_count. The deferred-send worker
+	// uses it to FINALIZE the pending row that was persisted at enqueue time, so
+	// a scheduled delivery updates that row instead of creating a duplicate. A
+	// zero t.SentAt leaves the stored sent_at untouched (mirrors UpdateTaskStatus).
+	// Absent row or a row owned by another tenant ⇒ ErrNotFound.
+	UpdateTask(ctx context.Context, t *ReachTask) (*ReachTask, error)
 
 	// GrantSubscribe idempotently accumulates quota: an existing auth for the
 	// same (tenant, member, tpl) gets GrantedQuota += quota; otherwise a new auth
@@ -245,9 +252,10 @@ type Rendered struct {
 // / store_name / birthday / recall_days / balance / points / product_name).
 //
 // ScheduledAt defers delivery (CONTRACT §19): when set to a future time AND a
-// ScheduledSendProducer is wired, Send enqueues the attempt onto the async job
-// queue and returns a transient pending task WITHOUT delivering or persisting a
-// row; the worker delivers it when the window opens (at-least-once via the
+// ScheduledSendProducer is wired, Send persists a pending ReachTask audit row,
+// enqueues the attempt onto the async job queue (the payload carries that row's
+// id), and returns the pending row WITHOUT delivering; the worker delivers it
+// when the window opens and finalizes the SAME row (at-least-once via the
 // queue's pending redelivery). Zero / past ⇒ immediate send (legacy behaviour).
 type SendInput struct {
 	StoreID, MemberID, StrategyID int64
@@ -260,15 +268,24 @@ type SendInput struct {
 // (CONTRACT §19). Satisfied by a jobqueue-backed adapter wired at the
 // composition root; reach never imports the queue directly. The adapter reads
 // the tenant from ctx (Send has already enforced it) so the worker can rebuild
-// a tenant-scoped context on delivery.
+// a tenant-scoped context on delivery. taskID is the id of the pending
+// ReachTask row Send persisted before enqueueing; the adapter MUST stamp it
+// into the job payload (ScheduledSendPayload.TaskID) so the worker finalizes
+// that exact row rather than creating a duplicate.
 type ScheduledSendProducer interface {
-	EnqueueScheduledSend(ctx context.Context, in SendInput, sendAt time.Time) error
+	EnqueueScheduledSend(ctx context.Context, in SendInput, sendAt time.Time, taskID int64) error
 }
 
 // ScheduledSendPayload is the JSON job body enqueued for a deferred send
-// (jobqueue.JobReachDueSend). The worker decodes it and re-drives Service.Send
-// with ScheduledAt cleared. Defined here so the producer (bootstrap) and the
-// consumer (cmd/worker) share one definition.
+// (jobqueue.JobReachDueSend). The worker decodes it and re-drives the pipeline
+// via Service.SendFinalize with ScheduledAt cleared and TaskID passed through.
+// Defined here so the producer (bootstrap) and the consumer (cmd/worker) share
+// one definition.
 type ScheduledSendPayload struct {
 	In SendInput `json:"in"`
+	// TaskID is the id of the pending ReachTask row persisted at enqueue time.
+	// The worker finalizes THIS row (sent/blocked/failed) instead of inserting a
+	// duplicate. 0 means "no row was pre-persisted" (a legacy job enqueued before
+	// this field existed) — the worker then falls back to creating a new row.
+	TaskID int64 `json:"task_id"`
 }

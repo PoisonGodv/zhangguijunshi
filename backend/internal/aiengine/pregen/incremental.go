@@ -2,21 +2,28 @@ package pregen
 
 import (
 	"context"
+	"fmt"
 
 	"go.uber.org/zap"
 )
 
 // IncrementalRetry drains the incremental-job channel (non-blocking) and
-// re-runs the pipeline for each pending tenant, overwriting both caches
+// re-runs the pipeline for each pending job, overwriting both caches
 // (§7.7.3). Each job is attempted exactly once per tick — IncrementalRetry does
 // NOT do within-tick exponential retry (unlike BatchGenerate); a failed job is
 // logged and dropped, and the next cron tick (or a fresh EnqueueIncremental)
 // handles newly-enqueued work. The "Retry" in the name refers to the cron-level
 // cadence (every 10 min), not within-tick retry.
 //
-// Returns (processed, err): processed is the count of jobs that landed in both
-// caches this tick; err is always nil (a single job failure is logged, not
-// surfaced as a batch error — consistent with "incremental best-effort").
+// Store scoping: a job with StoreID>0 is a targeted single-store refresh that
+// runs ONLY that store; StoreID==0 re-runs every active store of the tenant via
+// runTenantStores (or the legacy storeID=0 run when no StoreEnumerator is
+// wired). Either way the per-store run is single-attempt (runAndCache, NOT
+// runWithRetry) to preserve the incremental best-effort contract.
+//
+// Returns (processed, err): processed is the count of per-store runs that landed
+// in both caches this tick; err is always nil (a single run failure is logged,
+// not surfaced as a batch error — consistent with "incremental best-effort").
 func (s *Scheduler) IncrementalRetry(ctx context.Context) (int, error) {
 	processed := 0
 	for {
@@ -28,14 +35,24 @@ func (s *Scheduler) IncrementalRetry(ctx context.Context) (int, error) {
 				// Channel closed by Stop: stop draining.
 				return processed, nil
 			}
-			if err := s.runAndCache(ctx, job.TenantID); err != nil {
-				s.log.Warn("pregen incremental job failed",
-					zap.Int64("tenant_id", job.TenantID),
-					zap.String("reason", job.Reason),
-					zap.Error(err))
+			if job.StoreID > 0 {
+				// Targeted single-store refresh (single attempt).
+				if err := s.runAndCache(ctx, job.TenantID, job.StoreID); err != nil {
+					s.log.Warn("pregen incremental job failed",
+						zap.Int64("tenant_id", job.TenantID),
+						zap.Int64("store_id", job.StoreID),
+						zap.String("reason", job.Reason),
+						zap.Error(err))
+					continue
+				}
+				processed++
 				continue
 			}
-			processed++
+			// All stores of the tenant (single attempt each). Failures are
+			// already logged by runAndCache's callers' contract; the drain stays
+			// best-effort so we only aggregate the processed count.
+			p, _ := s.runTenantStores(ctx, job.TenantID, s.runAndCache)
+			processed += p
 		default:
 			return processed, nil
 		}
@@ -46,8 +63,15 @@ func (s *Scheduler) IncrementalRetry(ctx context.Context) (int, error) {
 // (with retry). It is the worker-facing entry for the pregen_incremental job
 // (CONTRACT §19): the worker decodes the tenant from the Redis Stream job and
 // calls this to refresh that tenant's "today" cache on demand — independent of
-// the in-memory incr channel that IncrementalRetry drains. The tenant ctx is
-// built internally (Source=system); the caller passes a bare ctx.
+// the in-memory incr channel that IncrementalRetry drains. When a
+// StoreEnumerator is wired it refreshes every active store of the tenant (each
+// with retry); otherwise it falls back to the legacy single storeID=0 run. The
+// tenant ctx is built internally (Source=system); the caller passes a bare ctx.
+// Returns an error if any store run exhausts its retries.
 func (s *Scheduler) RefreshTenant(ctx context.Context, tenantID int64) error {
-	return s.runWithRetry(ctx, tenantID)
+	_, failed := s.runTenantStores(ctx, tenantID, s.runWithRetry)
+	if failed > 0 {
+		return fmt.Errorf("pregen: refresh tenant %d: %d store run(s) failed after retries", tenantID, failed)
+	}
+	return nil
 }

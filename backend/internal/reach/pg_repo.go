@@ -70,6 +70,16 @@ ORDER BY id DESC`
 SET status = $1, blocked_reason = NULLIF($2, ''), sent_at = COALESCE($3, sent_at)
 WHERE tenant_id = $4 AND id = $5
 RETURNING id, tenant_id, store_id, channel, template_code, target_count, status, blocked_reason, strategy_id, scheduled_at, sent_at, created_at`
+	// sqlReachTaskUpdate finalizes an existing row (worker delivery of a deferred
+	// send): status / blocked_reason / sent_at / target_count, matched by
+	// tenant_id + id. Same NULLIF / COALESCE semantics as UpdateTaskStatus — an
+	// empty blocked_reason clears the column and a NULL sent_at keeps the prior
+	// value. scheduled_at is intentionally NOT rewritten (it records when the
+	// send was booked). tenant_id in the WHERE keeps row isolation.
+	sqlReachTaskUpdate = `UPDATE reach_tasks
+SET status = $1, blocked_reason = NULLIF($2, ''), sent_at = COALESCE($3, sent_at), target_count = $4
+WHERE tenant_id = $5 AND id = $6
+RETURNING id, tenant_id, store_id, channel, template_code, target_count, status, blocked_reason, strategy_id, scheduled_at, sent_at, created_at`
 )
 
 // SQL for subscribe_auth (migration 000006). No UNIQUE constraint exists on
@@ -267,6 +277,31 @@ func (r *PGReachRepo) UpdateTaskStatus(ctx context.Context, tenantID, id int64, 
 		return nil, fmt.Errorf("reach: pg task update status: %w", err)
 	}
 	return t, nil
+}
+
+// UpdateTask rewrites an existing task row matched by (t.TenantID, t.ID):
+// status / blocked_reason / target_count, and sent_at when t.SentAt is non-zero
+// (a zero SentAt is passed as NULL and COALESCE keeps the stored value, matching
+// MemoryReachRepo). The deferred-send worker uses it to finalize the pending row
+// persisted at enqueue time instead of creating a duplicate. ErrNotFound when the
+// row is absent or owned by another tenant.
+func (r *PGReachRepo) UpdateTask(ctx context.Context, t *ReachTask) (*ReachTask, error) {
+	if r == nil || r.pool == nil || t == nil {
+		return nil, ErrNotFound
+	}
+	var sentAtArg any
+	if !t.SentAt.IsZero() {
+		sentAtArg = t.SentAt
+	}
+	got, err := scanReachTask(r.pool.QueryRow(ctx, sqlReachTaskUpdate,
+		t.Status, t.BlockedReason, sentAtArg, t.TargetCount, t.TenantID, t.ID))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("reach: pg task update: %w", err)
+	}
+	return got, nil
 }
 
 // GrantSubscribe idempotently accumulates quota for (tenant, member, tpl). An

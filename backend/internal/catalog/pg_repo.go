@@ -71,6 +71,13 @@ WHERE tenant_id = $1
   AND ($4 = '' OR position($4 in name) > 0 OR position($4 in barcode) > 0)
 ORDER BY id
 LIMIT $5 OFFSET $6`
+	// sqlProductUpdateTags touches ONLY the tags column (BE-A-09 write-back); it
+	// never rewrites price/cost/name, so it cannot trip the uniqueness indexes.
+	// tags is the TEXT[] column from migration 000002 (round-trips as []string).
+	sqlProductUpdateTags = `UPDATE products
+SET tags = $1, updated_at = now()
+WHERE tenant_id = $2 AND id = $3
+RETURNING id, tenant_id, store_id, barcode, name, category, unit, cost_cents, price_cents, image_url, shelf_life_days, tags, status, created_at, updated_at`
 )
 
 // ===== scan helpers =====
@@ -243,6 +250,24 @@ func (r *PGProductRepo) List(ctx context.Context, tenantID int64, f ProductFilte
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("catalog: pg product list rows: %w", err)
+	}
+	return out, nil
+}
+
+// UpdateTags replaces ONLY the tags column of the product addressed by productID
+// within tenantID (BE-A-09 write-back) and returns the updated record. It leaves
+// price/cost/name untouched, so it cannot trip the uniqueness indexes.
+// ErrNotFound when absent or cross-tenant; a nil pool returns ErrNotFound.
+func (r *PGProductRepo) UpdateTags(ctx context.Context, tenantID, productID int64, tags []string) (*Product, error) {
+	if r == nil || r.pool == nil {
+		return nil, ErrNotFound
+	}
+	out, err := scanProduct(r.pool.QueryRow(ctx, sqlProductUpdateTags, tags, tenantID, productID))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("catalog: pg product update tags: %w", err)
 	}
 	return out, nil
 }

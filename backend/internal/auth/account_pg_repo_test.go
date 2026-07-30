@@ -5,10 +5,12 @@ package auth
 // text contains regex metacharacters; same-package so it references the
 // unexported sqlAccount* constants. Reuses newMockPool / fixedTime from
 // pg_repo_test.go. store_id / password_hash / last_login_at are nullable and
-// scanned into sql.Null* (mirrors the membership pg_repo idiom).
+// scanned into sql.Null* (mirrors the membership pg_repo idiom). version is the
+// real users.version column (migration 000018).
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -18,7 +20,8 @@ import (
 )
 
 // accountColumns returns the users column list in scanAccount order. version is
-// a literal-0 column in the SELECT, included so AddRow arity matches.
+// the real users.version column (migration 000018); it is always non-null, so
+// AddRow supplies a concrete int64.
 func accountColumns() []string {
 	return []string{"id", "tenant_id", "store_id", "name", "role", "status", "password_hash", "version", "last_login_at"}
 }
@@ -41,7 +44,7 @@ func TestPGAccountRepo_FindByPhone(t *testing.T) {
 	require.Equal(t, "owner", acc.Role)
 	require.Equal(t, "active", acc.Status)
 	require.Equal(t, hash, acc.PasswordHash)
-	require.Equal(t, int64(0), acc.Version) // no version column yet -> constant 0
+	require.Equal(t, int64(0), acc.Version) // real version column (000018); row seeded at 0
 	require.Equal(t, fixedTime, acc.LastLoginAt)
 	require.Empty(t, acc.Phone, "PG path does not decrypt phone_enc")
 	// Crucially, the lookup hashes the phone the same way the seed would.
@@ -80,27 +83,66 @@ func TestPGAccountRepo_FindByUsername(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGAccountRepo(mock)
 	hash, _ := HashPassword("ops12345")
-	mock.ExpectQuery(sqlAccountByName).
+	// FindByUsername matches the username column (000018) and returns the real
+	// version. We return a non-zero version to prove it is not a constant 0.
+	mock.ExpectQuery(sqlAccountByUsername).
 		WithArgs(int64(1), "ops").
 		WillReturnRows(pgxmock.NewRows(accountColumns()).AddRow(
-			int64(2011), int64(1), nil, "ops", "platform_ops", "active", hash, int64(0), fixedTime,
+			int64(2011), int64(1), nil, "ops", "platform_ops", "active", hash, int64(3), fixedTime,
 		))
 	acc, err := repo.FindByUsername(context.Background(), 1, "ops")
 	require.NoError(t, err)
 	require.Equal(t, "platform_ops", acc.Role)
 	require.Equal(t, hash, acc.PasswordHash)
+	require.Equal(t, int64(3), acc.Version) // real version column value, not a constant 0
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestPGAccountRepo_FindByUsername_CrossTenantNotFound(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGAccountRepo(mock)
-	// name exists in tenant 1 but the query scopes tenant 2 -> no rows.
-	mock.ExpectQuery(sqlAccountByName).
+	// username exists in tenant 1 but the query scopes tenant 2 -> no rows.
+	mock.ExpectQuery(sqlAccountByUsername).
 		WithArgs(int64(2), "ops").
 		WillReturnError(pgx.ErrNoRows)
 	_, err := repo.FindByUsername(context.Background(), 2, "ops")
 	require.ErrorIs(t, err, ErrAccountNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGAccountRepo_BumpVersion(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	mock.ExpectQuery(sqlAccountBumpVersion).
+		WithArgs(int64(2001)).
+		WillReturnRows(pgxmock.NewRows([]string{"version"}).AddRow(int64(4)))
+	v, err := repo.BumpVersion(context.Background(), 2001)
+	require.NoError(t, err)
+	require.Equal(t, int64(4), v)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGAccountRepo_BumpVersion_NotFound(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	// No row updated (unknown id) -> ErrAccountNotFound.
+	mock.ExpectQuery(sqlAccountBumpVersion).
+		WithArgs(int64(9999)).
+		WillReturnError(pgx.ErrNoRows)
+	_, err := repo.BumpVersion(context.Background(), 9999)
+	require.ErrorIs(t, err, ErrAccountNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGAccountRepo_BumpVersion_DBError(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	mock.ExpectQuery(sqlAccountBumpVersion).
+		WithArgs(int64(2001)).
+		WillReturnError(errors.New("boom")) // non-NoRows DB error is wrapped
+	_, err := repo.BumpVersion(context.Background(), 2001)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrAccountNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

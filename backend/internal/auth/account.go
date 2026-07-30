@@ -28,14 +28,18 @@ type Account struct {
 	TenantID     int64
 	StoreID      int64
 	Name         string
+	Username     string // dedicated login name (users.username, migration 000018); per-tenant unique. Distinct from Name (display name, not unique). PG path leaves it empty (not selected) unless a lookup-by-username path needs it.
 	Phone        string // dev seed only; PG path leaves empty (no KMS decryption)
 	Role         string
 	Status       string
 	PasswordHash string
-	// Version is the token-revocation version. The users table has NO version
-	// column today (CONTRACT §19 note); the PG repo selects a constant 0 and
-	// TouchLogin does not bump it. A future migration adds users.version; until
-	// then Version is always 0 and the JWT ver check is a no-op.
+	// Version is the token-revocation version. The users table has a real
+	// version BIGINT NOT NULL DEFAULT 0 column (migration 000018); the PG repo
+	// selects it and BumpVersion increments it. It is the hook for
+	// revoke-on-password-change (bump on password change so old tokens' ver no
+	// longer match). The JWT ver check is still a no-op until the middleware
+	// starts comparing it, but Version is now a live value rather than a
+	// constant 0.
 	Version     int64
 	LastLoginAt time.Time
 }
@@ -66,15 +70,24 @@ type AccountRepo interface {
 	// phone is hashed with PhoneHash and matched against users.phone_hash.
 	FindByPhone(ctx context.Context, tenantID int64, phone string) (*Account, error)
 
-	// FindByUsername looks up an active platform account by name within
-	// tenantID. The users table has no dedicated username column, so the name
-	// column is reused; name is NOT globally unique, so this is only fit for
-	// the small, curated set of platform_ops accounts (see admin_login.go).
+	// FindByUsername looks up an active platform account by its dedicated
+	// username within tenantID, matching users.username (migration 000018).
+	// username is per-tenant unique (partial unique index excluding soft-deleted
+	// and NULL rows), so at most one active account matches. This is the seam the
+	// admin username+password login flow relies on (see admin_login.go).
 	FindByUsername(ctx context.Context, tenantID int64, username string) (*Account, error)
 
 	// TouchLogin sets last_login_at = now() for the account. Best-effort: the
 	// login flow ignores the returned error.
 	TouchLogin(ctx context.Context, id int64) error
+
+	// BumpVersion atomically increments users.version for the account and returns
+	// the new value. This is the hook for revoke-on-password-change: bumping
+	// version invalidates every previously issued token (their ver no longer
+	// matches). Returns ErrAccountNotFound when no row was updated. The
+	// password-change flow that calls this is a follow-up; the capability lands
+	// now so callers (and tests) can rely on it.
+	BumpVersion(ctx context.Context, id int64) (int64, error)
 }
 
 // phonePepper is the fixed app-level salt folded into phone_hash. The users

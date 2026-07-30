@@ -62,4 +62,9 @@ type ProductRepo interface {
 	GetByBarcode(ctx context.Context, tenantID, storeID int64, barcode string) (*Product, error)
 	// List returns products within tenantID matching f.
 	List(ctx context.Context, tenantID int64, f ProductFilter) ([]*Product, error)
+	// UpdateTags replaces the tag set (临期/滞销/高毛利) of the product addressed
+	// by productID within tenantID and returns the updated record. ErrNotFound
+	// if absent or cross-tenant. Used by the BE-A-09 tag write-back (the
+	// dataquality job); it touches ONLY the tags column, never price/cost.
+	UpdateTags(ctx context.Context, tenantID, productID int64, tags []string) (*Product, error)
 }

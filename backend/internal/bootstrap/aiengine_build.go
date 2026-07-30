@@ -29,6 +29,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
 	"github.com/zhangguijunshi/backend/internal/reach"
+	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/db"
@@ -54,6 +55,7 @@ func buildAIEngine(
 	marketingSvc *marketing.Service,
 	reachSvc *reach.Service,
 	groupbuySvc *groupbuy.Service,
+	storeSvc *store.Service,
 ) aiEngine {
 	// gateway.NewFromConfig builds a placeholder (empty-providers) gateway when
 	// no provider API key is configured (dev); agent.EnhanceOrSkip then degrades
@@ -123,6 +125,9 @@ func buildAIEngine(
 		pregen.WithAttribution(attrRepo, attrComputer),
 		pregen.WithBanditLearner(banditLearner),
 		pregen.WithItemEnumerator(strategyItemEnumeratorAdapter{strategySvc}),
+		// M6 ①: run the pipeline per active store (injects StoreID into ctx so
+		// the strategy domain no longer rejects the run with storeID=0).
+		pregen.WithStoreEnumerator(storeEnumeratorAdapter{storeSvc}),
 	)
 
 	return aiEngine{
