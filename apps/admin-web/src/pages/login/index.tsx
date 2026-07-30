@@ -1,42 +1,100 @@
-// src/pages/login/index.tsx — 登录页占位 (FE-ADMIN-01)
-// 本轮不实现真登录 (BE-A-01 延后); 重定向到 dashboard 并提示 dev 头模式。
-import { useEffect } from 'react'
-import { Result, Button, Typography, Alert } from 'antd'
+// src/pages/login/index.tsx — 平台运营登录页 (FE-ADMIN / BE-A-01 真登录)
+//
+// 账号(平台运营 name)+密码登录 → POST /v1/admin/auth/login → 存 admin_token
+// (localStorage) → 跳经营看板。request.ts 的请求拦截器随后自动注入
+// Authorization: Bearer <jwt>。登录失败由 request 拦截器统一中文提示。
+import { useState } from 'react'
+import { Form, Input, Button, Card, Typography, Alert, App } from 'antd'
+import { UserOutlined, LockOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
+import { api, setToken } from '@/services/request'
 
-const { Paragraph } = Typography
+const { Title, Paragraph } = Typography
+
+interface LoginResult {
+  access_token: string
+  refresh_token: string
+  expires_in: number
+  token_type: string
+}
+
+interface LoginForm {
+  username: string
+  password: string
+}
 
 export default function LoginPage() {
   const navigate = useNavigate()
-  useEffect(() => {
-    // 本轮 dev 头模式: 不校验 token, 直接重定向看板。
-    // BE-A-01 落地后: 在此实现账号密码登录 → /v1/admin/login → 存 admin_token。
-    const t = setTimeout(() => navigate('/dashboard', { replace: true }), 0)
-    return () => clearTimeout(t)
-  }, [navigate])
+  const { message } = App.useApp()
+  const [loading, setLoading] = useState(false)
+
+  const onFinish = async (values: LoginForm) => {
+    setLoading(true)
+    try {
+      const res = await api.post<LoginResult>('/admin/auth/login', {
+        username: values.username.trim(),
+        password: values.password,
+      })
+      if (!res?.access_token) {
+        message.error('登录响应缺少 token')
+        return
+      }
+      setToken(res.access_token)
+      message.success('登录成功')
+      navigate('/dashboard', { replace: true })
+    } catch {
+      // 错误提示已由 request 拦截器统一处理 (中文映射)。
+    } finally {
+      setLoading(false)
+    }
+  }
 
   return (
-    <Result
-      status="info"
-      title="管理后台登录 (待 BE-A-01 实现)"
-      subTitle="当前为 dev 头直连模式, 无需登录, 已自动重定向至经营看板。"
-      extra={
-        <div>
+    <div
+      style={{
+        minHeight: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: '#f0f2f5',
+      }}
+    >
+      <Card style={{ width: 380, boxShadow: '0 2px 8px rgba(0,0,0,0.09)' }}>
+        <Title level={3} style={{ textAlign: 'center', marginBottom: 4 }}>
+          掌柜军师 · 平台运营
+        </Title>
+        <Paragraph type="secondary" style={{ textAlign: 'center', marginBottom: 24 }}>
+          请登录管理后台
+        </Paragraph>
+        <Form<LoginForm> layout="vertical" onFinish={onFinish} autoComplete="off">
+          <Form.Item
+            name="username"
+            rules={[{ required: true, message: '请输入账号' }]}
+          >
+            <Input prefix={<UserOutlined />} placeholder="账号 (平台运营 name)" size="large" />
+          </Form.Item>
+          <Form.Item
+            name="password"
+            rules={[{ required: true, message: '请输入密码' }]}
+          >
+            <Input.Password prefix={<LockOutlined />} placeholder="密码" size="large" />
+          </Form.Item>
+          <Form.Item>
+            <Button type="primary" htmlType="submit" size="large" block loading={loading}>
+              登录
+            </Button>
+          </Form.Item>
+        </Form>
+        {import.meta.env.DEV && (
           <Alert
-            type="warning"
+            type="info"
             showIcon
-            message="dev 模式: 请求注入 X-Mock-Tenant=1 / X-Mock-Store=0 / X-Mock-User=dev / X-Mock-Role=owner"
-            description="prod 模式改为 JWT Authorization 头 (BE-A-01 落地后启用)。"
-            style={{ marginBottom: 16, textAlign: 'left' }}
+            message="dev 提示"
+            description="未登录时请求会回落 X-Mock-* 头直连 (request.ts)。demo 平台账号: name=ops / 密码=ops12345 (tenant 1)。"
+            style={{ marginTop: 8 }}
           />
-          <Paragraph type="secondary">
-            鉴权头注入逻辑见 <code>src/services/request.ts</code>。
-          </Paragraph>
-          <Button type="primary" onClick={() => navigate('/dashboard', { replace: true })}>
-            进入经营看板
-          </Button>
-        </div>
-      }
-    />
+        )}
+      </Card>
+    </div>
   )
 }

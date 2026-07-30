@@ -75,13 +75,16 @@ ai:
   default_provider: ${ZG_AI_DEFAULT_PROVIDER}   # prod: which provider is active
   request_timeout: "8s"
   monthly_budget_cny: 2.0           # prod: per-tenant monthly AI cost ceiling
-  providers: {}                     # prod: providers injected via ZG_AI_PROVIDERS_* env, not committed
-  # prod: task-tier -> provider+model routes injected via env (M3-S2 §13.3.7).
-  # Empty -> every tier falls back to defaultRoute. Staging/prod example:
-  #   routes:
-  #     lite: { provider: doubao,  model: doubao-lite-32k }
-  #     v3:   { provider: deepseek, model: deepseek-chat }
-  #     r1:   { provider: deepseek, model: deepseek-reasoner }
+  # prod: providers/routes are MAP fields — viper's AutomaticEnv cannot fill
+  # maps, so config.go scans the environment directly (CONTRACT §19 / plan B3):
+  #   ZG_AI_PROVIDERS_<NAME>_BASE_URL | _API_KEY | _MODEL   (NAME e.g. QWEN)
+  #   ZG_AI_ROUTES_<TIER>_PROVIDER | _MODEL                 (TIER e.g. V3)
+  # Names/tiers are lower-cased into the maps below. Leave the maps empty here;
+  # the env scan fills them at load time (yaml values, if any, are preserved).
+  providers: {}
+  # prod: task-tier -> provider+model routes injected via ZG_AI_ROUTES_* env.
+  # Empty -> every tier falls back to defaultRoute. Example (via env, not yaml):
+  #   ZG_AI_ROUTES_LITE_PROVIDER=doubao   ZG_AI_ROUTES_V3_PROVIDER=deepseek
   routes: {}
 
 otel:
@@ -100,6 +103,37 @@ cos:
   bucket: ${ZG_COS_BUCKET}
   endpoint: ${ZG_COS_ENDPOINT}
 
+payment:
+  # prod: WeChat Pay V3 service-provider credentials (CONTRACT §15.5.8 / §19),
+  # env-injected from SSM/KMS, never committed. When all required fields are
+  # present the wiring builds the REAL V3 client (internal/payment/v3*.go);
+  # otherwise it falls back to FakeWxPay (which never networks). private_key_pem
+  # (inline) and private_key_file (mounted path) are mutually exclusive; PEM wins.
+  mch_id: ${ZG_PAYMENT_MCH_ID}
+  api_v3_key: ${ZG_PAYMENT_API_V3_KEY}
+  cert_serial: ${ZG_PAYMENT_CERT_SERIAL}
+  private_key_file: ${ZG_PAYMENT_PRIVATE_KEY_FILE}
+  platform_cert_url: ${ZG_PAYMENT_PLATFORM_CERT_URL}
+  notify_url: ${ZG_PAYMENT_NOTIFY_URL}
+  base_url: ${ZG_PAYMENT_BASE_URL}
+  timeout: "10s"
+
+job_queue:
+  # prod: Redis Stream job queue shared by the worker binary + in-process
+  # producers (reach scheduled-send). nil-safe: with no Redis the producer is a
+  # no-op and the consumer does not start (CONTRACT §19).
+  stream: "zg:jobs"
+  group: "zg-workers"
+  consumer: ${ZG_JOBQUEUE_CONSUMER}    # unique per worker replica (e.g. worker-1)
+  block: "5s"
+  max_len: 10000
+
+scheduler:
+  # prod: the pregen cron runs in the dedicated cron binary, NOT in-process, so
+  # the api and cron never double-tick (CONTRACT §19). dev sets this true.
+  run_in_api: false
+
 multitenancy:
   strict: true                      # prod: hard-enforce tenant on every repo call
   dev_mock_header: false           # prod: MOCK header OFF — rely on JWT (dev had true)
+  platform_tenant_id: 1            # prod: tenant hosting platform_ops (admin login)

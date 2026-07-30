@@ -1,21 +1,15 @@
-package main
+package bootstrap
 
-// aiengine_adapters.go wires the M3-S1 AI engine's anti-corruption ports to the
-// concrete domain services (CONTRACT §12.3.2 signal.Lookuper, §12.3.9 exec's
-// four ports). Each adapter is a thin struct that translates one domain call
-// into the port's shape at the composition root, so aiengine imports no
-// concrete domain package.
-//
-// M3-S1 best-effort signal: membership has no List method / Member has no
-// Birthday field, and inventory's BatchRepo has no cross-product nearing list
-// (ListActiveBatchesFIFO is per-product). The signalLookuperAdapter therefore
-// returns empty / zero stats, and the pipeline's cold-start seed compensates
-// (CONTRACT §12.5.5 + §12.8 显式延后). Real enumeration lands in M3-S2 alongside
-// strategy_cache. Tests that need realistic signals inject a fake Lookuper
-// directly into a hand-built Pipeline.
+// adapters.go hosts the anti-corruption adapters the composition root uses to
+// bind concrete domain services onto the narrower ports of neighbouring
+// domains (CONTRACT §8.3 / §9.3 / §10.3 / §11.3.2 / §12.3 / §14.3 / §15.7).
+// These were previously spread across cmd/api/{main,aiengine_adapters,
+// payment_adapters}.go; they moved here so the api / worker / cron binaries all
+// compose the identical object graph. Logic is unchanged.
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/zhangguijunshi/backend/internal/aiengine/attribution"
@@ -24,17 +18,200 @@ import (
 	"github.com/zhangguijunshi/backend/internal/aiengine/signal"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
+	"github.com/zhangguijunshi/backend/internal/compliance/contentfilter"
+	"github.com/zhangguijunshi/backend/internal/compliance/freqcircuit"
 	"github.com/zhangguijunshi/backend/internal/groupbuy"
 	"github.com/zhangguijunshi/backend/internal/inventory"
+	"github.com/zhangguijunshi/backend/internal/margin"
 	"github.com/zhangguijunshi/backend/internal/marketing"
 	"github.com/zhangguijunshi/backend/internal/membership"
+	"github.com/zhangguijunshi/backend/internal/payment"
 	"github.com/zhangguijunshi/backend/internal/reach"
 	"github.com/zhangguijunshi/backend/internal/strategy"
+	"github.com/zhangguijunshi/backend/internal/subscription"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
+// defaultMarginFloorPct is the gross-margin floor (10%) the marketing margin
+// guard enforces on coupon issuance.
+const defaultMarginFloorPct = 10
+
+// ---- catalog ↔ billing / inventory / marketing / margin ----
+
+// catalogPricer adapts *catalog.Service to billing.ProductPricer (CONTRACT §8.3).
+type catalogPricer struct{ svc *catalog.Service }
+
+func (p catalogPricer) GetByID(ctx context.Context, tenantID, id int64) (*billing.PricedProduct, error) {
+	prod, err := p.svc.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if prod.TenantID != tenantID {
+		return nil, catalog.ErrNotFound
+	}
+	return &billing.PricedProduct{
+		ID:         prod.ID,
+		TenantID:   prod.TenantID,
+		StoreID:    prod.StoreID,
+		Name:       prod.Name,
+		Unit:       prod.Unit,
+		PriceCents: prod.PriceCents,
+		CostCents:  prod.CostCents,
+		Status:     prod.Status,
+	}, nil
+}
+
+// catalogProductLookuper adapts *catalog.Service to inventory.ProductLookuper
+// (CONTRACT §9.3).
+type catalogProductLookuper struct{ svc *catalog.Service }
+
+func (l catalogProductLookuper) Exists(ctx context.Context, tenantID, productID int64) (bool, error) {
+	prod, err := l.svc.GetByID(ctx, productID)
+	if err != nil {
+		if errors.Is(err, catalog.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if prod.TenantID != tenantID {
+		return false, nil
+	}
+	return true, nil
+}
+
+// inventoryStockConsumer adapts *inventory.Service to billing.StockConsumer
+// (CONTRACT §9.3).
+type inventoryStockConsumer struct{ svc *inventory.Service }
+
+func (c inventoryStockConsumer) ConsumeFIFO(ctx context.Context, storeID, productID, qty, refOrderID int64) error {
+	_, err := c.svc.ConsumeFIFO(ctx, storeID, productID, qty, refOrderID)
+	return err
+}
+
+// membershipLookuper adapts *membership.Service to marketing.MemberLookuper
+// (CONTRACT §10.3).
+type membershipLookuper struct{ svc *membership.Service }
+
+func (l membershipLookuper) Exists(ctx context.Context, tenantID, memberID int64) (bool, error) {
+	m, err := l.svc.GetMember(ctx, memberID)
+	if err != nil {
+		if errors.Is(err, membership.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if m.TenantID != tenantID {
+		return false, nil
+	}
+	return true, nil
+}
+
+// catalogMarginGuard adapts margin.Guard + *catalog.Service to
+// marketing.MarginGuard (CONTRACT §10.3). Best-effort: a catalog read failure
+// skips the check rather than blocking issuance.
+type catalogMarginGuard struct {
+	guard      margin.Guard
+	catalogSvc *catalog.Service
+}
+
+func (g catalogMarginGuard) ValidateCoupon(ctx context.Context, c *marketing.Coupon) error {
+	prods, err := g.catalogSvc.List(ctx, catalog.ProductFilter{Limit: 500})
+	if err != nil {
+		return nil
+	}
+	products := make([]margin.ProductView, 0, len(prods))
+	for _, p := range prods {
+		products = append(products, margin.ProductView{
+			ID:         p.ID,
+			CostCents:  p.CostCents,
+			PriceCents: p.PriceCents,
+		})
+	}
+	rule := margin.CouponRule{
+		Type:             c.Type,
+		ThresholdCents:   c.Params.ThresholdCents,
+		OffCents:         c.Params.OffCents,
+		DiscountPermille: c.Params.DiscountPermille,
+	}
+	return margin.ValidateCoupon(g.guard, rule, products)
+}
+
+// ---- reach ↔ freqcircuit / contentfilter ----
+
+// freqGateAdapter adapts *freqcircuit.Service to reach.FreqGate (CONTRACT §11.3.2).
+type freqGateAdapter struct{ svc *freqcircuit.Service }
+
+func (a freqGateAdapter) Allow(ctx context.Context, channel string) (bool, string, error) {
+	return a.svc.Allow(ctx, freqcircuit.Channel(channel))
+}
+
+// cfFilterAdapter adapts *contentfilter.Filter to reach.ContentFilter
+// (CONTRACT §11.3.2).
+type cfFilterAdapter struct{ f *contentfilter.Filter }
+
+func (a cfFilterAdapter) Do(text string) reach.ContentResult {
+	r := a.f.Do(text)
+	return reach.ContentResult{
+		Text:     r.Text,
+		Passed:   r.Passed,
+		HitWords: r.HitWords,
+		Replaced: r.Replaced,
+	}
+}
+
+// ---- payment ↔ billing / membership / subscription ----
+
+// paymentFulfiller routes a successful payment to the domain its Subject names
+// (CONTRACT §15.7). nil domains are skipped.
+type paymentFulfiller struct {
+	bill *billing.Service
+	mbr  *membership.Service
+	sub  *subscription.Service
+}
+
+var _ payment.Fulfiller = (*paymentFulfiller)(nil)
+
+func (f paymentFulfiller) Fulfill(ctx context.Context, p *payment.Payment) error {
+	switch p.Subject {
+	case payment.SubjectOrder:
+		if f.bill == nil || p.PaidAt == nil {
+			return nil
+		}
+		_, err := f.bill.MarkOrderPaid(ctx, p.RefID, p.OutTradeNo, *p.PaidAt)
+		return err
+	case payment.SubjectRecharge:
+		if f.mbr == nil {
+			return nil
+		}
+		_, err := f.mbr.Recharge(ctx, membership.RechargeInput{
+			MemberID:     p.RefID,
+			AmountCents:  p.AmountCents,
+			RefPaymentID: p.ID,
+		})
+		return err
+	case payment.SubjectSubscription:
+		if f.sub == nil {
+			return nil
+		}
+		_, err := f.sub.ConfirmPayment(ctx, p.TenantID, p.AmountCents, p.Provider, p.OutTradeNo)
+		return err
+	}
+	return nil
+}
+
+// ---- aiengine ↔ domain services (M3-S1 §12.3 / M3-S3 §14.3) ----
+
+// withTenantCtx injects tenantID as a system-sourced identity so the adapters
+// can call domain services that resolve tenant via multitenancy.EnforceTenant.
+func withTenantCtx(ctx context.Context, tenantID int64) context.Context {
+	return multitenancy.WithContext(ctx, multitenancy.Context{
+		TenantID: tenantID,
+		Source:   multitenancy.SourceSystem,
+	})
+}
+
 // signalLookuperAdapter adapts catalog/inventory/membership/billing to
-// signal.Lookuper. M3-S1 best-effort (see file comment).
+// signal.Lookuper.
 type signalLookuperAdapter struct {
 	catalogSvc    *catalog.Service
 	inventorySvc  *inventory.Service
@@ -42,20 +219,13 @@ type signalLookuperAdapter struct {
 	billingSvc    *billing.Service
 }
 
-// Inventory returns nearing-expiry items by enumerating inventory batches
-// (M3-S2: real enumeration via ListNearingBatches, replacing M3-S1's best-effort
-// empty return). Each nearing batch is enriched with the product's name / cost /
-// price via catalog.GetByID; a catalog miss leaves CostCents from the batch and
-// PriceCents=0 (rule's margin guard then skips it). SlowMoving/HighMargin stay
-// false (M3-S2 does not yet compute those tags here — dataquality integration
-// is a later milestone).
 func (a signalLookuperAdapter) Inventory(ctx context.Context, _, storeID int64) ([]signal.InventorySig, error) {
 	if a.inventorySvc == nil {
 		return nil, nil
 	}
-	batches, err := a.inventorySvc.ListNearingBatches(ctx, storeID, 3) // ≤3 天临期
+	batches, err := a.inventorySvc.ListNearingBatches(ctx, storeID, 3)
 	if err != nil {
-		return nil, nil // best-effort: degrade to empty, cold-start covers
+		return nil, nil
 	}
 	out := make([]signal.InventorySig, 0, len(batches))
 	for _, b := range batches {
@@ -72,7 +242,7 @@ func (a signalLookuperAdapter) Inventory(ctx context.Context, _, storeID int64) 
 		if a.catalogSvc != nil {
 			if p, perr := a.catalogSvc.GetByID(ctx, b.ProductID); perr == nil && p != nil {
 				sig.Name = p.Name
-				sig.CostCents = p.CostCents // catalog's cost is authoritative
+				sig.CostCents = p.CostCents
 				sig.PriceCents = p.PriceCents
 			}
 		}
@@ -81,10 +251,6 @@ func (a signalLookuperAdapter) Inventory(ctx context.Context, _, storeID int64) 
 	return out, nil
 }
 
-// Members returns member-aggregate stats by enumerating members (M3-S2: real
-// enumeration via ListMembers, replacing M3-S1's best-effort zero). Three
-// scoped queries: sleep_30 (LastVisitAt < now-30d), birthday_today, high_value
-// (Points ≥ 1000). Errors degrade to empty (cold-start covers).
 func (a signalLookuperAdapter) Members(ctx context.Context, _ int64) (signal.MemberStats, error) {
 	if a.membershipSvc == nil {
 		return signal.MemberStats{}, nil
@@ -105,14 +271,11 @@ func (a signalLookuperAdapter) Members(ctx context.Context, _ int64) (signal.Mem
 	return signal.MemberStats{Sleep30: len(sleepers), HighValue: hvIDs, BirthdayToday: bdIDs}, nil
 }
 
-// DailyTxn returns the daily transaction aggregate. M3-S1 best-effort: zero
-// (billing.DailySummary wiring deferred); cold-start covers.
 func (a signalLookuperAdapter) DailyTxn(_ context.Context, _, _ int64, _ string) (signal.TxnSig, error) {
 	return signal.TxnSig{}, nil
 }
 
 // couponIssuerAdapter adapts marketing.Service.Issue to exec.CouponIssuer.
-// Source is fixed "ai_strategy"; strategyID is the attribution key.
 type couponIssuerAdapter struct{ svc *marketing.Service }
 
 func (a couponIssuerAdapter) Issue(ctx context.Context, memberID, couponID, strategyID int64, expireAt *time.Time) (*exec.CouponRef, error) {
@@ -129,10 +292,7 @@ func (a couponIssuerAdapter) Issue(ctx context.Context, memberID, couponID, stra
 	return &exec.CouponRef{MemberCouponID: mc.ID, MemberID: mc.MemberID}, nil
 }
 
-// msgSenderAdapter adapts reach.Service.Send to exec.MessageSender. A blocked
-// send returns (task, nil) at reach; this adapter copies task.Status /
-// BlockedReason into SendRef so the executor attributes it (blocked is NOT
-// failure).
+// msgSenderAdapter adapts reach.Service.Send to exec.MessageSender.
 type msgSenderAdapter struct{ svc *reach.Service }
 
 func (a msgSenderAdapter) Send(ctx context.Context, storeID, memberID, strategyID int64, channel, tplCode string, vars map[string]string) (*exec.SendRef, error) {
@@ -159,8 +319,6 @@ func (a priceUpdaterAdapter) UpdatePrice(ctx context.Context, productID, costCen
 }
 
 // groupbuyOpenerAdapter adapts groupbuy.Service.Create to exec.GroupbuyOpener.
-// strategyID is the attribution key written onto the Groupbuy row (M3-S3
-// groupbuy→strategy linkage), so groupbuy_success can be attributed back.
 type groupbuyOpenerAdapter struct{ svc *groupbuy.Service }
 
 func (a groupbuyOpenerAdapter) Launch(ctx context.Context, storeID, productID int64, title string, priceCents int64, requiredCount, validHours int, strategyID int64) (*exec.GroupbuyRef, error) {
@@ -180,9 +338,8 @@ func (a groupbuyOpenerAdapter) Launch(ctx context.Context, storeID, productID in
 }
 
 // tenantEnumeratorAdapter adapts the pregen scheduler's TenantEnumerator port.
-// dev stub: ActiveTenantIDs returns nil (no real tenant store wired) so the
-// pregen BatchGenerate is a no-op in dev; production wires tenant.Service.List
-// (or a SQL enumerate) here to drive the 03:00 full-batch pre-generation.
+// dev stub: ActiveTenantIDs returns nil so the pregen BatchGenerate is a no-op
+// until production wires a real tenant store.
 type tenantEnumeratorAdapter struct{}
 
 func (tenantEnumeratorAdapter) ActiveTenantIDs(_ context.Context) ([]int64, error) {
@@ -190,13 +347,7 @@ func (tenantEnumeratorAdapter) ActiveTenantIDs(_ context.Context) ([]int64, erro
 }
 
 // strategyItemEnumeratorAdapter adapts strategy.Service onto pregen's
-// StrategyItemEnumerator port (M3-S3 §14.7). ListExecutedSince walks the
-// tenant's strategies and returns items in the executed state whose
-// ExecutedAt is at or after `since`, each annotated with its strategy's
-// StoreID (StrategyItem has no StoreID field). Cross-tenant records are never
-// returned (strategy.Service resolves tenant from ctx via EnforceTenant).
-// Limit caps the strategy scan (<=0 → 200) — a tuned pgx query replaces this
-// once the pgx repo lands (CONTRACT §14.8).
+// StrategyItemEnumerator port (M3-S3 §14.7).
 type strategyItemEnumeratorAdapter struct{ svc *strategy.Service }
 
 func (a strategyItemEnumeratorAdapter) ListExecutedSince(ctx context.Context, tenantID int64, since time.Time, limit int) ([]pregen.ExecutedItem, error) {
@@ -229,7 +380,6 @@ func (a strategyItemEnumeratorAdapter) ListExecutedSince(ctx context.Context, te
 	return out, nil
 }
 
-// Compile-time: the adapters satisfy their respective anti-corruption ports.
 var (
 	_ attribution.CouponStats       = (*couponStatsAdapter)(nil)
 	_ attribution.VisitCounter      = (*visitCounterAdapter)(nil)
@@ -239,24 +389,8 @@ var (
 	_ pregen.StrategyItemEnumerator = (*strategyItemEnumeratorAdapter)(nil)
 )
 
-// withTenantCtx injects tenantID into ctx as a system-sourced identity so the
-// anti-corruption port adapters can call domain services that resolve tenant
-// via multitenancy.EnforceTenant(ctx). The M3-S3 attribution/bandit ports pass
-// tenantID explicitly (CONTRACT §14.3 frozen signatures) AND the domain
-// services re-derive it from ctx — we align the two here (CONTRACT §14.7).
-func withTenantCtx(ctx context.Context, tenantID int64) context.Context {
-	return multitenancy.WithContext(ctx, multitenancy.Context{
-		TenantID: tenantID,
-		Source:   multitenancy.SourceSystem,
-	})
-}
-
 // couponStatsAdapter adapts marketing.Service.ListByStrategy onto
-// attribution.CouponStats. SentRedeemed returns the coupons issued
-// (sent) and redeemed (used) under one strategy_id — the AI attribution link
-// (marketing.MemberCoupon.StrategyID, M3-S3 additive). sent==0 means the
-// strategy issued no coupons (non-coupon action) → the Computer skips the
-// coupon_redeem metric. Errors degrade to (0,0,nil) (best-effort, §14.5).
+// attribution.CouponStats.
 type couponStatsAdapter struct{ svc *marketing.Service }
 
 func (a couponStatsAdapter) SentRedeemed(ctx context.Context, tenantID, strategyID int64) (int, int, error) {
@@ -278,10 +412,7 @@ func (a couponStatsAdapter) SentRedeemed(ctx context.Context, tenantID, strategy
 }
 
 // visitCounterAdapter adapts billing.Service.DailySummary onto
-// attribution.VisitCounter. SinceCount sums paid order counts per natural day
-// across [since, now]; BaselineCount returns the 7-day-pre average daily order
-// count scaled to the same window duration (dev approximation, §14.7/§14.8 — a
-// tuned pgx query replaces this once the pgx repo lands). Errors degrade to 0.
+// attribution.VisitCounter.
 type visitCounterAdapter struct{ svc *billing.Service }
 
 func (a visitCounterAdapter) SinceCount(ctx context.Context, tenantID, storeID int64, since time.Time) (int, error) {
@@ -306,7 +437,6 @@ func (a visitCounterAdapter) BaselineCount(ctx context.Context, tenantID, storeI
 		return 0, nil
 	}
 	bctx := withTenantCtx(ctx, tenantID)
-	// Average paid orders per day over the 7 days preceding `before`.
 	var sum float64
 	n := 0
 	for i := 1; i <= 7; i++ {
@@ -322,15 +452,10 @@ func (a visitCounterAdapter) BaselineCount(ctx context.Context, tenantID, storeI
 		return 0, nil
 	}
 	avgDaily := sum / float64(n)
-	// Scale the per-day average to the actual window duration.
 	return avgDaily * (float64(window) / float64(24*time.Hour)), nil
 }
 
 // groupbuyStatsAdapter adapts groupbuy onto attribution.GroupbuyStats.
-// StartedSucceeded proxies to Service.StatsByStrategy so the groupbuy_success
-// 归因 metric is computed from real groupbuy rows linked to the strategy_id
-// (M3-S3 groupbuy→strategy linkage). strategyID<=0 or a nil svc yields
-// (0,0,nil) → the Computer skips the metric (no panic, no leakage).
 type groupbuyStatsAdapter struct{ svc *groupbuy.Service }
 
 func (a groupbuyStatsAdapter) StartedSucceeded(ctx context.Context, tenantID, strategyID int64) (int, int, error) {
@@ -340,13 +465,8 @@ func (a groupbuyStatsAdapter) StartedSucceeded(ctx context.Context, tenantID, st
 	return a.svc.StatsByStrategy(withTenantCtx(ctx, tenantID), strategyID)
 }
 
-// repurchaseCounterAdapter adapts marketing.Service.MembersByStrategy +
-// billing.Service.RepurchaseMembers onto attribution.RepurchaseCounter (the
-// M3-S3 repurchase 归因 feed). Rate returns the share of the strategy-touched
-// members who placed ≥1 paid order in [executedAt, measuredAt] (inclusive),
-// clipped to [0,1]. A nil mkt/bill, an empty touched set, or any upstream error
-// degrades to (0, nil) so the Computer's repurchase metric simply isn't
-// emitted (best-effort, §14.5 — never panics, never leaks cross-tenant).
+// repurchaseCounterAdapter adapts marketing.MembersByStrategy +
+// billing.RepurchaseMembers onto attribution.RepurchaseCounter.
 type repurchaseCounterAdapter struct {
 	mkt  *marketing.Service
 	bill *billing.Service
@@ -378,9 +498,7 @@ func (a repurchaseCounterAdapter) Rate(ctx context.Context, tenantID, strategyID
 	return v, nil
 }
 
-// itemLoaderAdapter adapts strategy.Service.GetItem onto attribution.ItemLoader
-// (the Computer resolves an item to compute Reward without importing
-// strategy.Service, CONTRACT §14.3.0 / §14.3.1).
+// itemLoaderAdapter adapts strategy.Service.GetItem onto attribution.ItemLoader.
 type itemLoaderAdapter struct{ svc *strategy.Service }
 
 func (a itemLoaderAdapter) GetItem(ctx context.Context, tenantID, itemID int64) (*strategy.StrategyItem, error) {
@@ -390,9 +508,7 @@ func (a itemLoaderAdapter) GetItem(ctx context.Context, tenantID, itemID int64) 
 	return a.svc.GetItem(withTenantCtx(ctx, tenantID), itemID)
 }
 
-// itemResolverAdapter adapts strategy.Service onto bandit.ItemResolver. Resolve
-// maps an item to its arm key (ruleID = item.ReasonType), owning strategyID, and
-// storeID (via the parent strategy). bandit never imports strategy (§14.3.0).
+// itemResolverAdapter adapts strategy.Service onto bandit.ItemResolver.
 type itemResolverAdapter struct{ svc *strategy.Service }
 
 func (a itemResolverAdapter) Resolve(ctx context.Context, tenantID, itemID int64) (string, int64, int64, error) {

@@ -28,6 +28,9 @@ type Config struct {
 	AccessTTL    time.Duration
 	RefreshTTL   time.Duration
 	RefreshSlack time.Duration // renew refresh when remaining TTL below this; 0 -> default 7d
+	// PlatformTenantID is the tenant that owns platform_ops accounts; AdminLogin
+	// looks up username within this tenant. 0 defaults to tenant 1 (set by caller).
+	PlatformTenantID int64
 }
 
 // AuthService is the consumer-auth orchestrator.
@@ -36,11 +39,14 @@ type AuthService struct {
 	jwt          *jwt.Manager
 	store        jwt.SessionStore
 	repo         ConsumerRepo
+	accountRepo  AccountRepo // staff-account repo; nil disables boss/admin login (CONTRACT §19)
 	appID        string
 	secret       string
 	accessTTL    time.Duration
 	refreshTTL   time.Duration
 	refreshSlack time.Duration
+	// platformTenantID is the tenant owning platform_ops accounts (AdminLogin scope).
+	platformTenantID int64
 }
 
 // New constructs an AuthService. The same wx credentials are used for every
@@ -52,15 +58,16 @@ func New(cfg Config, wx Code2Sessioner, mgr *jwt.Manager, store jwt.SessionStore
 		slack = 7 * 24 * time.Hour // tech plan §6.2.5: renew refresh when < 7d left
 	}
 	return &AuthService{
-		wx:           wx,
-		jwt:          mgr,
-		store:        store,
-		repo:         repo,
-		appID:        cfg.AppID,
-		secret:       cfg.Secret,
-		accessTTL:    cfg.AccessTTL,
-		refreshTTL:   cfg.RefreshTTL,
-		refreshSlack: slack,
+		wx:               wx,
+		jwt:              mgr,
+		store:            store,
+		repo:             repo,
+		appID:            cfg.AppID,
+		secret:           cfg.Secret,
+		accessTTL:        cfg.AccessTTL,
+		refreshTTL:       cfg.RefreshTTL,
+		refreshSlack:     slack,
+		platformTenantID: cfg.PlatformTenantID,
 	}
 }
 

@@ -21,6 +21,9 @@ type Config struct {
 	AI           AIConfig           `mapstructure:"ai"`
 	OTel         OTelConfig         `mapstructure:"otel"`
 	COS          COSConfig          `mapstructure:"cos"`
+	Payment      PaymentConfig      `mapstructure:"payment"`
+	JobQueue     JobQueueConfig     `mapstructure:"job_queue"`
+	Scheduler    SchedulerConfig    `mapstructure:"scheduler"`
 	Multitenancy MultitenancyConfig `mapstructure:"multitenancy"`
 }
 
@@ -138,6 +141,50 @@ type COSConfig struct {
 	Endpoint  string `mapstructure:"endpoint"`
 }
 
+// PaymentConfig holds the WeChat Pay V3 service-provider credentials (CONTRACT
+// §15.5.8). All fields are env-injected in prod (never committed). When the
+// required fields are absent the wiring falls back to FakeWxPay (dev/test); the
+// real V3 client (internal/payment/v3*.go) is used otherwise. PrivateKeyPEM
+// (inline) and PrivateKeyFile (path) are mutually exclusive; PEM wins when both
+// are set.
+type PaymentConfig struct {
+	MchID           string        `mapstructure:"mch_id"`            // 服务商商户号
+	APiv3Key        string        `mapstructure:"api_v3_key"`        // APIv3 密钥 (AES-GCM 解密 resource + 证书)
+	CertSerial      string        `mapstructure:"cert_serial"`       // 商户 API 证书序列号
+	PrivateKeyPEM   string        `mapstructure:"private_key_pem"`   // 商户 API 私钥 PEM (内联)
+	PrivateKeyFile  string        `mapstructure:"private_key_file"`  // 商户 API 私钥 PEM (文件路径)
+	PlatformCertURL string        `mapstructure:"platform_cert_url"` // 平台证书拉取端点; 空 -> 官方 /v3/certificates
+	NotifyURL       string        `mapstructure:"notify_url"`        // 支付回调通知地址
+	BaseURL         string        `mapstructure:"base_url"`          // V3 网关; 空 -> api.mch.weixin.qq.com
+	Timeout         time.Duration `mapstructure:"timeout"`
+}
+
+// Configured reports whether the minimum V3 fields are present to build the real
+// client. Missing any → wiring keeps FakeWxPay (dev/test never networks).
+func (c PaymentConfig) Configured() bool {
+	return c.MchID != "" && c.APiv3Key != "" && c.CertSerial != "" &&
+		(c.PrivateKeyPEM != "" || c.PrivateKeyFile != "")
+}
+
+// JobQueueConfig configures the Redis Stream job queue shared by the worker and
+// the in-process producers (reach scheduled-send / pregen incremental). When
+// Redis is unavailable the producer degrades to a no-op log and the consumer
+// does not start (CONTRACT §19).
+type JobQueueConfig struct {
+	Stream   string        `mapstructure:"stream"`   // Redis Stream 名 (XADD/XREADGROUP)
+	Group    string        `mapstructure:"group"`    // consumer group
+	Consumer string        `mapstructure:"consumer"` // consumer 名 (区分 worker 实例)
+	Block    time.Duration `mapstructure:"block"`    // XREADGROUP block 时长
+	MaxLen   int64         `mapstructure:"max_len"`  // stream 近似裁剪长度 (XADD MAXLEN ~ n)
+}
+
+// SchedulerConfig governs where the pregen cron runs. dev runs it inside the api
+// process (single-binary convenience); prod runs it in the dedicated cron binary
+// and sets RunInAPI=false so the two never double-tick (CONTRACT §19).
+type SchedulerConfig struct {
+	RunInAPI bool `mapstructure:"run_in_api"` // true: api 进程内嵌 pregen; false: 仅 cron 二进制
+}
+
 // MultitenancyConfig governs the row-level isolation guard (ARCH-01).
 type MultitenancyConfig struct {
 	Strict bool `mapstructure:"strict"` // hard-enforce tenant on every repo call
@@ -146,4 +193,9 @@ type MultitenancyConfig struct {
 	// from real JWT auth. MUST be false in staging/prod. Default false; dev
 	// config sets it true.
 	DevMockHeader bool `mapstructure:"dev_mock_header"`
+	// PlatformTenantID is the tenant that hosts platform_ops accounts (admin
+	// login, CONTRACT §19). AdminLogin resolves the username under this tenant
+	// and signs a Scene=admin JWT. Default 1; override via
+	// multitenancy.platform_tenant_id for non-default platform tenants.
+	PlatformTenantID int64 `mapstructure:"platform_tenant_id"`
 }

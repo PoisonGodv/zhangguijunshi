@@ -217,6 +217,13 @@ func WithNowFunc(f func() time.Time) Option {
 	}
 }
 
+// WithScheduledProducer wires the async deferred-send port (CONTRACT §19). When
+// set, a future SendInput.ScheduledAt enqueues the send instead of delivering
+// it inline. Without it, scheduled sends fall back to immediate delivery.
+func WithScheduledProducer(p ScheduledSendProducer) Option {
+	return func(s *Service) { s.scheduledProducer = p }
+}
+
 // RenderInput carries the fields a template needs. MemberName / StoreName are
 // the primary values; Vars is the elastic bag for template-specific keys
 // (birthday / recall_days / balance / points / product_name). Missing values
@@ -236,8 +243,32 @@ type Rendered struct {
 // SendInput is one reach attempt: which member on which channel with which
 // template, attributed to a strategy. Vars carries render variables (member_name
 // / store_name / birthday / recall_days / balance / points / product_name).
+//
+// ScheduledAt defers delivery (CONTRACT §19): when set to a future time AND a
+// ScheduledSendProducer is wired, Send enqueues the attempt onto the async job
+// queue and returns a transient pending task WITHOUT delivering or persisting a
+// row; the worker delivers it when the window opens (at-least-once via the
+// queue's pending redelivery). Zero / past ⇒ immediate send (legacy behaviour).
 type SendInput struct {
 	StoreID, MemberID, StrategyID int64
 	Channel, TemplateCode         string
 	Vars                          map[string]string
+	ScheduledAt                   time.Time
+}
+
+// ScheduledSendProducer defers a future reach send to the async job queue
+// (CONTRACT §19). Satisfied by a jobqueue-backed adapter wired at the
+// composition root; reach never imports the queue directly. The adapter reads
+// the tenant from ctx (Send has already enforced it) so the worker can rebuild
+// a tenant-scoped context on delivery.
+type ScheduledSendProducer interface {
+	EnqueueScheduledSend(ctx context.Context, in SendInput, sendAt time.Time) error
+}
+
+// ScheduledSendPayload is the JSON job body enqueued for a deferred send
+// (jobqueue.JobReachDueSend). The worker decodes it and re-drives Service.Send
+// with ScheduledAt cleared. Defined here so the producer (bootstrap) and the
+// consumer (cmd/worker) share one definition.
+type ScheduledSendPayload struct {
+	In SendInput `json:"in"`
 }

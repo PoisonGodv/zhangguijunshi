@@ -88,5 +88,6 @@ cos:
 multitenancy:
   strict: true
   # DEV ONLY: lets curl exercise the isolation guard via X-Mock-Tenant on the
-  # boss/admin surfaces (which have no login flow yet). False in staging/prod.
+  # boss/admin surfaces without logging in first (M5 added real login, but dev
+  # keeps the mock-header fallback for quick manual testing). False in staging/prod.
   dev_mock_header: true

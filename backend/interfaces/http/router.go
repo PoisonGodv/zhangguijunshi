@@ -37,6 +37,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/internal/subscription"
 	"github.com/zhangguijunshi/backend/pkg/config"
+	"github.com/zhangguijunshi/backend/pkg/cos"
 	"github.com/zhangguijunshi/backend/pkg/db"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
@@ -79,6 +80,9 @@ type Deps struct {
 	Subscription *subscription.Service
 	// FE-MP-02 store domain (C-side 门店列表; nil in the minimal test fixture).
 	StoreSvc *store.Service
+	// COS is the object-storage client for boss image uploads (CONTRACT §19).
+	// nil in dev (unconfigured) → the /assets endpoint reports "COS 未配置".
+	COS *cos.Client
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
 }
@@ -118,22 +122,34 @@ func New(deps Deps) *gin.Engine {
 	}
 
 	wireWxshop(r, deps)
-	for _, prefix := range []string{"/v1/boss", "/v1/admin"} {
-		g := r.Group(prefix)
-		g.Use(bossAdminAuthMW(deps))
-		g.GET("/whoami", whoami)
-	}
 	wireBoss(r, deps)
+	wireAdmin(r, deps)
 	return r
 }
 
-// wireBoss mounts the merchant (boss) BFF domain routes for M1-S1: the product
-// catalogue and the billing (checkout + daily flow) surfaces. All routes sit
-// behind the boss auth middleware; tenant/store are resolved from the verified
-// context (JWT in prod, X-Mock-* in dev), never from the request body.
+// wireBoss mounts the merchant (boss) BFF. The login endpoint is public
+// (credential triple — no authenticated identity yet); everything else sits
+// behind real JWT + RequireScene(boss) in prod, or the dev MockTenant fallback.
+// Tenant/store are always resolved from the verified context, never the body.
 func wireBoss(r *gin.Engine, deps Deps) {
 	boss := r.Group("/v1/boss")
-	boss.Use(bossAdminAuthMW(deps))
+
+	// Public auth: registered BEFORE the authed middleware so it stays open.
+	if deps.AuthSvc != nil {
+		bh := handler.NewBossAuthHandler(deps.AuthSvc)
+		boss.POST("/auth/login", bh.Login)
+	}
+
+	// Authed group: real JWT + RequireScene(boss) (prod) or MockTenant (dev).
+	boss.Use(bossAdminAuthMW(deps, jwt.SceneBoss))
+	boss.GET("/whoami", whoami)
+	if deps.AuthSvc != nil {
+		bh := handler.NewBossAuthHandler(deps.AuthSvc)
+		boss.POST("/auth/logout", bh.Logout)
+	}
+	// Boss image upload → COS (nil client ⇒ handler reports "COS 未配置").
+	ah := handler.NewAssetHandler(deps.COS)
+	boss.POST("/assets", ah.Upload)
 
 	if deps.Catalog != nil {
 		h := handler.NewCatalogHandler(deps.Catalog)
@@ -286,14 +302,45 @@ func wxshopAuthMW(deps Deps) gin.HandlerFunc {
 	return middleware.MockTenant()
 }
 
-// bossAdminAuthMW uses MockTenant in dev (dev_mock_header) or when JWT is not
-// wired; otherwise it enforces real JWT auth. These surfaces have no login
-// flow in M0-S2, so dev keeps the mock header demo alive.
-func bossAdminAuthMW(deps Deps) gin.HandlerFunc {
+// wireAdmin mounts the platform-ops (admin) BFF. Login is public; /me and
+// logout sit behind real JWT + RequireScene(admin) in prod, MockTenant in dev.
+// GET /v1/admin/me returns the caller's identity + permissions.menus (RBAC).
+func wireAdmin(r *gin.Engine, deps Deps) {
+	admin := r.Group("/v1/admin")
+
+	// Public auth: registered BEFORE the authed middleware so it stays open.
+	if deps.AuthSvc != nil {
+		ah := handler.NewAdminAuthHandler(deps.AuthSvc)
+		admin.POST("/auth/login", ah.Login)
+	}
+
+	// Authed group: real JWT + RequireScene(admin) (prod) or MockTenant (dev).
+	admin.Use(bossAdminAuthMW(deps, jwt.SceneAdmin))
+	admin.GET("/whoami", whoami)
+	if deps.AuthSvc != nil {
+		ah := handler.NewAdminAuthHandler(deps.AuthSvc)
+		admin.GET("/me", ah.Me)
+		admin.POST("/auth/logout", ah.Logout)
+	}
+}
+
+// bossAdminAuthMW enforces real JWT + the given surface scene (RequireScene) in
+// prod, or falls back to MockTenant in dev (dev_mock_header) / when no JWT is
+// wired. The tenant is always resolved from the verified context. Composing
+// Auth + RequireScene into one handler keeps the dev fallback a single branch.
+func bossAdminAuthMW(deps Deps, scene string) gin.HandlerFunc {
 	if deps.DevMock || deps.JWT == nil {
 		return middleware.MockTenant()
 	}
-	return middleware.Auth(deps.JWT, deps.Store)
+	authMW := middleware.Auth(deps.JWT, deps.Store)
+	sceneMW := middleware.RequireScene(scene)
+	return func(c *gin.Context) {
+		authMW(c)
+		if c.IsAborted() {
+			return
+		}
+		sceneMW(c)
+	}
 }
 
 // liveness: the process is up. Always 200.

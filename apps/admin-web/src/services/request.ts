@@ -14,14 +14,28 @@ import axios, { type AxiosInstance, type AxiosRequestConfig, type AxiosResponse,
 import { message } from 'antd'
 import type { Envelope } from '@/types/api'
 
-// === dev 鉴权头 (与 apps/merchant-mp app.ts globalData.tenantHeader 同源) ===
-// BE-A-01 落地后: 删除 X-Mock-* 注入, 改读 localStorage admin_token → Authorization: Bearer <jwt>
+// === dev 兜底鉴权头 (BE-A-01 已落地: 真登录优先, 仅 dev 未登录时兜底) ===
+// 鉴权顺序 (见请求拦截器): localStorage.admin_token → Authorization: Bearer <jwt>;
+// 无 token 且处于 dev (import.meta.env.DEV) 时, 回落 X-Mock-* 头直连, 便于后端
+// 未开真登录/本地无账号时联调。prod 构建 (import.meta.env.DEV=false) 永不注入 mock 头。
 const DEV_HEADERS: Record<string, string> = {
   'X-Mock-Tenant': '1',
   'X-Mock-Store': '0',
   'X-Mock-User': 'dev',
   'X-Mock-Role': 'owner',
-  'X-Client': 'admin-web',
+}
+
+// === 登录态存取 (BE-A-01) ===
+const TOKEN_KEY = 'admin_token'
+export const getToken = (): string | null => localStorage.getItem(TOKEN_KEY)
+export const setToken = (token: string): void => localStorage.setItem(TOKEN_KEY, token)
+export const clearToken = (): void => localStorage.removeItem(TOKEN_KEY)
+
+// 跳登录页 (避免在拦截器里 import router 造成循环; 直接改 location)。
+function redirectToLogin(): void {
+  if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+    window.location.href = '/login'
+  }
 }
 
 // === errcode → 中文映射 (boss 域, 对齐后端 pkg/errcode + handler 内联码) ===
@@ -106,16 +120,19 @@ const client: AxiosInstance = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-// 请求拦截: 注入 dev 头 + trace id; prod 预留 Authorization (BE-A-01)
+// 请求拦截: 真登录 token 优先; dev 未登录回落 X-Mock-* 头; 注入 trace id + client。
 client.interceptors.request.use((cfg: InternalAxiosRequestConfig) => {
-  // dev 鉴权头 (BE-A-01 后移除, 改为下方 prod 分支)
-  Object.entries(DEV_HEADERS).forEach(([k, v]) => {
-    cfg.headers.set(k, v)
-  })
-  // PROD (BE-A-01 落地后启用):
-  //   const token = localStorage.getItem('admin_token')
-  //   if (token) cfg.headers.set('Authorization', `Bearer ${token}`)
-  //   delete DEV_HEADERS 注入
+  const token = getToken()
+  if (token) {
+    // BE-A-01 真登录: 所有业务请求 tenant 来自 JWT, 绝不带 mock 头。
+    cfg.headers.set('Authorization', `Bearer ${token}`)
+  } else if (import.meta.env.DEV) {
+    // dev 兜底: 未登录时用 X-Mock-* 直连 (后端 dev_mock_header=true 时生效)。
+    Object.entries(DEV_HEADERS).forEach(([k, v]) => {
+      cfg.headers.set(k, v)
+    })
+  }
+  cfg.headers.set('X-Client', 'admin-web')
   cfg.headers.set('X-Trace-Id', genTraceId())
   return cfg
 })
@@ -129,12 +146,12 @@ client.interceptors.response.use(
       // 返回 data 部分 (与 api.get<T> 泛型约定一致: axios 默认返 res.data, 这里再解一层 envelope)
       return body.data as unknown as AxiosResponse
     }
-    // 鉴权失效 (prod 落地后触发, dev 直连不会命中)
-    if (code === 10001 || code === 10002 || code === 10003) {
-      localStorage.removeItem('admin_token')
-      // 不自动跳转登录页 (本轮无登录页), 仅提示
-      message.error('登录已过期, 请重新登录 (dev 头模式: 刷新即可)')
-      return Promise.reject(new ApiError(code, body.message || '登录已过期', body.trace_id))
+    // 鉴权失效 (BE-A-01 真登录: token 过期/无效)
+    if (code === 10001 || code === 10002 || code === 10003 || code === 40101) {
+      clearToken()
+      message.error('登录已失效，请重新登录')
+      redirectToLogin()
+      return Promise.reject(new ApiError(code, body.message || '登录已失效', body.trace_id))
     }
     // 业务/系统错误: 中文映射
     let msg = ERR_CODE_MSG[code]
@@ -151,7 +168,9 @@ client.interceptors.response.use(
     if (status && status >= 500) {
       message.error('服务开小差, 请稍后重试')
     } else if (status === 401) {
-      message.error('登录已过期 (dev 头模式: 刷新即可)')
+      clearToken()
+      message.error('登录已失效，请重新登录')
+      redirectToLogin()
     } else if (err.code === 'ECONNABORTED') {
       message.error('请求超时, 请重试')
     } else if (!err.response) {

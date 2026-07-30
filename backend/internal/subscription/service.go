@@ -60,6 +60,15 @@ func (s *Service) GetSubscription(ctx context.Context) (*Subscription, error) {
 // Gate exposes the FeatureGate for handler/middleware paywall checks.
 func (s *Service) Gate() *FeatureGate { return s.gate }
 
+// ExpireDue transitions every active subscription past its period end to
+// expired (CONTRACT §15.8), returning the count affected. It is a GLOBAL batch
+// operation run by the cron binary — unlike the per-tenant methods it does NOT
+// resolve/enforce a tenant from ctx. Uses the service clock (overridable via
+// WithNowFunc for deterministic tests).
+func (s *Service) ExpireDue(ctx context.Context) (int, error) {
+	return s.store.ExpireDue(ctx, s.now())
+}
+
 // Subscribe switches/renews the ctx tenant's plan (manual/admin). For paid
 // plans PeriodMonths<=0 defaults to 1 month; free is permanent
 // (PeriodEndsAt=nil). Prior active rows are cancelled by the store.

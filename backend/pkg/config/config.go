@@ -112,6 +112,11 @@ func Load(opts ...Option) (*Config, error) {
 	if err := v.Unmarshal(&cfg, withDurationHook()); err != nil {
 		return nil, fmt.Errorf("config: unmarshal: %w", err)
 	}
+	// Layer 3b: env-injected map fields. viper's AutomaticEnv cannot populate
+	// map[string]struct{} fields, so the prod config's "providers injected via
+	// ZG_AI_PROVIDERS_* env" promise (config.prod.yaml) was an unimplemented gap
+	// until this pass (CONTRACT §19 / plan B3). Scan the real env here.
+	applyAIProvidersEnv(&cfg)
 	return &cfg, nil
 }
 
@@ -177,6 +182,24 @@ func SetDefaults(v *viper.Viper) {
 	// Multitenancy: fail-safe strict; dev mock header OFF by default (opt-in).
 	v.SetDefault("multitenancy.strict", true)
 	v.SetDefault("multitenancy.dev_mock_header", false)
+	// Platform tenant (default 1) hosts platform_ops accounts for admin login.
+	v.SetDefault("multitenancy.platform_tenant_id", int64(1))
+
+	// Payment (WeChat Pay V3): no creds by default → wiring keeps FakeWxPay
+	// (dev/test never network). Only a timeout has a safe built-in.
+	v.SetDefault("payment.timeout", 10*time.Second)
+
+	// Job queue (Redis Stream): sane built-ins; the queue is effectively
+	// disabled when the Redis client is nil (dev without Redis).
+	v.SetDefault("job_queue.stream", "zg:jobs")
+	v.SetDefault("job_queue.group", "zg-workers")
+	v.SetDefault("job_queue.consumer", "worker-1")
+	v.SetDefault("job_queue.block", 5*time.Second)
+	v.SetDefault("job_queue.max_len", int64(10000))
+
+	// Scheduler: dev runs the pregen cron inside the api process (single-binary
+	// convenience); prod sets run_in_api=false so the cron binary owns it.
+	v.SetDefault("scheduler.run_in_api", true)
 }
 
 // withDurationHook returns a viper DecoderConfigOption that wires a decode-hook
@@ -193,4 +216,107 @@ func withDurationHook() viper.DecoderConfigOption {
 			mapstructure.StringToSliceHookFunc(","),
 		)
 	}
+}
+
+// Env prefixes for the map-backed AI config (CONTRACT §19 / plan B3). Viper's
+// AutomaticEnv populates scalar keys but cannot materialise map fields, so we
+// scan os.Environ ourselves.
+const (
+	aiProviderEnvPrefix = "ZG_AI_PROVIDERS_" // + <NAME>_<base_url|api_key|model>
+	aiRouteEnvPrefix    = "ZG_AI_ROUTES_"    // + <TIER>_<provider|model>
+)
+
+// applyAIProvidersEnv backfills cfg.AI.Providers and cfg.AI.Routes from the
+// ZG_AI_PROVIDERS_<NAME>_<FIELD> and ZG_AI_ROUTES_<TIER>_<FIELD> environment
+// variables. Names and tiers are lower-cased to match the map keys consumed by
+// the gateway (qwen/deepseek/doubao, lite/v3/r1). Values already present (from
+// yaml) are preserved; env only fills or overrides individual fields.
+//
+// Examples:
+//
+//	ZG_AI_PROVIDERS_QWEN_API_KEY=sk-...      → providers["qwen"].APIKey
+//	ZG_AI_PROVIDERS_QWEN_BASE_URL=https://..  → providers["qwen"].BaseURL
+//	ZG_AI_ROUTES_V3_PROVIDER=deepseek         → routes["v3"].Provider
+func applyAIProvidersEnv(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	// Providers.
+	if cfg.AI.Providers == nil {
+		cfg.AI.Providers = map[string]AIProviderConfig{}
+	}
+	for _, kv := range os.Environ() {
+		body, ok := envBody(kv, aiProviderEnvPrefix)
+		if !ok {
+			continue
+		}
+		name, field, val, ok := splitNameField(body) // "QWEN", "API_KEY", val
+		if !ok {
+			continue
+		}
+		p := cfg.AI.Providers[strings.ToLower(name)]
+		switch strings.ToLower(field) {
+		case "base_url":
+			p.BaseURL = val
+		case "api_key":
+			p.APIKey = val
+		case "model":
+			p.Model = val
+		}
+		cfg.AI.Providers[strings.ToLower(name)] = p
+	}
+	// Routes.
+	if cfg.AI.Routes == nil {
+		cfg.AI.Routes = map[string]AIRouteConfig{}
+	}
+	for _, kv := range os.Environ() {
+		body, ok := envBody(kv, aiRouteEnvPrefix)
+		if !ok {
+			continue
+		}
+		tier, field, val, ok := splitNameField(body) // "V3", "PROVIDER", val
+		if !ok {
+			continue
+		}
+		r := cfg.AI.Routes[strings.ToLower(tier)]
+		switch strings.ToLower(field) {
+		case "provider":
+			r.Provider = val
+		case "model":
+			r.Model = val
+		}
+		cfg.AI.Routes[strings.ToLower(tier)] = r
+	}
+}
+
+// envBody strips prefix and returns the part after the first '=' when kv has the
+// given prefix (and an '='). ok is false otherwise.
+func envBody(kv, prefix string) (body string, ok bool) {
+	if !strings.HasPrefix(kv, prefix) {
+		return "", false
+	}
+	rest := kv[len(prefix):]
+	eq := strings.IndexByte(rest, '=')
+	if eq < 0 {
+		return "", false
+	}
+	return rest, true
+}
+
+// splitNameField parses "NAME_FIELD=value" → (name, field, value). name is up to
+// the first '_' (provider/tier names never contain '_'); field is everything
+// between that '_' and '=' (fields like base_url/api_key may contain '_'). The
+// 4th return is false when no '_' separates a name from a field.
+func splitNameField(body string) (name, field, val string, ok bool) {
+	eq := strings.IndexByte(body, '=')
+	if eq < 0 {
+		return "", "", "", false
+	}
+	nameField := body[:eq]
+	val = body[eq+1:]
+	us := strings.IndexByte(nameField, '_')
+	if us < 0 {
+		return "", "", "", false
+	}
+	return nameField[:us], nameField[us+1:], val, true
 }

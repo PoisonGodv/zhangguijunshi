@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -26,6 +27,12 @@ type SubscriptionStore interface {
 	Upsert(ctx context.Context, sub *Subscription) (*Subscription, error)
 	// ListHistory returns the subscription audit trail (all statuses).
 	ListHistory(ctx context.Context, tenantID int64) ([]*Subscription, error)
+	// ExpireDue flips every active subscription whose period_ends_at has passed
+	// to expired (CONTRACT §15.8). It is a GLOBAL batch operation (all tenants)
+	// run by the cron binary — it does NOT take a tenant. Returns the number of
+	// rows transitioned. Subscriptions with nil period_ends_at (永久/free) are
+	// never expired.
+	ExpireDue(ctx context.Context, now time.Time) (int, error)
 }
 
 // MemoryStore is the in-memory dev/test SubscriptionStore. It is safe for
@@ -123,6 +130,25 @@ func (s *MemoryStore) ListHistory(_ context.Context, tenantID int64) ([]*Subscri
 	return out, nil
 }
 
+// ExpireDue transitions every active subscription whose period has ended to
+// expired (CONTRACT §15.8). Global across tenants; nil period_ends_at (永久)
+// is never expired. Returns the count of transitioned rows.
+func (s *MemoryStore) ExpireDue(_ context.Context, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, subs := range s.byTenant {
+		for _, sub := range subs {
+			if sub.Status == "active" && sub.PeriodEndsAt != nil && sub.PeriodEndsAt.Before(now) {
+				sub.Status = "expired"
+				sub.UpdatedAt = now
+				n++
+			}
+		}
+	}
+	return n, nil
+}
+
 // ===== PG production store (pgxmock tested) =====
 
 // PGPool is the narrow DB surface PGStore needs for single-row reads/writes
@@ -158,6 +184,12 @@ RETURNING id, tenant_id, plan, period_started_at, period_ends_at, status, source
 
 	sqlSubListHistory = `SELECT id, tenant_id, plan, period_started_at, period_ends_at, status, source, payment_ref, created_at, updated_at
 FROM subscriptions WHERE tenant_id = $1 ORDER BY id`
+
+	// sqlSubExpireDue flips every active subscription past its period end to
+	// expired (CONTRACT §15.8). Global (all tenants); nil period_ends_at never
+	// matches. $1 = now.
+	sqlSubExpireDue = `UPDATE subscriptions SET status = 'expired', updated_at = $1
+WHERE status = 'active' AND period_ends_at IS NOT NULL AND period_ends_at < $1`
 )
 
 // PGStore is the production SubscriptionStore backed by PostgreSQL
@@ -261,6 +293,20 @@ func (s *PGStore) ListHistory(ctx context.Context, tenantID int64) ([]*Subscript
 		return nil, fmt.Errorf("subscription: pg list rows: %w", err)
 	}
 	return out, nil
+}
+
+// ExpireDue transitions every active subscription past its period end to
+// expired (CONTRACT §15.8), returning the affected row count. A nil pool is a
+// defensive no-op returning 0 (dev wires MemoryStore).
+func (s *PGStore) ExpireDue(ctx context.Context, now time.Time) (int, error) {
+	if s == nil || s.pool == nil {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx, sqlSubExpireDue, now)
+	if err != nil {
+		return 0, fmt.Errorf("subscription: pg expire due: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // scanner is the common Scan surface of pgx.Row and pgx.Rows.

@@ -719,3 +719,103 @@ func TestConsumeSubscribe_Concurrent(t *testing.T) {
 		t.Errorf("over-consume must be exhausted, got %v", err)
 	}
 }
+
+// ---- scheduled (deferred) send: CONTRACT §19 ----
+
+// fakeScheduledProducer records deferred-send enqueues.
+type fakeScheduledProducer struct {
+	calls  int
+	gotIn  SendInput
+	gotAt  time.Time
+	retErr error
+}
+
+func (f *fakeScheduledProducer) EnqueueScheduledSend(_ context.Context, in SendInput, sendAt time.Time) error {
+	f.calls++
+	f.gotIn = in
+	f.gotAt = sendAt
+	return f.retErr
+}
+
+func TestSend_ScheduledFuture_EnqueuesAndSkipsDelivery(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	snd := &fakeSender{}
+	prod := &fakeScheduledProducer{}
+	s := New(repo, WithSender(snd), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	future := clock().Add(2 * time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelSubscribeMsg, TemplateCode: TplBirthday, ScheduledAt: future}
+	task, err := s.Send(ctxWithTenant(7), in)
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if prod.calls != 1 {
+		t.Fatalf("producer calls = %d, want 1", prod.calls)
+	}
+	if prod.gotAt != future {
+		t.Errorf("producer sendAt = %v, want %v", prod.gotAt, future)
+	}
+	if prod.gotIn.MemberID != 42 {
+		t.Errorf("producer got memberID = %d", prod.gotIn.MemberID)
+	}
+	if task.Status != StatusPending {
+		t.Errorf("task status = %q, want pending", task.Status)
+	}
+	if len(snd.payloads) != 0 {
+		t.Errorf("sender must NOT be called for a deferred send, got %d payloads", len(snd.payloads))
+	}
+	// No row persisted at enqueue time (the worker persists on delivery).
+	tasks, _ := repo.ListTasks(ctxWithTenant(7), 7, 1, "")
+	if len(tasks) != 0 {
+		t.Errorf("no task should be persisted at enqueue, got %d", len(tasks))
+	}
+}
+
+func TestSend_ScheduledFuture_NoProducer_FallsBackImmediate(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	snd := &fakeSender{}
+	s := New(repo, WithSender(snd), WithNowFunc(clock)) // no producer wired
+
+	future := clock().Add(2 * time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+	task, err := s.Send(ctxWithTenant(7), in)
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(snd.payloads) != 1 {
+		t.Errorf("without a producer the send must be immediate, got %d payloads", len(snd.payloads))
+	}
+	if task.Status == StatusPending {
+		t.Errorf("immediate send must not stay pending, got %q", task.Status)
+	}
+}
+
+func TestSend_ScheduledPast_SendsImmediately(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	snd := &fakeSender{}
+	prod := &fakeScheduledProducer{}
+	s := New(repo, WithSender(snd), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	past := clock().Add(-time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: past}
+	if _, err := s.Send(ctxWithTenant(7), in); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if prod.calls != 0 {
+		t.Errorf("past schedule must not enqueue, producer calls = %d", prod.calls)
+	}
+	if len(snd.payloads) != 1 {
+		t.Errorf("past schedule must send immediately, got %d payloads", len(snd.payloads))
+	}
+}
+
+func TestSend_ScheduledEnqueueError_Propagates(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	prod := &fakeScheduledProducer{retErr: errors.New("queue down")}
+	s := New(repo, WithScheduledProducer(prod), WithNowFunc(clock))
+
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelSubscribeMsg, TemplateCode: TplBirthday, ScheduledAt: clock().Add(time.Hour)}
+	if _, err := s.Send(ctxWithTenant(7), in); err == nil {
+		t.Fatal("enqueue error must propagate")
+	}
+}

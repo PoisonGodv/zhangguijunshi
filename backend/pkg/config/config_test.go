@@ -223,3 +223,100 @@ func TestSetDefaults_StrictBaseline(t *testing.T) {
 		t.Errorf("postgres.max_conns: got %d, want > 0", cfg.Postgres.MaxConns)
 	}
 }
+
+// TestLoad_AIProvidersEnv verifies the ZG_AI_PROVIDERS_<NAME>_<FIELD> /
+// ZG_AI_ROUTES_<TIER>_<FIELD> env→map injection that viper's AutomaticEnv cannot
+// perform (CONTRACT §19 / plan B3). Names and tiers are lower-cased.
+func TestLoad_AIProvidersEnv(t *testing.T) {
+	t.Setenv("ZG_AI_PROVIDERS_QWEN_BASE_URL", "https://dashscope.aliyuncs.com")
+	t.Setenv("ZG_AI_PROVIDERS_QWEN_API_KEY", "sk-qwen")
+	t.Setenv("ZG_AI_PROVIDERS_DEEPSEEK_MODEL", "deepseek-chat")
+	// Mixed-case name should still map to a lower-cased key.
+	t.Setenv("ZG_AI_PROVIDERS_Doubao_API_KEY", "sk-doubao")
+
+	t.Setenv("ZG_AI_ROUTES_V3_PROVIDER", "deepseek")
+	t.Setenv("ZG_AI_ROUTES_V3_MODEL", "deepseek-chat")
+	t.Setenv("ZG_AI_ROUTES_LITE_PROVIDER", "doubao")
+
+	cfg, err := Load(WithConfigDir(newDir(t)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	qwen := cfg.AI.Providers["qwen"]
+	if qwen.BaseURL != "https://dashscope.aliyuncs.com" {
+		t.Errorf("providers[qwen].base_url: got %q", qwen.BaseURL)
+	}
+	if qwen.APIKey != "sk-qwen" {
+		t.Errorf("providers[qwen].api_key: got %q", qwen.APIKey)
+	}
+	if cfg.AI.Providers["deepseek"].Model != "deepseek-chat" {
+		t.Errorf("providers[deepseek].model: got %q", cfg.AI.Providers["deepseek"].Model)
+	}
+	if cfg.AI.Providers["doubao"].APIKey != "sk-doubao" {
+		t.Errorf("providers[doubao].api_key: got %q (mixed-case name not lower-cased)", cfg.AI.Providers["doubao"].APIKey)
+	}
+
+	v3 := cfg.AI.Routes["v3"]
+	if v3.Provider != "deepseek" || v3.Model != "deepseek-chat" {
+		t.Errorf("routes[v3]: got %+v", v3)
+	}
+	if cfg.AI.Routes["lite"].Provider != "doubao" {
+		t.Errorf("routes[lite].provider: got %q", cfg.AI.Routes["lite"].Provider)
+	}
+}
+
+// TestLoad_AIProvidersEnvPreservesYaml confirms env only fills/overrides
+// individual fields and does not wipe providers already set by the yaml layer.
+func TestLoad_AIProvidersEnvPreservesYaml(t *testing.T) {
+	dir := newDir(t)
+	writeYAML(t, dir, "dev", `
+ai:
+  providers:
+    qwen:
+      base_url: "https://from-yaml"
+      model: "qwen-from-yaml"
+`)
+	// Env fills api_key and overrides model; base_url from yaml must survive.
+	t.Setenv("ZG_AI_PROVIDERS_QWEN_API_KEY", "sk-env")
+	t.Setenv("ZG_AI_PROVIDERS_QWEN_MODEL", "qwen-from-env")
+
+	cfg, err := Load(WithConfigDir(dir))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	qwen := cfg.AI.Providers["qwen"]
+	if qwen.BaseURL != "https://from-yaml" {
+		t.Errorf("base_url should be preserved from yaml: got %q", qwen.BaseURL)
+	}
+	if qwen.Model != "qwen-from-env" {
+		t.Errorf("model should be overridden by env: got %q", qwen.Model)
+	}
+	if qwen.APIKey != "sk-env" {
+		t.Errorf("api_key should be filled from env: got %q", qwen.APIKey)
+	}
+}
+
+// TestLoad_NewDefaults covers the payment/jobqueue/scheduler/platform-tenant
+// defaults added in plan Phase 0.
+func TestLoad_NewDefaults(t *testing.T) {
+	cfg, err := Load(WithConfigDir(newDir(t)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Multitenancy.PlatformTenantID != 1 {
+		t.Errorf("platform_tenant_id: got %d, want 1", cfg.Multitenancy.PlatformTenantID)
+	}
+	if cfg.Payment.Configured() {
+		t.Error("payment should be unconfigured by default (FakeWxPay path)")
+	}
+	if cfg.JobQueue.Stream != "zg:jobs" {
+		t.Errorf("job_queue.stream: got %q", cfg.JobQueue.Stream)
+	}
+	if cfg.JobQueue.Group != "zg-workers" {
+		t.Errorf("job_queue.group: got %q", cfg.JobQueue.Group)
+	}
+	if !cfg.Scheduler.RunInAPI {
+		t.Error("scheduler.run_in_api should default true (dev in-process)")
+	}
+}

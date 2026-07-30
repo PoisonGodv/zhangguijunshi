@@ -41,3 +41,13 @@ func (s *Scheduler) IncrementalRetry(ctx context.Context) (int, error) {
 		}
 	}
 }
+
+// RefreshTenant runs the pipeline for ONE tenant and overwrites both caches
+// (with retry). It is the worker-facing entry for the pregen_incremental job
+// (CONTRACT §19): the worker decodes the tenant from the Redis Stream job and
+// calls this to refresh that tenant's "today" cache on demand — independent of
+// the in-memory incr channel that IncrementalRetry drains. The tenant ctx is
+// built internally (Source=system); the caller passes a bare ctx.
+func (s *Scheduler) RefreshTenant(ctx context.Context, tenantID int64) error {
+	return s.runWithRetry(ctx, tenantID)
+}

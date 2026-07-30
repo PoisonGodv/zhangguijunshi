@@ -3421,9 +3421,69 @@ services 层：catalog.ts/inventory.ts/membership.ts（A2a）+ billing.ts/market
 - `GET /v1/boss/billing/summary/today` → DailySummary（GrossCents/NetCents/TopProducts，admin-web 看板字段对齐）
 
 ### 18.5 显式延后（不在本轮）
-- **BE-A-01 真实登录 + RBAC**：admin-web 仍走 dev `X-Mock-*` 头（与 merchant-mp 一致）；prod 改读 localStorage admin_token 注入 Authorization；菜单 RBAC 下发（`GET /v1/admin/me` 返 permissions.menus）待 BE-A-01。
-- **平台运营跨租户管理后台**：`/v1/admin/*` 仍只有 /whoami 空壳；`internal/tenant/` 空目录；跨租户商户入驻/审核/封禁/对账需新建独立 `/v1/admin/*` 路由 + `platform_ops` 角色中间件 + 跨租户 service（不能简单绕过 EnforceTenant，破坏 ARCH-01）。
+- ~~**BE-A-01 真实登录 + RBAC**~~：**已在 M5 落地（§19）** — boss 手机号+密码 / admin 账号+密码 bcrypt 登录、`GET /v1/admin/me` 下发 permissions.menus、`RequireScene/RequireRole` RBAC 中间件、admin-web 改读 localStorage admin_token 注入 Authorization（dev 未登录回落 X-Mock-* 头）。
+- **平台运营跨租户管理后台**：`/v1/admin/*` M5 已加 login/me/logout（§19），但跨租户商户入驻/审核/封禁/对账仍缺；`internal/tenant/` 空目录；需新建独立 `/v1/admin/*` 业务路由 + 跨租户 service（不能简单绕过 EnforceTenant，破坏 ARCH-01）。
 - **后端缺口**：inventory `GET /boss/inventory/batches`（批次列表，临期看板真闭环）；groupbuy 独立 desc/原价字段（现降级 desc=title、original=团购价）；C端储值充值接口（balance 页充值入口）；C端订单详情单条接口；catalog 真分页 total（现 count=本次条数）。
 - **真 PG/Redis 联调**：全 pgxmock + memory，main.go 切换已就位。
 - **admin-web 构建优化**：单 chunk 3.2MB（echarts+antd 全量），待 manualChunks 拆分。
 - consumer-mp `member-qr` 组件仍文本占位 nonce（后端返二维码图片 URL 后改 image）。
+
+## 19. M5 生产化三缺口：真登录+RBAC / 真实密钥接入 / worker+cron（2026-07-30）
+
+一次性补齐三类生产化硬缺口。执行模式：**主线程独占共享文件**（config / bootstrap / main.go / router / Dockerfile / compose / CONTRACT），**agent 独占隔离包**（Phase1 四并行：auth/V3payment/cos/jobqueue；Phase3 两并行：cron/worker）。`go build ./... && go test -race ./...` 全绿（45+ 包），gofmt/vet clean。
+
+### 19.1 共享地基（Phase 0，主线程）
+- `pkg/config/types.go`：新增 `PaymentConfig`(+`Configured()`)、`JobQueueConfig`、`SchedulerConfig{RunInAPI}`；`MultitenancyConfig` 加 `PlatformTenantID int64`（admin 账号所在平台租户，默认 1）。根 `Config` 挂 `Payment/JobQueue/Scheduler` 字段。
+- `pkg/config/config.go`：`applyAIProvidersEnv` —— viper AutomaticEnv 填不了 map，故自定义 `os.Environ()` 扫描注入：`ZG_AI_PROVIDERS_<NAME>_<BASE_URL|API_KEY|MODEL>` → `cfg.AI.Providers`、`ZG_AI_ROUTES_<TIER>_<PROVIDER|MODEL>` → `cfg.AI.Routes`（name/tier 小写化；yaml 已有值保留、env 只补/覆盖单字段）。修掉 config.prod.yaml「声称 env 注入但无代码」的缺口。`SetDefaults` 补 payment.timeout / job_queue.* / scheduler.run_in_api=true / platform_tenant_id=1。
+- `migrations/000017_user_password.{up,down}.sql`：`users` 加 `password_hash TEXT`（nullable，兼容存量；非空校验在 service 层）。bcrypt 存储。
+
+### 19.2 BE-A-01 真登录 + RBAC（Phase 1 A1，密码 bcrypt）
+- `internal/auth`：`Account` 模型 + `AccountRepo`（`FindByPhone`/`FindByUsername`/`TouchLogin`）memory+pg 双实现；`password.go`（`HashPassword`/`VerifyPassword`，bcrypt cost=10）；`boss_login.go`/`admin_login.go`（`AuthService.BossLogin/AdminLogin`，经 `WithAccountRepo` 注入账号库，复用 `jwt.Manager.Sign` + `SessionStore.IssueRefresh`，签 `Scene=boss|admin`、`Subject="u_<id>"`、带 TenantID/StoreID/Role/Version 的 JWT，返回既有 `LoginResult`）；`rbac.go`（`RoleMenus`/`MenusFor`/`MeResult`/`BuildMeResult`）。
+- **登录失败三态折叠**：wrong-password / not-found / 空 hash 全部 → `ErrLoginFailed`（40102/401），不泄漏用户存在性。登录端点从 body 取凭证三元组（此时无已认证身份）；登录后所有业务请求 tenant 一律来自 JWT（`EnforceTenant`），绝不取 body（与 ARCH-01 串户证明一致）。AdminLogin 强制 StoreID=0。
+- **约定**：`phone_hash = hex(SHA256("zgjs-phone-v1" + phone))`（users 无行级盐，用全局 pepper；PG 写/查与 memory seed 同函数）。admin 用 `name` 列做 platform_ops 查找（users 无 username 列；`FindByUsername` 是后续「加唯一 username 列」migration 的接缝）。users 暂无 version 列 → `Account.Version` 恒 0（JWT ver 校验当前 no-op，文件头已标注）。
+- `interfaces/http/handler/{boss_auth,admin_auth}.go`：`POST /v1/boss/auth/login{tenant_id,phone,password}`、`POST /v1/{boss,admin}/auth/logout`、`POST /v1/admin/auth/login{username,password}`、`GET /v1/admin/me`（返 MeResult：user + role + permissions.menus）。
+- `interfaces/http/middleware/rbac.go`：`RequireScene(scene)`（校验 `c.Get("claims").(*jwt.Claims).Scene`，不符 40101/Abort）、`RequireRole(roles...)`（不符 40301/Abort）。
+- **dev demo 账号**（memory seed）：boss owner tenant 1 / phone `13800000001` / 密码 `boss12345`；platform ops tenant 1 / name `ops` / 密码 `ops12345`。
+
+### 19.3 router 拆组 + RBAC 接线（Phase 2，主线程）
+`interfaces/http/router.go`：`wireBoss`/`wireAdmin` 拆为「登录公开组（注册在 `Use` 之前 → public）+ authed 组」。authed 中间件 `bossAdminAuthMW(deps, scene)`：`DevMock || JWT==nil` → `MockTenant`（dev 兜底）；否则 `Auth` + `RequireScene(scene)` 组合（prod 强制真 JWT + RBAC）。boss 组挂 `Scene=boss`、admin 组挂 `Scene=admin`；`GET /v1/admin/me`、`POST /v1/boss/assets`（COS 上传）挂入 authed 组。
+
+### 19.4 微信支付 V3 完整真客户端（Phase 1 B1）
+- `internal/payment/v3{wire,client,cert,notify}.go`：`NewV3Client(cfg PaymentConfig, hc) (*V3Client, error)` 装私钥（PEM 内联优先于文件；PKCS#1/PKCS#8）；`*V3Client` 实现 `SubMerchantApplier`(Apply→POST `/v3/ecommerce/applyments/`、Query→GET)、`Preparer`(Prepay→POST `/v3/pay/transactions/jsapi` 服务商特约 + JSAPI 调起参数 paySign)、`NotifyParser`(ParseNotify)。接上已写好但零调用方的 `sign.go` `SignV3Authorization`(line 61)/`VerifyV3Notify`(line 93)——不重写签名。
+- **NotifyParser**：`VerifyV3Notify` 验四头 + ±5min 防重放 + RSA 验签（平台证书按 serial 缓存、惰性拉取 `/v3/certificates` + APIv3 AES-GCM 解密证书 pem）→ 通过后 AES-256-GCM（key=`APiv3Key` 32 字节）解 `resource.ciphertext`。失败一律 `ErrSignInvalid`（复用既有 sentinel），DB 不动。
+- **装配**（bootstrap `payment_ports.go`）：`cfg.Payment.Configured()` → 真 V3Client（`vc.AppID = cfg.WX.AppID`，PaymentConfig 不带 appid）三端口 `WithApplier/WithPreparer/WithNotifyParser`；否则 / 初始化失败 → `FakeWxPay`（dev/测试永不联网）。
+- **已知 gap（代码已标注，上线前补）**：PrepayInput.SubMerchantID 是 DB 行 id（service.go 覆写），真 V3 需 WeChat `sub_mch_id` 字符串；Apply 敏感字段未做平台证书 RSA-OAEP 字段级加密（与 FakeWxPay 平级）。
+- 测试：httptest 假上游验 Apply/Prepay/Query 签名头 + 响应解析、AES-GCM 已知向量、固定 pem 证书解析、notify 全链路（自签平台证书 + 篡改/过期 → ErrSignInvalid）。17 测试。
+
+### 19.5 COS 客户端（Phase 1 B2，纯 stdlib）
+- `pkg/cos/{sign,client,upload}.go`：腾讯云 COS（S3 兼容）裸 `net/http` + HMAC-SHA1（`q-sign-algorithm=sha1`），不引 `tenc-cos-go-sdk`（与 `pkg/wxsdk` 纯 HTTP 范式一致）。`PutObject(ctx,key,contentType,r) (url,error)`（host+content-type 参与签名）、`SignedURL(ctx,key,expiry)`（临时 URL 方案）。`Client.WithBaseURL/WithHTTPClient` 便于 httptest。
+- `interfaces/http/handler/asset.go`：`POST /v1/boss/assets`（multipart `file`，≤10MB）→ COS PutObject → `{url}`；cos 为 nil（未配置）→ `ErrInternal`「COS 未配置」（nil-safe）。
+- 测试：httptest 假对象存储验 PUT 签名头自洽往返 + 非 2xx 报错 + SignedURL 自洽 + baseURL 解析 + nil client。
+
+### 19.6 Redis Stream jobqueue + worker + cron（Phase 1 C1 / Phase 3）
+- `pkg/jobqueue/queue.go`：`Producer.Enqueue(ctx, Job)`（XADD，MAXLEN ~ N）+ `Consumer.Run(ctx, Handler)`（XREADGROUP consumer group，先读 id="0" 本 consumer pending 做重投递、再 ">" 阻塞读新；成功 XAck+XDel，失败不 ACK 留 pending 下轮重投；腐坏 entry 丢弃防毒丸热循环）。`Job{Type,Payload,TenantID,RunAt}`；`JobPregenIncremental`/`JobReachDueSend`。**nil-safe**：client==nil → Producer no-op 日志、Consumer 不启动（dev 无 Redis）。收 `redis.Cmdable`（prod 注入 `redisx.Client`，测试注入 miniredis）。
+- **reach scheduled-send**（Phase 2）：`reach.SendInput.ScheduledAt`；`Send` 早分支——未来时间 + 已接 `ScheduledSendProducer` → 入队 `JobReachDueSend`（payload=`reach.ScheduledSendPayload{In}`，tenant 取自 ctx）并返回 transient pending task（**不落库**，queue 的 pending 重投递即 at-least-once 保证）；无 producer（dev）→ 回落即时发。worker 解码后清空 ScheduledAt 即时发。bootstrap `reachScheduledProducer` 适配 `jobqueue.Producer`→`reach.ScheduledSendProducer`（仅 rdb!=nil 时接）。**设计取舍**：定时发送由 jobqueue worker 消费驱动，cron 不做 DB sweep（故未加 `reach.ListDue`，避免 dead code）。
+- **worker**（`cmd/worker/main.go`）：`bootstrap.BuildServices` → `jobqueue.NewConsumer(cmdable, cfg.JobQueue, dispatcher)`；dispatcher 分发：`pregen_incremental` → `svc.Scheduler.RefreshTenant(ctx, job.TenantID)`（新公开方法，跑单租户 pipeline + 覆写双缓存，带重试）；`reach_due_send` → 解码 `ScheduledSendPayload`、清 ScheduledAt、tenant ctx → `reach.Send`；未知 type → 日志 + nil（丢毒丸）。无 Redis → 日志 + 干净退出码 0。SIGINT/SIGTERM 优雅退出。
+- **cron**（`cmd/cron/main.go`）：`bootstrap.BuildServices` → pregen 4 条经 `go svc.Scheduler.Start()`（Scheduler 自有 cron loop，含 batch/incremental/attribution/bandit）；另起一个 `*cron.Cron`（Asia/Shanghai）注册：groupbuy.finalize `*/5 * * * *`（per-tenant `ActiveTenantIDs`→SourceSystem ctx→`Groupbuy.FinalizeExpired`）、subscription.expire `0 6 * * *`（全局 `Subscription.ExpireDue`，新增方法：interface+Memory+PG+Service，`period_ends_at<now` 的 active→expired）、dataquality `0 1 * * *`（per-tenant BE-A-08 `ReverseDailySales` over inventory sale_out + BE-A-09 `ComputeTags`，**compute+log，落库为后续**）。
+- **subscription.ExpireDue**（Phase 3，主线程）：`SubscriptionStore` 接口加性新增 `ExpireDue(ctx, now) (int, error)`（全局，不按租户）；MemoryStore 遍历、PGStore `UPDATE ... WHERE status='active' AND period_ends_at < $1`；`Service.ExpireDue(ctx)` 用 service clock。
+- **真 tenant 枚举器**（Phase 3，主线程）：bootstrap `dbTenantEnumerator` 读 `tenants WHERE status='active' AND deleted_at IS NULL`（DB 在场）；dev 回落空 stub。驱动 pregen 03:00 batch + cron per-tenant jobs。
+
+### 19.7 共享 bootstrap 组合根（Phase 2，主线程）
+- 新 `internal/bootstrap/`：`BuildInfra(ctx,cfg,log)`（db pool + redis client + ES256 JWT manager + session store，均可 nil 降级）+ `BuildServices(ctx,cfg,log,infra) (*Services,error)`（全量 repo/service/AI pipeline/pregen scheduler/payment ports/COS/auth+AccountRepo/jobqueue producer）。`cmd/api/{aiengine_adapters,payment_adapters}.go` 的反腐适配器全部迁入 `bootstrap/adapters.go`。`Services` 暴露 HTTP Deps 全字段 + `Scheduler/Tenants/JobProducer/COS/RDB`。
+- `cmd/api/main.go` 瘦身为：config → BuildLogger → BuildServices → `cfg.Scheduler.RunInAPI` 时 `StartScheduler()` → `httpserver.New(Deps{...})` → serve + graceful shutdown（`svc.Close()`）。
+- **prod 不双跑 pregen**：`config.prod.yaml` `scheduler.run_in_api=false` + compose backend 设 `ZG_SCHEDULER_RUN_IN_API=false`，cron 二进制独占。
+
+### 19.8 部署 + 前端 + 配置（Phase 4，主线程）
+- `backend/Dockerfile`：构建五二进制（api/migrate/worker/cron/llmbench）到 `/out/` 并 COPY 到 runtime。
+- `infra/compose/docker-compose.prod.yml`：加 `backend-worker`（entrypoint `/out/worker`）、`backend-cron`（entrypoint `/out/cron`）服务，同镜像、`env_file ../../.env`、`ZG_ENV=prod`、`depends_on postgres/redis service_healthy`、无端口/healthcheck（纯循环）、`restart: unless-stopped`；backend(api) 加 `ZG_SCHEDULER_RUN_IN_API=false`。
+- `configs/config.prod.yaml`：加 `payment`/`job_queue`/`scheduler`/`multitenancy.platform_tenant_id` 段；修正 ai providers/routes 注释为真实 env 格式（`ZG_AI_PROVIDERS_<NAME>_<FIELD>` / `ZG_AI_ROUTES_<TIER>_<FIELD>`）。
+- `.env.example`：prod 段加 `ZG_PAYMENT_*`/`ZG_JOBQUEUE_CONSUMER`/`ZG_SCHEDULER_RUN_IN_API`/`ZG_MULTITENANCY_PLATFORM_TENANT_ID` + AI routes env 示例。
+- `apps/admin-web`：`request.ts` 改 token 优先（localStorage `admin_token` → `Authorization: Bearer`）、dev 未登录回落 `X-Mock-*`（`import.meta.env.DEV`）、401/40101 清 token + 跳 `/login`；`pages/login/index.tsx` 真登录表单 → `POST /v1/admin/auth/login` → 存 token → 跳看板（tsc 0 错）。
+
+### 19.9 显式延后（不在 M5）
+- **pregen 单店解析缺口（既有，非 M5 引入）**：`pregen.runAndCache` 只往 ctx 注入 TenantID（无 StoreID），而 `pipeline.Run` 从 ctx 取 storeID（缺省 0）、`strategy.SaveAdvice` 要求 StoreID>0（否则 ErrParam）→ 按租户的 pregen（batch/incremental cron 与 worker 的 `pregen_incremental`）端到端会报 `strategy: invalid param`。此前未暴露：pregen 测试用 fake PipelineRunner、dev tenant 枚举为空。worker dispatcher 行为正确（报错→重投递）；`reach_due_send` 端到端可用。修法：pregen 按 (tenant, store) 枚举门店并把 StoreID 注入 pipeline ctx（或解析主门店）——属 AI 引擎设计变更，独立里程碑处理。当前无自动 producer 投递 `pregen_incremental`，故不会实际空转。
+- WX V3：PrepayInput 透传真 WeChat `sub_mch_id`（现为 DB 行 id）；Apply 敏感字段平台证书 RSA-OAEP 字段级加密。
+- reach：定时发送的「落库可见 + cron DB sweep 兜底」（现为 jobqueue 驱动、enqueue 不落库；queue PEL 即重投递保证）。
+- dataquality：fused daily-sales 落库、tag 落产品、`DaysSinceLastSale`/`EarliestExpiry` 精确化（现 compute+log，仅高毛利 tag 有效）。
+- users `version` 列（改密/踢线 ver 失效）；admin 唯一 username 列；`internal/tenant` 跨租户平台运营后台。
+- 真 PG/Redis/WX/COS/LLM 密钥联调（本机构建真实集成代码 + env 注入，dev/测试用 Fake/httptest/miniredis/pgxmock）。

@@ -29,7 +29,10 @@ type Service struct {
 	sender Sender        // nil = skip send step
 	freq   FreqGate      // nil = skip frequency check
 	cf     ContentFilter // nil = skip content check
-	now    func() time.Time
+	// scheduledProducer defers future sends to the async job queue (nil =
+	// scheduled sends fall back to immediate delivery). CONTRACT §19.
+	scheduledProducer ScheduledSendProducer
+	now               func() time.Time
 }
 
 // Render delegates to the pure package-level Render so it is callable even when
@@ -67,6 +70,28 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 	}
 
 	now := s.now()
+
+	// Deferred send (CONTRACT §19): a future ScheduledAt with a wired producer
+	// is enqueued for async delivery; the worker re-drives it through Send (with
+	// ScheduledAt cleared) when the window opens. No row is persisted here — the
+	// queue's pending redelivery is the at-least-once guarantee. Without a
+	// producer (dev, no Redis) this branch is skipped and the send is immediate.
+	if !in.ScheduledAt.IsZero() && in.ScheduledAt.After(now) && s.scheduledProducer != nil {
+		if err := s.scheduledProducer.EnqueueScheduledSend(ctx, in, in.ScheduledAt); err != nil {
+			return nil, err
+		}
+		return &ReachTask{
+			TenantID:     tenantID,
+			StoreID:      in.StoreID,
+			StrategyID:   in.StrategyID,
+			Channel:      in.Channel,
+			TemplateCode: in.TemplateCode,
+			TargetCount:  1,
+			Status:       StatusPending,
+			ScheduledAt:  in.ScheduledAt,
+			CreatedAt:    now,
+		}, nil
+	}
 
 	// ② render (unknown code = hard error, not a block).
 	rendered, err := Render(RenderInput{

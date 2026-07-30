@@ -18,9 +18,9 @@
 #   - health 端点：/healthz（liveness，无依赖检查）与 /readyz（readiness，含 DB
 #     ping，见 interfaces/http/router.go）。HEALTHCHECK 用 /healthz，因为它在 DB
 #     未就绪时仍返回 200——容器自身存活与依赖就绪分离，避免编排器误杀。
-#   - 已实现的三个二进制（api / migrate / llmbench）一并构建到 /out/，方便同一
-#     镜像以不同 entrypoint 复用（migrate 作为 init 容器等）。worker / cron 为
-#     规划中尚未实现的占位目录（仅 .gitkeep），不参与构建。
+#   - 已实现的五个二进制（api / migrate / worker / cron / llmbench）一并构建到
+#     /out/，方便同一镜像以不同 entrypoint 复用（migrate 作为 init 容器，worker /
+#     cron 作为独立异步服务，CONTRACT §19）。
 #   - CGO_ENABLED=0：纯静态，可跑 distroless static；pgx 等纯 Go 依赖无需 cgo。
 
 ARG GO_VERSION=1.25
@@ -49,9 +49,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # 拷全部源码（.dockerignore 已排除无关项）。
 COPY . .
 
-# 静态构建已实现的三个二进制到 /out/。worker / cron 目录当前仅为 .gitkeep 占位
-# （jobs cron 为规划中后续里程碑，见 CONTRACT.md/记忆），尚未实现，故不构建——
-# 待落地后再加回 -o /out/worker ./cmd/worker 与 -o /out/cron ./cmd/cron。
+# 静态构建五个二进制到 /out/。worker / cron 为 M5 落地的异步作业消费者 / 定时
+# 任务二进制（CONTRACT §19），与 api 共享 internal/bootstrap 组合根；同一镜像以
+# 不同 entrypoint 复用（migrate 作为 init 容器、worker/cron 作为独立服务）。
 # ldflags 去符号缩体积；不注入版本到 main（源码未定义 ldflags -X 入口，version
 # 来自 config，故只 strip）。
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -62,6 +62,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" \
       -o /out/migrate  ./cmd/migrate && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
+    go build -trimpath -ldflags="-s -w" \
+      -o /out/worker   ./cmd/worker && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
+    go build -trimpath -ldflags="-s -w" \
+      -o /out/cron     ./cmd/cron && \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" \
       -o /out/llmbench ./cmd/llmbench
@@ -82,10 +88,12 @@ RUN apk add --no-cache ca-certificates tzdata wget && \
 # 非 root 运行，工作目录设为 /app 以匹配 config/migrate 的相对目录默认值。
 WORKDIR /app
 
-# 拷贝二进制与运行期资产。worker / cron 未实现，不拷贝（待落地后补
-# COPY --from=builder /out/worker /out/worker 与 /out/cron /out/cron）。
+# 拷贝二进制与运行期资产。worker / cron 为 M5 落地的独立服务二进制（CONTRACT §19），
+# compose 以同镜像不同 entrypoint 运行。
 COPY --from=builder /out/api       /out/api
 COPY --from=builder /out/migrate  /out/migrate
+COPY --from=builder /out/worker   /out/worker
+COPY --from=builder /out/cron     /out/cron
 COPY --from=builder /out/llmbench /out/llmbench
 COPY configs/ /app/configs/
 COPY migrations/ /app/migrations/

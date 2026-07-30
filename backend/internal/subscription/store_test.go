@@ -236,3 +236,65 @@ func TestPGStore_NilPool_Write_ErrInternal(t *testing.T) {
 	})
 	require.Error(t, err)
 }
+
+// ===== ExpireDue (CONTRACT §15.8) =====
+
+func TestMemoryStore_ExpireDue(t *testing.T) {
+	s := NewMemoryStore()
+	past := fixedNow.AddDate(0, 0, -1)
+	future := fixedNow.AddDate(0, 1, 0)
+
+	// tenant 1: expired period → should flip.
+	_, err := s.Upsert(context.Background(), &Subscription{
+		TenantID: 1, Plan: PlanPro, Status: "active",
+		PeriodStartedAt: past, PeriodEndsAt: &past, CreatedAt: fixedNow, UpdatedAt: fixedNow,
+	})
+	require.NoError(t, err)
+	// tenant 2: future period → stays active.
+	_, err = s.Upsert(context.Background(), &Subscription{
+		TenantID: 2, Plan: PlanPro, Status: "active",
+		PeriodStartedAt: fixedNow, PeriodEndsAt: &future, CreatedAt: fixedNow, UpdatedAt: fixedNow,
+	})
+	require.NoError(t, err)
+	// tenant 3: nil period (永久/free) → never expires.
+	_, err = s.Upsert(context.Background(), &Subscription{
+		TenantID: 3, Plan: PlanFree, Status: "active",
+		PeriodStartedAt: fixedNow, PeriodEndsAt: nil, CreatedAt: fixedNow, UpdatedAt: fixedNow,
+	})
+	require.NoError(t, err)
+
+	n, err := s.ExpireDue(context.Background(), fixedNow)
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "only tenant 1's lapsed sub should expire")
+
+	plan1, _ := s.CurrentPlan(context.Background(), 1)
+	require.Equal(t, PlanFree, plan1, "expired tenant reads as free")
+	plan2, _ := s.CurrentPlan(context.Background(), 2)
+	require.Equal(t, PlanPro, plan2, "future tenant stays pro")
+	plan3, _ := s.CurrentPlan(context.Background(), 3)
+	require.Equal(t, PlanFree, plan3)
+
+	// Idempotent: a second run expires nothing new.
+	n2, err := s.ExpireDue(context.Background(), fixedNow)
+	require.NoError(t, err)
+	require.Equal(t, 0, n2)
+}
+
+func TestPGStore_ExpireDue(t *testing.T) {
+	mock := newSubMockPool(t)
+	repo := NewPGStore(mock)
+	mock.ExpectExec(sqlSubExpireDue).
+		WithArgs(fixedNow).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 3))
+	n, err := repo.ExpireDue(context.Background(), fixedNow)
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGStore_ExpireDue_NilPool_NoOp(t *testing.T) {
+	repo := NewPGStore(nil)
+	n, err := repo.ExpireDue(context.Background(), fixedNow)
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+}
