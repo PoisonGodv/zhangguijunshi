@@ -95,9 +95,11 @@ CREATE TABLE stores (
                    CHECK (status IN ('active','closed')),
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    deleted_at     TIMESTAMPTZ,
-    UNIQUE (tenant_id, name) WHERE deleted_at IS NULL
+    deleted_at     TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stores_tenant_name
+    ON stores (tenant_id, name) WHERE deleted_at IS NULL;
 
 CREATE INDEX idx_stores_tenant ON stores(tenant_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_stores_lbs    ON stores(tenant_id, lng, lat) WHERE deleted_at IS NULL;
@@ -141,10 +143,14 @@ CREATE TABLE users (
     last_login_at TIMESTAMPTZ,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    deleted_at    TIMESTAMPTZ,
-    UNIQUE (tenant_id, phone_hash) WHERE deleted_at IS NULL,
-    UNIQUE (tenant_id, wx_openid)  WHERE deleted_at IS NULL AND wx_openid IS NOT NULL
+    deleted_at    TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tenant_phone_hash
+    ON users (tenant_id, phone_hash) WHERE deleted_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tenant_wx_openid
+    ON users (tenant_id, wx_openid) WHERE deleted_at IS NULL AND wx_openid IS NOT NULL;
 
 CREATE INDEX idx_users_tenant_role ON users(tenant_id, role) WHERE deleted_at IS NULL;
 

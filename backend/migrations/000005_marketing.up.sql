@@ -45,12 +45,12 @@ CREATE TABLE coupons (
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
     deleted_at   TIMESTAMPTZ,
-    UNIQUE (tenant_id, name) WHERE deleted_at IS NULL,
     CHECK (valid_to > valid_from),
     CHECK (issued >= 0),
     CHECK (total_quota IS NULL OR total_quota >= 0)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coupons_tenant_name ON coupons (tenant_id, name) WHERE deleted_at IS NULL;
 CREATE INDEX idx_coupons_tenant_store ON coupons(tenant_id, store_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_coupons_tenant_status ON coupons(tenant_id, status) WHERE deleted_at IS NULL;
 

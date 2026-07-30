@@ -1,5 +1,12 @@
-# syntax=docker
 # Dockerfile — 掌柜军师 管理后台 (apps/admin-web) 容器化产物
+#
+# NOTE: 不使用 `# syntax=docker/dockerfile:1.7` 显式前端指令。`# syntax=docker`
+# 会被 BuildKit 解析为 docker.io/library/docker:latest 作为前端镜像，但它不是
+# 合法的 BuildKit frontend，会以 "frontend grpc server closed unexpectedly"
+# 崩溃；显式 `docker/dockerfile:1.7` 又依赖实时从 docker.io 拉取前端（在受限/
+# flaky 网络下会 auth 超时）。Docker 29.x 内置的 BuildKit frontend 已支持本文件
+# 用到的全部特性（多阶段、COPY --from），故去掉 syntax 指令、用内置前端，既
+# 稳定义免去构建期网络拉取。
 #
 # 构建产物: nginx 静态站 + 同源反代 /v1/ → 后端 Go 单体 (避免 CORS)
 # API base 现状: src/services/request.ts 硬编码 baseURL '/v1' (同源相对路径,

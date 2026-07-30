@@ -1,0 +1,39 @@
+# Local-prod override for docker-compose.prod.yml.
+#
+# Layers a REAL ES256 JWT key (generated locally, gitignored) on top of the
+# prod stack so the backend boots without the insecure deterministic DevKey
+# fallback (config.prod.yaml jwt.key_file is otherwise empty -> DevKey + WARN).
+#
+# Why an override file (not editing prod.yml): docker-compose.prod.yml is a
+# committed deliverable representing the real prod topology; local-only mounts
+# and generated secrets should not pollute it. This file is also gitignored-
+# friendly (contains no secrets itself; the key it mounts lives at
+# infra/compose/secrets/jwt-key.pem, covered by .gitignore: *.pem, secrets/).
+#
+# Usage (from repo root):
+#   docker compose --env-file .env \
+#     -f infra/compose/docker-compose.prod.yml \
+#     -f infra/compose/docker-compose.local.yml up -d
+#   # migrate first (one-shot, profile-gated):
+#   docker compose --env-file .env \
+#     -f infra/compose/docker-compose.prod.yml \
+#     -f infra/compose/docker-compose.local.yml --profile migrate up
+#
+# Merge semantics: compose merges `volumes` (appends) and `environment`
+# (later file wins) across files. backend already has its prod env_file +
+# environment block; this only ADDS the key mount + the ZG_JWT_KEY_FILE path
+# (which is also set in .env — kept here as a self-documenting structural
+# override so the mount and the path never drift apart).
+services:
+  backend:
+    volumes:
+      - ./secrets/jwt-key.pem:/app/configs/jwt-key.pem:ro
+    environment:
+      ZG_JWT_KEY_FILE: /app/configs/jwt-key.pem
+      ZG_JWT_KEY_ID: local-prod-1
+    # 本机 8080 已被 dev Go api 占用（用户本地 `go run ./cmd/api`）。容器内仍
+    # 监听 8080（admin-web nginx 走内部 backend:8080 不受影响），仅把宿主发布
+    # 端口重映射到 18080，让容器栈与 dev 进程共存。!override 整体替换 prod.yml
+    # 的 ports 列表（compose v2.20+ 支持），避免 8080 冲突。
+    ports: !override
+      - "18080:8080"

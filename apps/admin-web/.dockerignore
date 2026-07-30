@@ -28,7 +28,7 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# 已有容器化产物自身 (避免递归)
+# 已有容器化产物自身 (避免递归)。注意: nginx.conf 不在此列——runtime 阶段
+# COPY nginx.conf 到镜像内, 必须保留在构建上下文里。
 Dockerfile
 .dockerignore
-nginx.conf

@@ -49,10 +49,11 @@ CREATE TABLE members (
                       CHECK (status IN ('active','blocked')),
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    deleted_at        TIMESTAMPTZ,
-    UNIQUE (tenant_id, phone_hash) WHERE deleted_at IS NULL AND phone_hash IS NOT NULL,
-    UNIQUE (tenant_id, wx_openid) WHERE deleted_at IS NULL AND wx_openid IS NOT NULL
+    deleted_at        TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_members_tenant_phone ON members (tenant_id, phone_hash) WHERE deleted_at IS NULL AND phone_hash IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_members_tenant_openid ON members (tenant_id, wx_openid) WHERE deleted_at IS NULL AND wx_openid IS NOT NULL;
 
 CREATE INDEX idx_members_tenant_store ON members(tenant_id, store_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_members_last_visit ON members(tenant_id, store_id, last_visit_at) WHERE deleted_at IS NULL;

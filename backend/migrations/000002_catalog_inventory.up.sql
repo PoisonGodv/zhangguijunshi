@@ -44,10 +44,13 @@ CREATE TABLE products (
                     CHECK (status IN ('active','archived')),
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    deleted_at      TIMESTAMPTZ,
-    UNIQUE (tenant_id, store_id, barcode) WHERE deleted_at IS NULL AND barcode IS NOT NULL,
-    UNIQUE (tenant_id, store_id, name, unit) WHERE deleted_at IS NULL
+    deleted_at      TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_tenant_store_barcode
+    ON products (tenant_id, store_id, barcode) WHERE deleted_at IS NULL AND barcode IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_tenant_store_name_unit
+    ON products (tenant_id, store_id, name, unit) WHERE deleted_at IS NULL;
 
 CREATE INDEX idx_products_tenant_store ON products(tenant_id, store_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_products_tags ON products(tenant_id, store_id) WHERE deleted_at IS NULL AND array_length(tags,1) > 0;
