@@ -77,6 +77,24 @@ curl localhost:8080/readyz                          # {"code":0,"data":{"db":"sk
 
 ---
 
+## 部署
+
+生产部署与本地开发的完整步骤见 runbook：
+
+- 生产部署：[docs/runbooks/deploy.md](docs/runbooks/deploy.md)
+- 本地开发：[docs/runbooks/local-dev.md](docs/runbooks/local-dev.md)
+
+在有 Docker 的服务器上，全栈一键起（先填 `.env`，再跑迁移，再起服务）：
+
+```bash
+docker compose -f infra/compose/docker-compose.prod.yml --profile migrate up    # 一次性迁移
+docker compose -f infra/compose/docker-compose.prod.yml up -d                   # 起后端 + 后台
+```
+
+> 本机无 Docker，compose 与 Dockerfile 作为可交付产物；实际部署在有 Docker 的服务器上执行。
+
+---
+
 ## 环境变量
 
 配置分层加载（低 → 高优先级）：**defaults → `configs/config.<env>.yaml` → 环境变量（前缀 `ZG_`，下划线嵌套）**。

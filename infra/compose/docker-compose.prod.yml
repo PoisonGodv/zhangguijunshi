@@ -1,0 +1,193 @@
+# Production full-stack compose for zhanggui-junshi.
+#
+# Brings up the complete prod stack: postgres (pgvector) + redis + backend API
+# + admin-web (nginx). MinIO is intentionally omitted — prod uses Tencent COS
+# (configured via ZG_COS_* env); a commented-out minio block is kept below for
+# local reference.
+#
+# Paths NOTE: this file lives at infra/compose/, so build contexts and env_file
+# paths are relative to THIS file's directory:
+#   ../../backend        -> backend/ source (built by backend/Dockerfile)
+#   ../../apps/admin-web -> admin-web source (built by apps/admin-web/Dockerfile)
+#   ./init               -> infra/compose/init/init.sql (pgvector bootstrap)
+#   ../../.env           -> repo-root .env (production secrets, gitignored)
+#
+# Usage (run from repo root):
+#   1) First-time / schema migrations (one-shot, profile-gated):
+#        docker compose --env-file .env \
+#          -f infra/compose/docker-compose.prod.yml --profile migrate up
+#      (apply `up` then `--profile migrate down`/stop; or run `run --rm migrate up`)
+#   2) Start the long-running stack:
+#        docker compose --env-file .env \
+#          -f infra/compose/docker-compose.prod.yml up -d
+#   3) Tail logs:
+#        docker compose -f infra/compose/docker-compose.prod.yml logs -f backend
+#   4) Tear down (keep volumes = data):
+#        docker compose -f infra/compose/docker-compose.prod.yml down
+#      Wipe data: append `-v` to the down command.
+#
+# This machine has no Docker — this file is a DELIVERABLE ONLY and is NOT
+# executed here (per CONTRACT.md hard constraints). YAML is syntax-checked
+# offline.
+#
+# Image layout (per backend/Dockerfile, written by a parallel agent): binaries
+# at /out/{api,migrate,worker,cron,llmbench}, WORKDIR /app, configs copied to
+# /app/configs/, migrations copied to /app/migrations/. The Dockerfile HEALTH-
+# CHECK probes /healthz (liveness, no DB check) so the orchestrator won't kill
+# the container during a slow DB start. We expose /readyz as a SECONDARY
+# readiness check via depends_on for dependents that need DB-up.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16   # bundles PostgreSQL 16 + pgvector extension
+    container_name: zg-postgres-prod
+    environment:
+      POSTGRES_USER: ${ZG_POSTGRES_USER:-zg}
+      POSTGRES_PASSWORD: ${ZG_POSTGRES_PASSWORD:?set ZG_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${ZG_POSTGRES_DATABASE:-zhanggui}
+    # prod: do NOT publish 5432 to the host by default; reach the DB from within
+    # the compose network only (backend talks to service `postgres`). Uncomment
+    # the ports block for emergency access from the host.
+    # ports:
+    #   - "5432:5432"
+    volumes:
+      - pgdata_prod:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro   # runs init.sql (pgvector ext) on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ZG_POSTGRES_USER:-zg} -d ${ZG_POSTGRES_DATABASE:-zhanggui}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks: [zg-net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: zg-redis-prod
+    # prod: appendonly persistence for cache/reach-state durability.
+    command: ["redis-server", "--appendonly", "yes"]
+    # prod: no host port by default (internal only); uncomment for debug.
+    # ports:
+    #   - "6379:6379"
+    volumes:
+      - redisdata_prod:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    networks: [zg-net]
+
+  backend:
+    image: zhanggui-junshi-backend:latest
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    container_name: zg-backend-prod
+    # env_file loads every ZG_* var from repo-root .env (secrets: JWT key,
+    # LLM providers, COS, WX, OTLP endpoint). The `environment:` block below
+    # then OVERRIDES the structural/routing fields (env=prod, host=service name).
+    env_file: ../../.env
+    environment:
+      ZG_ENV: prod                           # selects /app/configs/config.prod.yaml
+      ZG_APP_CONFIG_DIR: configs             # relative to WORKDIR /app (default)
+      ZG_POSTGRES_HOST: postgres            # compose service name
+      ZG_POSTGRES_PORT: "5432"
+      ZG_REDIS_HOST: redis                   # compose service name
+      ZG_REDIS_PORT: "6379"
+      # ZG_POSTGRES_PASSWORD / ZG_REDIS_PASSWORD / ZG_JWT_KEY_FILE / ZG_AI_* /
+      # ZG_COS_* / ZG_WX_* / ZG_OTEL_* come from env_file (../../.env).
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # prod: 8080 published for direct access / reverse-proxy termination. For an
+    # internal-only deployment behind a separate edge LB, drop this ports block.
+    ports:
+      - "8080:8080"
+    # Override the image HEALTHCHECK with /readyz (DB ping) so depends_on callers
+    # (admin-web) wait for true readiness, not just process liveness. The image's
+    # own /healthz stays the liveness probe inside the container. See
+    # backend/interfaces/http/router.go (/healthz + /readyz).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --tries=1 --timeout=3 http://127.0.0.1:8080/readyz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s   # give DB/Redis + migrations headroom before probing readiness
+    restart: unless-stopped
+    networks: [zg-net]
+
+  migrate:
+    # One-shot schema migration runner. Reuses the SAME built backend image so
+    # /out/migrate + /app/migrations are guaranteed in sync with the binary.
+    # Gated by the `migrate` profile so it does NOT start with `up -d`.
+    image: zhanggui-junshi-backend:latest
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    container_name: zg-migrate-prod
+    # migrate CLI has NO -config flag (see backend/cmd/migrate/main.go): it reads
+    # ZG_ENV to locate config.<env>.yaml (-> /app/configs/config.prod.yaml via
+    # WORKDIR /app) and ZG_MIGRATIONS_DIR for the SQL dir (-> /app/migrations).
+    # Subcommands: up | down [N] | version | force <v>. We run `up`.
+    entrypoint: ["/out/migrate"]
+    command: ["up"]
+    env_file: ../../.env
+    environment:
+      ZG_ENV: prod
+      ZG_MIGRATIONS_DIR: /app/migrations    # explicit; matches backend/Dockerfile layout
+      ZG_POSTGRES_HOST: postgres
+      ZG_POSTGRES_PORT: "5432"
+      ZG_REDIS_HOST: redis
+      ZG_REDIS_PORT: "6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"            # one-shot; do not retry-loop
+    profiles: ["migrate"]
+    networks: [zg-net]
+
+  admin-web:
+    image: zhanggui-junshi-admin-web:latest
+    build:
+      context: ../../apps/admin-web
+      dockerfile: Dockerfile
+    container_name: zg-admin-web-prod
+    depends_on:
+      backend:
+        condition: service_healthy   # wait until backend /readyz is green
+    ports:
+      - "8088:80"          # nginx listens on :80 inside; publish on 8088
+    restart: unless-stopped
+    networks: [zg-net]
+
+  # ------------------------------------------------------------------
+  # minio — NOT in prod. Prod object storage is Tencent COS, configured via
+  # ZG_COS_* env. Kept here (commented) for local parity / debugging only.
+  # ------------------------------------------------------------------
+  # minio:
+  #   image: minio/minio:latest
+  #   command: ["server", "/data", "--console-address", ":9001"]
+  #   environment:
+  #     MINIO_ROOT_USER: ${ZG_MINIO_ROOT_USER:-minio}
+  #     MINIO_ROOT_PASSWORD: ${ZG_MINIO_ROOT_PASSWORD:-minio123}
+  #   ports:
+  #     - "9000:9000"
+  #     - "9001:9001"
+  #   volumes:
+  #     - miniodata_prod:/data
+  #   restart: unless-stopped
+  #   networks: [zg-net]
+
+volumes:
+  pgdata_prod:
+  redisdata_prod:
+  # miniodata_prod:
+
+networks:
+  zg-net:
+    driver: bridge

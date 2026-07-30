@@ -1,0 +1,105 @@
+# Production configuration.
+# Same field shape as config.dev.yaml (mirrors backend/pkg/config/types.go
+# mapstructure tags). Layering (low → high priority): defaults → this file →
+# env vars (prefix ZG_). Sensitive / deployment-specific values use ${VAR}
+# placeholders resolved from the environment at runtime (config.go runs the yaml
+# through os.ExpandEnv before handing it to viper) — NO real secrets are
+# committed. Every field that deviates from config.dev.yaml has a "# prod:"
+# comment explaining the change.
+#
+# This file is selected by setting ZG_ENV=prod (config.Load picks
+# configs/config.prod.yaml; there is no -config flag, see backend/cmd/migrate/
+# main.go and backend/Dockerfile). Within the docker-compose.prod.yml stack the
+# backend/migrate containers set ZG_ENV=prod and WORKDIR=/app so the file
+# resolves to /app/configs/config.prod.yaml.
+app:
+  name: zhanggui-junshi-backend
+  env: prod                          # prod: dev had "dev"
+  version: ${ZG_APP_VERSION}         # prod: version injected at build/deploy time
+
+http:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: "15s"
+  write_timeout: "15s"
+  shutdown_timeout: "30s"
+
+postgres:
+  # prod: connection fields are ${VAR} placeholders (no hardcoded creds). In the
+  # compose stack ZG_POSTGRES_HOST=postgres points at the compose service; for a
+  # managed DB (TDSQL-C) override via env and set ZG_POSTGRES_SSL_MODE=require.
+  host: ${ZG_POSTGRES_HOST}
+  port: 5432
+  user: ${ZG_POSTGRES_USER}
+  password: ${ZG_POSTGRES_PASSWORD}
+  database: ${ZG_POSTGRES_DATABASE}
+  ssl_mode: ${ZG_POSTGRES_SSL_MODE}
+  max_conns: 20                      # prod: larger pool than dev's 10
+  min_conns: 5                       # prod: keep 5 warm vs dev's 2
+  max_conn_lifetime: "30m"
+  max_conn_idle_time: "5m"
+
+redis:
+  host: ${ZG_REDIS_HOST}             # prod: no hardcoded host (dev had localhost)
+  port: 6379
+  password: ${ZG_REDIS_PASSWORD}      # prod: secret injected via env (dev was empty)
+  db: 0
+  pool_size: 20                      # prod: larger pool than dev's 10
+
+log:
+  level: info                       # prod: info (dev had debug — too verbose)
+  encoding: json                    # prod: structured json logs (dev had console)
+  output_paths:
+    - stdout
+
+jwt:
+  # prod: ES256 signing key MUST be a real ECDSA P-256 key, injected at runtime
+  # via ZG_JWT_KEY_FILE (path to a mounted PEM) or a mounted secret file. Leave
+  # key_file empty here ONLY if you inject ZG_JWT_KEY_FILE via env; NEVER rely on
+  # the deterministic DevKey in production (it is insecure and logged on boot).
+  key_file: ${ZG_JWT_KEY_FILE}
+  key_id: ${ZG_JWT_KEY_ID}           # prod: kid for key rotation, env-injected
+  access_ttl: "30m"
+  refresh_ttl: "720h"
+  issuer: zhanggui-junshi
+
+wx:
+  # prod: real WeChat mini-program credentials per tenant; env-injected, never
+  # committed (dev had empty placeholders too — prod enforces it via ${VAR}).
+  app_id: ${ZG_WX_APP_ID}
+  secret: ${ZG_WX_SECRET}
+  code2session_url: ""               # prod: empty -> official WeChat endpoint
+  timeout: "5s"
+
+ai:
+  default_provider: ${ZG_AI_DEFAULT_PROVIDER}   # prod: which provider is active
+  request_timeout: "8s"
+  monthly_budget_cny: 2.0           # prod: per-tenant monthly AI cost ceiling
+  providers: {}                     # prod: providers injected via ZG_AI_PROVIDERS_* env, not committed
+  # prod: task-tier -> provider+model routes injected via env (M3-S2 §13.3.7).
+  # Empty -> every tier falls back to defaultRoute. Staging/prod example:
+  #   routes:
+  #     lite: { provider: doubao,  model: doubao-lite-32k }
+  #     v3:   { provider: deepseek, model: deepseek-chat }
+  #     r1:   { provider: deepseek, model: deepseek-reasoner }
+  routes: {}
+
+otel:
+  enable: true                      # prod: telemetry ON (dev had false)
+  endpoint: ${ZG_OTEL_ENDPOINT}      # prod: OTLP collector endpoint, env-injected
+  service_name: zhanggui-junshi-backend
+  sample_ratio: 0.1                 # prod: 10% sampling vs dev's 1.0 (cost control)
+  insecure: false                   # prod: TLS to collector (dev had true/insecure)
+
+cos:
+  # prod: Tencent COS (S3-compatible) credentials env-injected from SSM/KMS;
+  # never committed. Bucket per environment.
+  secret_id: ${ZG_COS_SECRET_ID}
+  secret_key: ${ZG_COS_SECRET_KEY}
+  region: ${ZG_COS_REGION}
+  bucket: ${ZG_COS_BUCKET}
+  endpoint: ${ZG_COS_ENDPOINT}
+
+multitenancy:
+  strict: true                      # prod: hard-enforce tenant on every repo call
+  dev_mock_header: false           # prod: MOCK header OFF — rely on JWT (dev had true)

@@ -1,0 +1,48 @@
+# Docker 构建上下文排除项（相对 backend/）。
+# 保留：cmd/、internal/、interfaces/、pkg/、configs/、migrations/、go.mod、go.sum、Makefile。
+
+# VCS
+.git
+.gitignore
+.gitattributes
+.github
+
+# 本地 IDE / OS 杂项
+.idea
+.vscode
+.DS_Store
+*.swp
+*~
+
+# Go 测试产物与缓存（构建镜像不需要测试，加速上下文上传）
+**/*_test.go
+**/*.test
+**/*.out
+**/testdata/
+coverage.txt
+coverage.html
+
+# 本地运行产物
+bin/
+out/
+*.exe
+
+# 本地配置密钥 / 环境文件（切勿进镜像）
+configs/config.local.yaml
+configs/config.prod.local.yaml
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# 文档与计划（不影响编译）
+CONTRACT.md
+README.md
+*.md
+docs/
+
+# 前端（与本后端镜像无关）
+node_modules
+apps/consumer-mp
+apps/admin-web
