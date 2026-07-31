@@ -209,6 +209,13 @@ func (a wxTokenSourceAdapter) GetAccessToken(ctx context.Context) (string, error
 	return a.cache.GetAccessToken(ctx, a.appID, a.secret)
 }
 
+// Invalidate drops the cached token for the adapter's AppID/Secret so the next
+// GetAccessToken refetches. reach.WxSender calls it after a token-invalid errcode
+// (40001/40014/42001/41001) to force a fresh token before retrying a send.
+func (a wxTokenSourceAdapter) Invalidate(_ context.Context) {
+	a.cache.Invalidate(a.appID, a.secret)
+}
+
 // memberResolverAdapter adapts *membership.Service onto reach.MemberResolver.
 // membership.Service.GetMember resolves the tenant from ctx, so the adapter
 // injects a system-source tenant context (tenantID comes from the reach

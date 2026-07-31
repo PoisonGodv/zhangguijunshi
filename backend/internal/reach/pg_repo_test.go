@@ -6,7 +6,8 @@ package reach
 // text contains regex metacharacters. Column helpers match the scanXxx Scan
 // order exactly — that ordering is what makes pgxmock row mapping succeed.
 // ConsumeSubscribe's "no row → ErrSubscribeExhausted" and GrantSubscribe's
-// read-then-write (no UNIQUE on the lookup tuple) are the load-bearing cases.
+// single-statement ON CONFLICT upsert (UNIQUE uq_subauth_tenant_member_tpl,
+// migration 000021) are the load-bearing cases.
 
 import (
 	"context"
@@ -187,11 +188,10 @@ func TestPGReachRepo_UpdateTaskNotFound(t *testing.T) {
 func TestPGReachRepo_GrantSubscribeNew(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGReachRepo(mock)
-	// Lookup misses (no existing auth) → INSERT new with GrantedQuota=quota.
-	mock.ExpectQuery(sqlSubAuthGrantLookup).
-		WithArgs(int64(1), int64(100), "tpl_subscribe").
-		WillReturnError(pgx.ErrNoRows)
-	mock.ExpectQuery(sqlSubAuthGrantInsert).
+	// Single ON CONFLICT upsert: no prior row ⇒ INSERT path returns a fresh auth
+	// with GrantedQuota=quota, UsedQuota=0. Args order matches sqlSubAuthGrantUpsert:
+	// tenant, member, tpl, quota, granted_at.
+	mock.ExpectQuery(sqlSubAuthGrantUpsert).
 		WithArgs(int64(1), int64(100), "tpl_subscribe", 3, fixedTime).
 		WillReturnRows(pgxmock.NewRows(subColumns()).AddRow(
 			int64(9), int64(1), int64(100), "tpl_subscribe", 3, 0, fixedTime,
@@ -207,18 +207,50 @@ func TestPGReachRepo_GrantSubscribeNew(t *testing.T) {
 func TestPGReachRepo_GrantSubscribeAccumulate(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGReachRepo(mock)
-	// Lookup hits (existing id=9) → UPDATE granted_quota += quota.
-	mock.ExpectQuery(sqlSubAuthGrantLookup).
-		WithArgs(int64(1), int64(100), "tpl_subscribe").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(9)))
-	mock.ExpectQuery(sqlSubAuthGrantAdd).
-		WithArgs(3, fixedTime, int64(1), int64(100), "tpl_subscribe").
+	// Single ON CONFLICT upsert: an existing row ⇒ the DO UPDATE branch accumulates
+	// granted_quota += quota (3 onto prior 3 ⇒ 6) in ONE statement. This is the
+	// load-bearing regression for the concurrent-first-grant duplicate-row bug: the
+	// upsert is a single atomic statement, so there is no read-then-write window in
+	// which two concurrent first-grants could both INSERT.
+	mock.ExpectQuery(sqlSubAuthGrantUpsert).
+		WithArgs(int64(1), int64(100), "tpl_subscribe", 3, fixedTime).
 		WillReturnRows(pgxmock.NewRows(subColumns()).AddRow(
 			int64(9), int64(1), int64(100), "tpl_subscribe", 6, 1, fixedTime,
 		))
 	a, err := repo.GrantSubscribe(context.Background(), 1, 100, "tpl_subscribe", 3, fixedTime)
 	require.NoError(t, err)
 	require.Equal(t, 6, a.GrantedQuota) // 3 accumulated onto prior 3
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGReachRepo_GrantSubscribeConcurrentSingleRow simulates two concurrent
+// first-grants landing on the same (tenant, member, tpl): each is a single
+// ON CONFLICT upsert, so the DB returns one row per call and the second call sees
+// the accumulated total — never a second row. Two sequential upsert expectations
+// (no lookup/insert split) prove the single-statement path.
+func TestPGReachRepo_GrantSubscribeConcurrentSingleRow(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGReachRepo(mock)
+	// First grant inserts (granted=2).
+	mock.ExpectQuery(sqlSubAuthGrantUpsert).
+		WithArgs(int64(1), int64(100), "tpl_subscribe", 2, fixedTime).
+		WillReturnRows(pgxmock.NewRows(subColumns()).AddRow(
+			int64(9), int64(1), int64(100), "tpl_subscribe", 2, 0, fixedTime,
+		))
+	// Second concurrent grant hits ON CONFLICT and accumulates (granted=5).
+	mock.ExpectQuery(sqlSubAuthGrantUpsert).
+		WithArgs(int64(1), int64(100), "tpl_subscribe", 3, fixedTime).
+		WillReturnRows(pgxmock.NewRows(subColumns()).AddRow(
+			int64(9), int64(1), int64(100), "tpl_subscribe", 5, 0, fixedTime,
+		))
+	a1, err := repo.GrantSubscribe(context.Background(), 1, 100, "tpl_subscribe", 2, fixedTime)
+	require.NoError(t, err)
+	a2, err := repo.GrantSubscribe(context.Background(), 1, 100, "tpl_subscribe", 3, fixedTime)
+	require.NoError(t, err)
+	// Same row id both times (one row, accumulated) — the duplicate-row bug would
+	// have surfaced as two distinct ids / a lookup+insert pair.
+	require.Equal(t, a1.ID, a2.ID)
+	require.Equal(t, 5, a2.GrantedQuota)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

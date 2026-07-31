@@ -12,9 +12,9 @@ package reach
 // database/sql Null types. The two atomic critical sections match the memory
 // repo: ConsumeSubscribe is a single conditional UPDATE
 // (used_quota < granted_quota) that maps "no row" → ErrSubscribeExhausted;
-// GrantSubscribe is a read-then-write (subscribe_auth has no UNIQUE on
-// (tenant, member, template_id), only a non-unique index, so ON CONFLICT cannot
-// target it — the MarkSuccess-style two-step is the closest faithful mapping).
+// GrantSubscribe is a single ON CONFLICT upsert over the UNIQUE index
+// uq_subauth_tenant_member_tpl (added in migration 000021), so concurrent
+// first-grants accumulate onto one row instead of inserting duplicates.
 // Unsubscribe is a true ON CONFLICT upsert (UNIQUE(tenant, member, channel)).
 
 import (
@@ -82,20 +82,19 @@ WHERE tenant_id = $5 AND id = $6
 RETURNING id, tenant_id, store_id, channel, template_code, target_count, status, blocked_reason, strategy_id, scheduled_at, sent_at, created_at`
 )
 
-// SQL for subscribe_auth (migration 000006). No UNIQUE constraint exists on
-// (tenant_id, member_id, template_id) — only a non-unique index — so
-// GrantSubscribe cannot use ON CONFLICT; it looks up then branches (insert vs
-// accumulate), the MarkSuccess-style two-step. ConsumeSubscribe is a single
-// atomic conditional UPDATE: the WHERE used_quota < granted_quota guard plus the
-// table's CHECK (used_quota <= granted_quota) make the increment race-safe, and
-// "no row" (absent or exhausted) maps to ErrSubscribeExhausted.
+// SQL for subscribe_auth (migration 000006 + 000021). Migration 000021 adds the
+// UNIQUE index uq_subauth_tenant_member_tpl on (tenant_id, member_id,
+// template_id) — after first collapsing any pre-existing duplicate rows — so
+// GrantSubscribe is now a single atomic ON CONFLICT upsert (bug fix: the old
+// read-then-write raced on concurrent first-grants and inserted duplicate rows,
+// corrupting the one-time quota accounting). ConsumeSubscribe is a single atomic
+// conditional UPDATE: the WHERE used_quota < granted_quota guard plus the table's
+// CHECK (used_quota <= granted_quota) make the increment race-safe, and "no row"
+// (absent or exhausted) maps to ErrSubscribeExhausted.
 const (
-	sqlSubAuthGrantLookup = `SELECT id FROM subscribe_auth WHERE tenant_id = $1 AND member_id = $2 AND template_id = $3`
-	sqlSubAuthGrantInsert = `INSERT INTO subscribe_auth (tenant_id, member_id, template_id, granted_quota, used_quota, granted_at)
+	sqlSubAuthGrantUpsert = `INSERT INTO subscribe_auth (tenant_id, member_id, template_id, granted_quota, used_quota, granted_at)
 VALUES ($1, $2, $3, $4, 0, $5)
-RETURNING id, tenant_id, member_id, template_id, granted_quota, used_quota, granted_at`
-	sqlSubAuthGrantAdd = `UPDATE subscribe_auth SET granted_quota = granted_quota + $1, granted_at = $2
-WHERE tenant_id = $3 AND member_id = $4 AND template_id = $5
+ON CONFLICT (tenant_id, member_id, template_id) DO UPDATE SET granted_quota = subscribe_auth.granted_quota + EXCLUDED.granted_quota, granted_at = EXCLUDED.granted_at
 RETURNING id, tenant_id, member_id, template_id, granted_quota, used_quota, granted_at`
 	sqlSubAuthConsume = `UPDATE subscribe_auth SET used_quota = used_quota + 1
 WHERE tenant_id = $1 AND member_id = $2 AND template_id = $3 AND used_quota < granted_quota
@@ -304,26 +303,19 @@ func (r *PGReachRepo) UpdateTask(ctx context.Context, t *ReachTask) (*ReachTask,
 	return got, nil
 }
 
-// GrantSubscribe idempotently accumulates quota for (tenant, member, tpl). An
-// existing auth gets GrantedQuota += quota (granted_at refreshed); otherwise a
-// new auth is created with GrantedQuota = quota, UsedQuota = 0. subscribe_auth
-// has no UNIQUE on the (tenant, member, template_id) lookup tuple (only a
-// non-unique index), so this is a read-then-write — the closest faithful mapping
-// of MemoryReachRepo under the frozen PGPool surface.
+// GrantSubscribe idempotently accumulates quota for (tenant, member, tpl) as a
+// single atomic ON CONFLICT upsert: a new auth is inserted with GrantedQuota =
+// quota, UsedQuota = 0; an existing auth (matched by the UNIQUE index
+// uq_subauth_tenant_member_tpl added in migration 000021) gets GrantedQuota +=
+// quota with granted_at refreshed. The single statement is race-safe — two
+// concurrent first-grants can no longer both insert (the old read-then-write
+// did, corrupting the one-time quota accounting). Mirrors MemoryReachRepo, whose
+// single mutex already serialised the accumulate.
 func (r *PGReachRepo) GrantSubscribe(ctx context.Context, tenantID, memberID int64, tplID string, quota int, now time.Time) (*SubscribeAuth, error) {
 	if r == nil || r.pool == nil {
 		return nil, ErrNotFound
 	}
-	var existingID int64
-	err := r.pool.QueryRow(ctx, sqlSubAuthGrantLookup, tenantID, memberID, tplID).Scan(&existingID)
-	switch {
-	case err == nil:
-		return scanSubscribeAuth(r.pool.QueryRow(ctx, sqlSubAuthGrantAdd, quota, now, tenantID, memberID, tplID))
-	case errors.Is(err, pgx.ErrNoRows):
-		return scanSubscribeAuth(r.pool.QueryRow(ctx, sqlSubAuthGrantInsert, tenantID, memberID, tplID, quota, now))
-	default:
-		return nil, fmt.Errorf("reach: pg grant subscribe lookup: %w", err)
-	}
+	return scanSubscribeAuth(r.pool.QueryRow(ctx, sqlSubAuthGrantUpsert, tenantID, memberID, tplID, quota, now))
 }
 
 // ConsumeSubscribe atomically increments UsedQuota iff used<granted via a single

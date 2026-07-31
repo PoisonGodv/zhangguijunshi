@@ -65,9 +65,10 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 //     tripped between booking and delivery. See recheckBeforeSend for the
 //     degradation tradeoffs (freq optional ⇒ skipped when unwired; unsub strict
 //     ⇒ an error fails the attempt rather than delivering).
-//  5. channel==subscribe_msg ⇒ ConsumeSubscribe ⇒ ErrSubscribeExhausted ⇒
+//  5. channel==subscribe_msg ⇒ GetSubscribe precheck ⇒ absent/exhausted ⇒
 //     blocked(subscribe_quota)
-//  6. Sender (if wired).Send ⇒ failure status=failed / success status=sent
+//  6. Sender (if wired).Send ⇒ failure status=failed (quota NOT consumed)
+//  7. channel==subscribe_msg ⇒ ConsumeSubscribe (only after successful send)
 //
 // taskID selects the persistence mode at every terminal point (block / fail /
 // sent):
@@ -89,7 +90,12 @@ func (s *Service) SendFinalize(ctx context.Context, in SendInput, taskID int64) 
 	if err != nil {
 		return nil, err
 	}
-	if in.MemberID <= 0 || in.TemplateCode == "" || in.Channel == "" {
+	// StoreID is validated alongside the other identity fields (bug fix: the PG
+	// reach_tasks.store_id FK rejects store_id=0 while the memory repo accepted
+	// it, so an unvalidated StoreID=0 diverged across the two implementations).
+	// This single guard sits BEFORE both the deferred-send branch and persist, so
+	// it covers the immediate AND the scheduled paths in one place.
+	if in.StoreID <= 0 || in.MemberID <= 0 || in.TemplateCode == "" || in.Channel == "" {
 		return nil, errcode.ErrParam
 	}
 
@@ -185,19 +191,29 @@ func (s *Service) SendFinalize(ctx context.Context, in SendInput, taskID int64) 
 		return s.block(ctx, task, reason, taskID)
 	}
 
-	// ⑥ subscribe-message one-time quota. TemplateCode is the subscribe template
-	// id; absent auth ⇒ exhausted ⇒ blocked(subscribe_quota).
+	// ⑥ subscribe-message one-time quota PRECHECK. Bug fix: the actual
+	// ConsumeSubscribe was moved to AFTER a successful delivery (step ⑧) so a
+	// failed send no longer burns the member's one-time authorization with no
+	// rollback. We still reject up front when there is nothing to consume —
+	// absent auth (ErrNotFound) or used>=granted ⇒ blocked(subscribe_quota) — so
+	// an exhausted member never reaches the sender. Any other GetSubscribe error
+	// is a real system fault and is surfaced.
 	if in.Channel == ChannelSubscribeMsg {
-		if _, cerr := s.repo.ConsumeSubscribe(ctx, tenantID, in.MemberID, in.TemplateCode, now); cerr != nil {
-			if errors.Is(cerr, ErrSubscribeExhausted) {
-				return s.block(ctx, task, BlockSubscribeQuota, taskID)
-			}
-			return nil, cerr
+		auth, gerr := s.repo.GetSubscribe(ctx, tenantID, in.MemberID, in.TemplateCode)
+		switch {
+		case errors.Is(gerr, ErrNotFound):
+			return s.block(ctx, task, BlockSubscribeQuota, taskID)
+		case gerr != nil:
+			return nil, gerr
+		case auth.UsedQuota >= auth.GrantedQuota:
+			return s.block(ctx, task, BlockSubscribeQuota, taskID)
 		}
 	}
 
 	// ⑦ actual delivery (optional). On failure record status=failed but still
-	// return the task (the attempt happened; it just did not land).
+	// return the task (the attempt happened; it just did not land) — and, for
+	// subscribe_msg, the one-time quota is NOT consumed, because the consume now
+	// happens only after a successful send (step ⑧).
 	if s.sender != nil {
 		if serr := s.sender.Send(ctx, &SendPayload{
 			TenantID:     tenantID,
@@ -209,6 +225,19 @@ func (s *Service) SendFinalize(ctx context.Context, in SendInput, taskID int64) 
 		}); serr != nil {
 			task.Status = StatusFailed
 			return s.persist(ctx, task, taskID)
+		}
+	}
+
+	// ⑧ consume the one-time subscribe quota now that delivery has succeeded (or
+	// the sender is unwired — dev renders + audits only, which preserves the
+	// prior behaviour of recording the consumption). A concurrent drain between
+	// the ⑥ precheck and this consume can surface ErrSubscribeExhausted; the
+	// message already landed, so we must NOT relabel it blocked/failed nor
+	// trigger a worker redelivery — we tolerate that rare race and persist sent.
+	// Any other consume error is a real system fault and is surfaced.
+	if in.Channel == ChannelSubscribeMsg {
+		if _, cerr := s.repo.ConsumeSubscribe(ctx, tenantID, in.MemberID, in.TemplateCode, now); cerr != nil && !errors.Is(cerr, ErrSubscribeExhausted) {
+			return nil, cerr
 		}
 	}
 
@@ -243,11 +272,13 @@ func (s *Service) SendFinalize(ctx context.Context, in SendInput, taskID int64) 
 //     message someone who opted out.
 //
 // Quota (subscribe_msg) and the content filter are intentionally NOT rechecked:
-//   - Quota is consumed exactly once, at step ⑥. The deferred branch returns
-//     BEFORE step ⑥, so a deferred subscribe_msg send's quota is in fact consumed
-//     at delivery on its first and only pass through ⑥ — there is no earlier
-//     consumption to double-count, and recheckBeforeSend correctly leaves quota
-//     alone. (An immediate send likewise consumes at ⑥ on its single pass.)
+//   - Quota is now consumed exactly once, at step ⑧ — AFTER a successful send
+//     (bug fix: a failed delivery no longer burns the one-time authorization).
+//     Step ⑥ is only a PRECHECK (GetSubscribe) that rejects an exhausted member
+//     before reaching the sender; it does not mutate quota, so there is nothing
+//     for recheckBeforeSend to double-count. The deferred branch returns BEFORE
+//     step ⑥, so a deferred subscribe_msg send's quota is consumed at delivery
+//     on its first and only pass through ⑧.
 //   - The content filter is a pure function of the rendered body, which is byte
 //     identical at booking and delivery; re-running it adds cost with no new signal.
 func (s *Service) recheckBeforeSend(ctx context.Context, tenantID int64, in SendInput) (string, error) {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
@@ -211,7 +212,7 @@ func TestSend_BlockedContentFilter(t *testing.T) {
 	s := fullSvc(repo, snd, freq, cf)
 
 	task, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelWeworkOneV, TemplateCode: TplRepurchase,
+		StoreID: 7, MemberID: 100, Channel: ChannelWeworkOneV, TemplateCode: TplRepurchase,
 	})
 	if err != nil {
 		t.Fatalf("blocked must return nil error, got %v", err)
@@ -237,7 +238,7 @@ func TestSend_BlockedFreqCircuit(t *testing.T) {
 	s := fullSvc(repo, snd, freq, cf)
 
 	task, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelWeworkGroup, TemplateCode: TplNewWelcome,
+		StoreID: 7, MemberID: 100, Channel: ChannelWeworkGroup, TemplateCode: TplNewWelcome,
 	})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -270,7 +271,7 @@ func TestSend_BlockedUnsubscribed_OrderPreservesQuota(t *testing.T) {
 	}
 
 	task, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
+		StoreID: 7, MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
 	})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -298,7 +299,7 @@ func TestSend_BlockedSubscribeQuota(t *testing.T) {
 
 	// No GrantSubscribe ⇒ exhausted ⇒ blocked(subscribe_quota).
 	task, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
+		StoreID: 7, MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
 	})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -323,7 +324,7 @@ func TestSend_SubscribeMsgConsumesQuota(t *testing.T) {
 	}
 	// First send consumes one quota unit and succeeds.
 	if _, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
+		StoreID: 7, MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
 	}); err != nil {
 		t.Fatalf("send1: %v", err)
 	}
@@ -333,7 +334,7 @@ func TestSend_SubscribeMsgConsumesQuota(t *testing.T) {
 	}
 	// Second send exhausts exactly.
 	if _, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
+		StoreID: 7, MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
 	}); err != nil {
 		t.Fatalf("send2: %v", err)
 	}
@@ -343,7 +344,7 @@ func TestSend_SubscribeMsgConsumesQuota(t *testing.T) {
 	}
 	// Third send ⇒ exhausted ⇒ blocked.
 	task, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
+		StoreID: 7, MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
 	})
 	if err != nil {
 		t.Fatalf("send3 err: %v", err)
@@ -365,13 +366,56 @@ func TestSend_FailedDelivery(t *testing.T) {
 	s := fullSvc(repo, snd, freq, cf)
 
 	task, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelSMS, TemplateCode: TplRecall90,
+		StoreID: 7, MemberID: 100, Channel: ChannelSMS, TemplateCode: TplRecall90,
 	})
 	if err != nil {
 		t.Fatalf("send failure is recorded on the task, not returned as err: %v", err)
 	}
 	if task.Status != StatusFailed {
 		t.Fatalf("expected failed status, got %+v", task)
+	}
+}
+
+// TestSend_SubscribeFailedDelivery_DoesNotConsumeQuota is the regression for the
+// "先扣后发、失败不回退" bug: a subscribe_msg send whose delivery FAILS must NOT
+// burn the member's one-time authorization. ConsumeSubscribe now runs only after
+// a successful send, so a failed attempt leaves UsedQuota untouched and a later
+// successful send can still consume.
+func TestSend_SubscribeFailedDelivery_DoesNotConsumeQuota(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	snd := &fakeSender{err: errors.New("upstream timeout")} // delivery fails
+	freq := &fakeFreq{allowed: true}
+	cf := &fakeCF{passed: true}
+	s := fullSvc(repo, snd, freq, cf)
+
+	if _, err := s.GrantSubscribe(ctxWithTenant(50021), 100, TplPointsExpire, 1); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	// The send fails at the sender ⇒ recorded as failed, NOT returned as an error.
+	task, err := s.Send(ctxWithTenant(50021), SendInput{
+		StoreID: 7, MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
+	})
+	if err != nil {
+		t.Fatalf("failed delivery is recorded on the task: %v", err)
+	}
+	if task.Status != StatusFailed {
+		t.Fatalf("expected failed status, got %+v", task)
+	}
+	// The one-time quota was NOT consumed by the failed send.
+	auth, _ := s.repo.GetSubscribe(ctxWithTenant(50021), 50021, 100, TplPointsExpire)
+	if auth.UsedQuota != 0 {
+		t.Fatalf("failed send must not consume quota: used=%d", auth.UsedQuota)
+	}
+	// A subsequent SUCCESSFUL send can still consume the authorization.
+	snd.err = nil
+	if _, err := s.Send(ctxWithTenant(50021), SendInput{
+		StoreID: 7, MemberID: 100, Channel: ChannelSubscribeMsg, TemplateCode: TplPointsExpire,
+	}); err != nil {
+		t.Fatalf("retry send: %v", err)
+	}
+	auth, _ = s.repo.GetSubscribe(ctxWithTenant(50021), 50021, 100, TplPointsExpire)
+	if auth.UsedQuota != 1 {
+		t.Errorf("successful send should consume exactly once: used=%d", auth.UsedQuota)
 	}
 }
 
@@ -384,7 +428,7 @@ func TestSend_DevModeNoGuards(t *testing.T) {
 	s := New(repo, WithSender(snd), WithNowFunc(clock))
 
 	task, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelWeworkOneV, TemplateCode: TplBirthday,
+		StoreID: 7, MemberID: 100, Channel: ChannelWeworkOneV, TemplateCode: TplBirthday,
 		Vars: map[string]string{"member_name": "小美"},
 	})
 	if err != nil {
@@ -407,7 +451,7 @@ func TestSend_UnknownTemplateHardError(t *testing.T) {
 
 	// Unknown code ⇒ hard error (ErrTemplateUnknown), NOT a blocked task.
 	task, err := s.Send(ctxWithTenant(50021), SendInput{
-		MemberID: 100, Channel: ChannelWeworkGroup, TemplateCode: "bogus_tpl",
+		StoreID: 7, MemberID: 100, Channel: ChannelWeworkGroup, TemplateCode: "bogus_tpl",
 	})
 	if !errors.Is(err, ErrTemplateUnknown) {
 		t.Fatalf("expected ErrTemplateUnknown hard error, got err=%v task=%+v", err, task)
@@ -430,14 +474,41 @@ func TestSend_NoTenantHardError(t *testing.T) {
 func TestSend_ParamValidation(t *testing.T) {
 	s := New(NewMemoryReachRepo(), WithNowFunc(clock))
 	cases := []SendInput{
-		{MemberID: 0, Channel: ChannelSMS, TemplateCode: TplRecall30},
-		{MemberID: 1, Channel: "", TemplateCode: TplRecall30},
-		{MemberID: 1, Channel: ChannelSMS, TemplateCode: ""},
+		{StoreID: 0, MemberID: 1, Channel: ChannelSMS, TemplateCode: TplRecall30}, // StoreID=0 ⇒ ErrParam (PG FK rejects it)
+		{StoreID: 7, MemberID: 0, Channel: ChannelSMS, TemplateCode: TplRecall30},
+		{StoreID: 7, MemberID: 1, Channel: "", TemplateCode: TplRecall30},
+		{StoreID: 7, MemberID: 1, Channel: ChannelSMS, TemplateCode: ""},
 	}
 	for i, c := range cases {
-		if _, err := s.Send(ctxWithTenant(50021), c); err == nil {
-			t.Errorf("case %d: expected param error", i)
+		if _, err := s.Send(ctxWithTenant(50021), c); !errors.Is(err, errcode.ErrParam) {
+			t.Errorf("case %d: expected ErrParam, got %v", i, err)
 		}
+	}
+}
+
+// TestSend_StoreIDZero_ErrParam is the regression for the StoreID-validation bug:
+// StoreID=0 used to pass the memory repo but hit the PG reach_tasks.store_id FK,
+// diverging the two implementations. It must now be rejected up front as ErrParam
+// on BOTH the immediate and the scheduled paths (the guard precedes both).
+func TestSend_StoreIDZero_ErrParam(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	prod := &fakeScheduledProducer{}
+	s := New(repo, WithSender(&fakeSender{}), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	// Immediate path.
+	if _, err := s.Send(ctxWithTenant(50021), SendInput{StoreID: 0, MemberID: 1, Channel: ChannelSMS, TemplateCode: TplRecall30}); !errors.Is(err, errcode.ErrParam) {
+		t.Fatalf("immediate StoreID=0 must be ErrParam, got %v", err)
+	}
+	// Scheduled path: the guard runs BEFORE the deferred branch, so nothing is
+	// persisted or enqueued.
+	if _, err := s.Send(ctxWithTenant(50021), SendInput{StoreID: 0, MemberID: 1, Channel: ChannelSMS, TemplateCode: TplRecall30, ScheduledAt: clock().Add(time.Hour)}); !errors.Is(err, errcode.ErrParam) {
+		t.Fatalf("scheduled StoreID=0 must be ErrParam, got %v", err)
+	}
+	if prod.calls != 0 {
+		t.Errorf("StoreID=0 must not enqueue, producer calls = %d", prod.calls)
+	}
+	if tasks, _ := repo.ListTasks(ctxWithTenant(50021), 50021, 0, ""); len(tasks) != 0 {
+		t.Errorf("StoreID=0 must not persist any row, got %d", len(tasks))
 	}
 }
 
@@ -523,14 +594,14 @@ func TestUnsubscribe_ResubscribeCycle(t *testing.T) {
 	s := fullSvc(repo, snd, freq, cf)
 
 	// Baseline: send succeeds.
-	if _, err := s.Send(ctxWithTenant(50021), SendInput{MemberID: 300, Channel: ChannelWeworkOneV, TemplateCode: TplRecall30}); err != nil {
+	if _, err := s.Send(ctxWithTenant(50021), SendInput{StoreID: 7, MemberID: 300, Channel: ChannelWeworkOneV, TemplateCode: TplRecall30}); err != nil {
 		t.Fatalf("send1: %v", err)
 	}
 	// Opt out → next send blocked(unsubscribed).
 	if _, err := s.Unsubscribe(ctxWithTenant(50021), 300, ChannelWeworkOneV, "太吵了"); err != nil {
 		t.Fatalf("unsub: %v", err)
 	}
-	task, err := s.Send(ctxWithTenant(50021), SendInput{MemberID: 300, Channel: ChannelWeworkOneV, TemplateCode: TplRecall30})
+	task, err := s.Send(ctxWithTenant(50021), SendInput{StoreID: 7, MemberID: 300, Channel: ChannelWeworkOneV, TemplateCode: TplRecall30})
 	if err != nil {
 		t.Fatalf("send2 err: %v", err)
 	}
@@ -541,7 +612,7 @@ func TestUnsubscribe_ResubscribeCycle(t *testing.T) {
 	if err := s.Resubscribe(ctxWithTenant(50021), 300, ChannelWeworkOneV); err != nil {
 		t.Fatalf("resubscribe: %v", err)
 	}
-	task3, err := s.Send(ctxWithTenant(50021), SendInput{MemberID: 300, Channel: ChannelWeworkOneV, TemplateCode: TplRecall30})
+	task3, err := s.Send(ctxWithTenant(50021), SendInput{StoreID: 7, MemberID: 300, Channel: ChannelWeworkOneV, TemplateCode: TplRecall30})
 	if err != nil {
 		t.Fatalf("send3 err: %v", err)
 	}
@@ -582,7 +653,7 @@ func TestCrossTenant_TaskInvisible(t *testing.T) {
 	snd := &fakeSender{}
 	s := New(repo, WithSender(snd), WithFreqGate(&fakeFreq{allowed: true}), WithContentFilter(&fakeCF{passed: true}), WithNowFunc(clock))
 
-	task, err := s.Send(ctxWithTenant(50021), SendInput{MemberID: 1, Channel: ChannelSMS, TemplateCode: TplRecall30})
+	task, err := s.Send(ctxWithTenant(50021), SendInput{StoreID: 7, MemberID: 1, Channel: ChannelSMS, TemplateCode: TplRecall30})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

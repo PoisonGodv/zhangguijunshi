@@ -26,6 +26,7 @@ package reach
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/zhangguijunshi/backend/pkg/wxsdk"
@@ -41,8 +42,15 @@ const (
 // wxsdk.TokenCache adapter wired at the composition root (the adapter closes
 // over the tenant's AppID/Secret so reach never sees credentials). An error
 // means no token could be obtained — Send surfaces it and the task fails.
+//
+// Invalidate drops the cached token so the next GetAccessToken refetches.
+// WxSender calls it after the send API returns a token-invalid errcode
+// (40001/40014/42001/41001) and then retries the send exactly once with a fresh
+// token — otherwise a token that WeChat invalidated early (e.g. another process
+// rotated it) would fail every send for up to the ~115min cache lifetime.
 type TokenSource interface {
 	GetAccessToken(ctx context.Context) (string, error)
+	Invalidate(ctx context.Context)
 }
 
 // MemberResolver resolves a member's WeChat openid for delivery. Satisfied by a
@@ -98,9 +106,12 @@ func NewWxSender(client *wxsdk.Client, tokens TokenSource, members MemberResolve
 //
 // Pipeline: channel gate → resolve openid (empty ⇒ error) → map TemplateCode to
 // a WeChat template_id (missing ⇒ error) → build the data map (title→thing1,
-// body→thing2) → fetch access_token → POST the message. Every failure is
-// wrapped with %w so callers can errors.As into *wxsdk.APIError for the
-// WeChat-side errcode.
+// body→thing2) → fetch access_token → POST the message. If the send fails with a
+// token-invalid errcode (40001/40014/42001/41001), the cached token is
+// invalidated, a fresh one is fetched, and the send is retried EXACTLY ONCE (the
+// single retry guards against an infinite loop); a second failure is returned.
+// Every failure is wrapped with %w so callers can errors.As into *wxsdk.APIError
+// for the WeChat-side errcode.
 func (s *WxSender) Send(ctx context.Context, p *SendPayload) error {
 	if p == nil {
 		return fmt.Errorf("reach: wxsender: nil payload")
@@ -122,18 +133,39 @@ func (s *WxSender) Send(ctx context.Context, p *SendPayload) error {
 		return fmt.Errorf("reach: wxsender: no wechat template_id mapped for code %q", p.TemplateCode)
 	}
 
+	in := wxsdk.SubscribeMessageInput{
+		OpenID:     openID,
+		TemplateID: templateID,
+		Page:       s.page,
+		Data:       buildSubscribeData(p.Title, p.Body),
+	}
+
 	token, err := s.tokens.GetAccessToken(ctx)
 	if err != nil {
 		return fmt.Errorf("reach: wxsender: get access_token: %w", err)
 	}
 
-	if err := s.client.SendSubscribeMessage(ctx, token, wxsdk.SubscribeMessageInput{
-		OpenID:     openID,
-		TemplateID: templateID,
-		Page:       s.page,
-		Data:       buildSubscribeData(p.Title, p.Body),
-	}); err != nil {
-		return fmt.Errorf("reach: wxsender: send subscribe message: %w", err)
+	sendErr := s.client.SendSubscribeMessage(ctx, token, in)
+	if sendErr == nil {
+		return nil
+	}
+
+	// Token-invalid (40001/40014/42001/41001): the cached token was invalidated
+	// early (e.g. another instance rotated it). Drop it, refetch, and retry the
+	// send exactly once. Anything else (a genuine send fault) is returned as-is.
+	var apiErr *wxsdk.APIError
+	if !errors.As(sendErr, &apiErr) || !apiErr.IsTokenInvalid() {
+		return fmt.Errorf("reach: wxsender: send subscribe message: %w", sendErr)
+	}
+
+	s.tokens.Invalidate(ctx)
+	token, err = s.tokens.GetAccessToken(ctx)
+	if err != nil {
+		return fmt.Errorf("reach: wxsender: get access_token after invalidate: %w", err)
+	}
+	if err := s.client.SendSubscribeMessage(ctx, token, in); err != nil {
+		// Second attempt failed — surface it (no further retry, to avoid a loop).
+		return fmt.Errorf("reach: wxsender: send subscribe message (after token refresh): %w", err)
 	}
 	return nil
 }
