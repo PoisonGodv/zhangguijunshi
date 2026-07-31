@@ -218,6 +218,80 @@ func TestPGLedgerRepo_ListByTenant(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// Create maps ON CONFLICT DO NOTHING (no returned row → pgx.ErrNoRows) to
+// ErrDuplicateOutTradeNo, closing the check-then-insert race in Prepay.
+func TestPGPaymentRepo_CreateDuplicateOutTradeNo(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGPaymentRepo(mock)
+	mock.ExpectQuery(sqlPaymentCreate).
+		WithArgs(int64(1), int64(10), int64(42), "o1", ProviderWxPay, "", SubjectOrder, int64(100), int64(7), PaymentTypePay, PaymentStatusPending).
+		WillReturnError(pgx.ErrNoRows) // ON CONFLICT DO NOTHING swallowed the insert
+	_, err := repo.Create(context.Background(), &Payment{
+		TenantID: 1, StoreID: 10, SubMerchantID: 42, OutTradeNo: "o1", Provider: ProviderWxPay,
+		Subject: SubjectOrder, RefID: 100, AmountCents: 7, Type: PaymentTypePay, Status: PaymentStatusPending,
+	})
+	require.ErrorIs(t, err, ErrDuplicateOutTradeNo)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// GetByOutTradeNoAnyTenant returns the single owner when out_trade_no is unique.
+func TestPGPaymentRepo_GetByOutTradeNoAnyTenantSingle(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGPaymentRepo(mock)
+	mock.ExpectQuery(sqlPaymentGetByTradeAny).
+		WithArgs("o1").
+		WillReturnRows(pgxmock.NewRows(paymentColumns()).AddRow(
+			int64(5), int64(7), int64(10), int64(42), "o1", ProviderWxPay, "", SubjectOrder,
+			int64(100), int64(7), "pay", "pending", nil, fixedTime, fixedTime,
+		))
+	got, err := repo.GetByOutTradeNoAnyTenant(context.Background(), "o1")
+	require.NoError(t, err)
+	require.Equal(t, int64(7), got.TenantID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// GetByOutTradeNoAnyTenant fails closed with ErrAmbiguousOutTradeNo when two
+// tenants hold the same out_trade_no (the global-uniqueness invariant broken).
+func TestPGPaymentRepo_GetByOutTradeNoAnyTenantAmbiguous(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGPaymentRepo(mock)
+	mock.ExpectQuery(sqlPaymentGetByTradeAny).
+		WithArgs("dup").
+		WillReturnRows(pgxmock.NewRows(paymentColumns()).
+			AddRow(int64(5), int64(1), int64(10), int64(42), "dup", ProviderWxPay, "", SubjectOrder, int64(100), int64(7), "pay", "pending", nil, fixedTime, fixedTime).
+			AddRow(int64(6), int64(2), int64(20), int64(43), "dup", ProviderWxPay, "", SubjectOrder, int64(100), int64(8), "pay", "pending", nil, fixedTime, fixedTime))
+	_, err := repo.GetByOutTradeNoAnyTenant(context.Background(), "dup")
+	require.ErrorIs(t, err, ErrAmbiguousOutTradeNo)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// MarkFailed flips pending→failed and reports changed via RowsAffected.
+func TestPGPaymentRepo_MarkFailedChanged(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGPaymentRepo(mock)
+	mock.ExpectExec(sqlPaymentMarkFailed).
+		WithArgs(int64(1), int64(5)).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	changed, err := repo.MarkFailed(context.Background(), 1, 5)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// MarkFailed is a no-op (changed=false) when the row is not pending — a late
+// failed callback must never revert an already-succeeded payment.
+func TestPGPaymentRepo_MarkFailedNoOpWhenNotPending(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGPaymentRepo(mock)
+	mock.ExpectExec(sqlPaymentMarkFailed).
+		WithArgs(int64(1), int64(5)).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0)) // WHERE status='pending' matched nothing
+	changed, err := repo.MarkFailed(context.Background(), 1, 5)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPGRepo_NilPoolIsSafe(t *testing.T) {
 	// Nil pools degrade to ErrNotFound / empty rather than panicking.
 	smRepo := NewPGSubMerchantRepo(nil)

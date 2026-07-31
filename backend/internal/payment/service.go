@@ -232,9 +232,16 @@ func (s *Service) Prepay(ctx context.Context, in PrepayInput) (*Payment, *Prepay
 	if outTradeNo == "" {
 		outTradeNo = s.outTradeNo(tenantID, s.now())
 	}
-	// out_trade_no UNIQUE per tenant.
-	if existing, err := s.payRepo.GetByOutTradeNo(ctx, tenantID, outTradeNo); err == nil {
-		_ = existing
+	// out_trade_no is globally unique across all tenants (migration 000020):
+	// the unauthenticated notify callback resolves the owning tenant from
+	// out_trade_no alone, so a collision anywhere would make that resolution
+	// ambiguous. Reject a hit in ANY tenant (and fail closed on ambiguity). The
+	// authoritative guard is still the repo Create (ON CONFLICT / in-lock check)
+	// which closes the check-then-insert race; this pre-check gives a clean
+	// early error on the common serial-duplicate path.
+	if _, err := s.payRepo.GetByOutTradeNoAnyTenant(ctx, outTradeNo); err == nil {
+		return nil, nil, ErrDuplicateOutTradeNo
+	} else if errors.Is(err, ErrAmbiguousOutTradeNo) {
 		return nil, nil, ErrDuplicateOutTradeNo
 	} else if !errors.Is(err, ErrNotFound) {
 		return nil, nil, err
@@ -287,6 +294,9 @@ func (s *Service) GetPayment(ctx context.Context, id int64) (*Payment, error) {
 //  1. ParseNotify verifies/decodes (failure → return err, DB untouched).
 //  2. Resolve tenant + find the payment by out_trade_no (cross-tenant →
 //     ErrNotFound; ledger untouched).
+//     2b. On a success notify, verify res.AmountCents == p.AmountCents; a mismatch
+//     writes an audit ledger row (status="amount_mismatch") and returns
+//     ErrAmountMismatch WITHOUT marking success or fulfilling (短付防护).
 //  3. ledgerRepo.Append writes the audit row — UNIQUE(tenant,provider,tx_id)
 //     dedupes so a repeat callback yields one row.
 //  4. MarkSuccess performs the pending→success transition and reports changed.
@@ -294,7 +304,8 @@ func (s *Service) GetPayment(ctx context.Context, id int64) (*Payment, error) {
 //     Fulfilment failure is best-effort (logged, swallowed) — the payment is
 //     already success and must not roll back.
 //
-// Returns the final payment.
+// A failed notify uses the guarded MarkFailed (pending→failed only) so it can
+// never revert an already-succeeded payment. Returns the final payment.
 func (s *Service) HandleNotify(ctx context.Context, headers map[string]string, body []byte) (*Payment, error) {
 	if s.parser == nil {
 		return nil, errors.New("payment: notify parser not configured")
@@ -312,6 +323,34 @@ func (s *Service) HandleNotify(ctx context.Context, headers map[string]string, b
 	p, err := s.payRepo.GetByOutTradeNo(ctx, tenantID, res.OutTradeNo)
 	if err != nil {
 		return nil, err
+	}
+	// 2b. 实付金额校验 (短付/改价防护): a success notify whose amount differs
+	// from the payment's recorded AmountCents must NOT mark success nor fulfil.
+	// Write an audit ledger row (status="amount_mismatch", idempotent by
+	// provider_tx_id) so the discrepancy is recorded for manual reconciliation,
+	// then fail closed with ErrAmountMismatch.
+	if res.Status == PaymentStatusSuccess && res.AmountCents != p.AmountCents {
+		audit := &PaymentLedger{
+			TenantID:      tenantID,
+			StoreID:       p.StoreID,
+			SubMerchantID: p.SubMerchantID,
+			Provider:      p.Provider,
+			ProviderTxID:  res.ProviderTxID,
+			AmountCents:   res.AmountCents,
+			FeeCents:      0,
+			Type:          p.Type,
+			Status:        "amount_mismatch",
+			RawPayload:    res.RawPayload,
+			CreatedAt:     s.now(),
+		}
+		if !res.PaidAt.IsZero() {
+			paidAt := res.PaidAt
+			audit.PaidAt = &paidAt
+		}
+		if _, err := s.ledgerRepo.Append(ctx, audit); err != nil {
+			return nil, err
+		}
+		return nil, ErrAmountMismatch
 	}
 	// 3. ledger audit (idempotent by provider_tx_id).
 	ledgerStatus := "success"
@@ -354,8 +393,11 @@ func (s *Service) HandleNotify(ctx context.Context, headers map[string]string, b
 		}
 		return p, nil
 	}
-	// failed notify: best-effort pending→failed; do not fulfil.
-	_ = s.payRepo.UpdateStatus(ctx, tenantID, p.ID, PaymentStatusFailed)
+	// failed notify: guarded pending→failed only — a late failed callback must
+	// never revert an already-succeeded payment, so use MarkFailed (conditional
+	// on status='pending') rather than an unconditional UpdateStatus. Do not
+	// fulfil.
+	_, _ = s.payRepo.MarkFailed(ctx, tenantID, p.ID)
 	cur, err := s.payRepo.GetByID(ctx, tenantID, p.ID)
 	if err != nil {
 		return nil, err
@@ -376,19 +418,25 @@ func (s *Service) ListLedger(ctx context.Context, limit int) ([]*PaymentLedger, 
 // ResolveTenantByNotifyBody recovers the owning tenant from a raw WeChat notify
 // body. The notify callback is unauthenticated (CONTRACT §15.7) so the request
 // context carries no tenant; the tenant is resolved from the payment matched by
-// out_trade_no (unique per tenant). The HTTP handler calls this, injects the
-// tenant via multitenancy.WithContext, then calls HandleNotify — which then
-// enforces tenant as usual. ErrNotFound when no payment matches the out_trade_no.
-func (s *Service) ResolveTenantByNotifyBody(ctx context.Context, body []byte) (int64, error) {
+// out_trade_no (globally unique, migration 000020). headers carries the four
+// Wechatpay-* HTTP headers so the real V3 parser can verify the signature
+// (FakeWxPay ignores them); passing them here keeps the verify step identical
+// to HandleNotify's. The HTTP handler calls this, injects the tenant via
+// multitenancy.WithContext, then calls HandleNotify — which then enforces
+// tenant as usual. ErrNotFound when no payment matches the out_trade_no;
+// ErrAmbiguousOutTradeNo (fail-closed) when more than one tenant matches.
+func (s *Service) ResolveTenantByNotifyBody(ctx context.Context, headers map[string]string, body []byte) (int64, error) {
 	if s.parser == nil {
 		return 0, errors.New("payment: notify parser not configured")
 	}
-	res, err := s.parser.ParseNotify(ctx, nil, body)
+	res, err := s.parser.ParseNotify(ctx, headers, body)
 	if err != nil {
 		return 0, err
 	}
 	p, err := s.payRepo.GetByOutTradeNoAnyTenant(ctx, res.OutTradeNo)
 	if err != nil {
+		// ErrAmbiguousOutTradeNo propagates as-is: tenant resolution must fail
+		// closed rather than guess when out_trade_no is not globally unique.
 		return 0, err
 	}
 	return p.TenantID, nil

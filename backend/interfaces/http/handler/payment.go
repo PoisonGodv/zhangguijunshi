@@ -7,6 +7,7 @@ package handler
 // the notify route recovers the tenant from the out_trade_no (it has no auth).
 
 import (
+	"errors"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -135,10 +136,10 @@ func (h *PaymentHandler) Prepay(c *gin.Context) {
 		Description: req.Description,
 	})
 	if err != nil {
-		switch err {
-		case payment.ErrSubMerchantNotActive:
+		switch {
+		case errors.Is(err, payment.ErrSubMerchantNotActive):
 			httpx.Fail(c, errcode.ErrSubMerchantNotActive)
-		case payment.ErrDuplicateOutTradeNo:
+		case errors.Is(err, payment.ErrDuplicateOutTradeNo):
 			httpx.Fail(c, errcode.ErrPaymentDuplicate)
 		default:
 			httpx.FailError(c, err)
@@ -180,19 +181,37 @@ func (h *PaymentHandler) ListLedger(c *gin.Context) {
 	httpx.OK(c, rows)
 }
 
+// notifyHeaders extracts the four WeChat Pay V3 signature headers from the
+// callback request into the map[string]string shape NotifyParser.ParseNotify
+// expects. Without these the real V3 parser cannot verify the signature and
+// every production notify would fail closed (ErrSignInvalid); headerGet matches
+// case-insensitively so the canonical capitalisation used here is safe.
+func notifyHeaders(c *gin.Context) map[string]string {
+	h := c.Request.Header
+	return map[string]string{
+		"Wechatpay-Timestamp": h.Get("Wechatpay-Timestamp"),
+		"Wechatpay-Nonce":     h.Get("Wechatpay-Nonce"),
+		"Wechatpay-Serial":    h.Get("Wechatpay-Serial"),
+		"Wechatpay-Signature": h.Get("Wechatpay-Signature"),
+	}
+}
+
 // Notify is the unauthenticated WeChat-pay callback entry (CONTRACT §15.7).
 // POST /v1/wxshop/payment/notify — no auth/tenant middleware. The tenant is
 // recovered from the out_trade_no in the body, injected into ctx, then
-// HandleNotify runs the idempotent pending→success + fulfil pipeline. Replies
-// with WeChat's required {code,message} JSON; FAIL tells WeChat to retry.
+// HandleNotify runs the idempotent pending→success + fulfil pipeline. The four
+// Wechatpay-* HTTP headers are threaded through both ResolveTenantByNotifyBody
+// and HandleNotify so the real V3 parser can verify the signature. Replies with
+// WeChat's required {code,message} JSON; FAIL tells WeChat to retry.
 func (h *PaymentHandler) Notify(c *gin.Context) {
 	body, err := c.GetRawData()
 	if err != nil {
 		c.JSON(200, gin.H{"code": "FAIL", "message": "read body fail"})
 		return
 	}
+	headers := notifyHeaders(c)
 	ctx := c.Request.Context()
-	tenantID, err := h.svc.ResolveTenantByNotifyBody(ctx, body)
+	tenantID, err := h.svc.ResolveTenantByNotifyBody(ctx, headers, body)
 	if err != nil {
 		c.JSON(200, gin.H{"code": "FAIL", "message": "resolve tenant fail"})
 		return
@@ -201,7 +220,7 @@ func (h *PaymentHandler) Notify(c *gin.Context) {
 		TenantID: tenantID,
 		Source:   multitenancy.SourceSystem,
 	})
-	if _, err := h.svc.HandleNotify(tctx, nil, body); err != nil {
+	if _, err := h.svc.HandleNotify(tctx, headers, body); err != nil {
 		c.JSON(200, gin.H{"code": "FAIL", "message": "handle fail"})
 		return
 	}

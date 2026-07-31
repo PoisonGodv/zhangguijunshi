@@ -305,3 +305,173 @@ type failingFulfiller struct{}
 func (failingFulfiller) Fulfill(context.Context, *Payment) error {
 	return errors.New("downstream fulfilment broken")
 }
+
+// ===== Regression tests for the 5 confirmed payment bugs =====
+
+// Bug #2: a success notify whose amount differs from the payment's recorded
+// AmountCents must be rejected (短付防护) — no MarkSuccess, no fulfil, but an
+// audit ledger row with status="amount_mismatch" is written.
+func TestService_HandleNotify_AmountMismatchBlocked(t *testing.T) {
+	ff := &countingFulfiller{}
+	svc, _, pay, _ := newSvc(t, WithFulfiller(ff))
+	ctx := tenantCtx(1, 10)
+	activateSubMerchant(t, svc, ctx, 10)
+	p, _, err := svc.Prepay(ctx, PrepayInput{StoreID: 10, Subject: SubjectOrder, RefID: 77, AmountCents: 9900, OutTradeNo: "o1"})
+	require.NoError(t, err)
+
+	// Notify claims only 100 cents against a 9900-cent order → short-pay.
+	_, err = svc.HandleNotify(ctx, nil, fakeBody("o1", "wx-tx-short", 100, true))
+	require.ErrorIs(t, err, ErrAmountMismatch)
+
+	// Payment must remain pending (NOT marked success) and NOT fulfilled.
+	got, _ := pay.GetByID(ctx, 1, p.ID)
+	require.Equal(t, PaymentStatusPending, got.Status, "short-pay must not mark success")
+	require.Empty(t, got.ProviderTxID, "short-pay must not record the provider tx")
+	require.Equal(t, 0, ff.count(), "short-pay must not fulfil")
+
+	// Exactly one audit row, flagged amount_mismatch, carrying the paid amount.
+	rows, _ := svc.ListLedger(ctx, 0)
+	require.Len(t, rows, 1)
+	require.Equal(t, "amount_mismatch", rows[0].Status)
+	require.Equal(t, int64(100), rows[0].AmountCents)
+}
+
+// Bug #3: a late failed callback must NOT revert an already-succeeded payment
+// (MarkFailed is guarded on status='pending').
+func TestService_HandleNotify_FailedAfterSuccessDoesNotRevert(t *testing.T) {
+	svc, _, pay, _ := newSvc(t)
+	ctx := tenantCtx(1, 10)
+	activateSubMerchant(t, svc, ctx, 10)
+	p, _, err := svc.Prepay(ctx, PrepayInput{StoreID: 10, Subject: SubjectOrder, RefID: 1, AmountCents: 100, OutTradeNo: "o1"})
+	require.NoError(t, err)
+
+	// First: a genuine success notify.
+	p1, err := svc.HandleNotify(ctx, nil, fakeBody("o1", "wx-tx-ok", 100, true))
+	require.NoError(t, err)
+	require.Equal(t, PaymentStatusSuccess, p1.Status)
+
+	// Then: a late failed notify for the same order (different tx id). It must
+	// NOT flip the payment back to failed.
+	p2, err := svc.HandleNotify(ctx, nil, fakeBody("o1", "wx-tx-late-fail", 100, false))
+	require.NoError(t, err)
+	require.Equal(t, PaymentStatusSuccess, p2.Status, "failed callback must not revert success")
+
+	got, _ := pay.GetByID(ctx, 1, p.ID)
+	require.Equal(t, PaymentStatusSuccess, got.Status)
+}
+
+// Bug #5: concurrent Prepay with the same out_trade_no must admit exactly one
+// (the repo Create is the authoritative guard; the pre-check alone is racy).
+func TestService_Prepay_ConcurrentSameOutTradeNo(t *testing.T) {
+	svc, _, _, _ := newSvc(t)
+	ctx := tenantCtx(1, 10)
+	activateSubMerchant(t, svc, ctx, 10)
+
+	const workers = 8
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var okCount, dupCount int
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, err := svc.Prepay(ctx, PrepayInput{StoreID: 10, Subject: SubjectOrder, RefID: 1, AmountCents: 100, OutTradeNo: "race"})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				okCount++
+			case errors.Is(err, ErrDuplicateOutTradeNo):
+				dupCount++
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, 1, okCount, "exactly one concurrent Prepay may win")
+	require.Equal(t, workers-1, dupCount, "all losers must see ErrDuplicateOutTradeNo")
+}
+
+// Bug #4: out_trade_no is globally unique — a second tenant reusing another
+// tenant's out_trade_no is rejected at Prepay.
+func TestService_Prepay_CrossTenantDuplicateOutTradeNo(t *testing.T) {
+	svc, _, _, _ := newSvc(t)
+	ctx1 := tenantCtx(1, 10)
+	activateSubMerchant(t, svc, ctx1, 10)
+	_, _, err := svc.Prepay(ctx1, PrepayInput{StoreID: 10, Subject: SubjectOrder, RefID: 1, AmountCents: 100, OutTradeNo: "shared"})
+	require.NoError(t, err)
+
+	ctx2 := tenantCtx(2, 20)
+	activateSubMerchant(t, svc, ctx2, 20)
+	_, _, err = svc.Prepay(ctx2, PrepayInput{StoreID: 20, Subject: SubjectOrder, RefID: 2, AmountCents: 100, OutTradeNo: "shared"})
+	require.ErrorIs(t, err, ErrDuplicateOutTradeNo, "out_trade_no must be globally unique across tenants")
+}
+
+// Bug #4: when the global-uniqueness invariant is broken (two tenants hold the
+// same out_trade_no), tenant resolution for the unauthenticated notify must
+// fail closed with ErrAmbiguousOutTradeNo rather than guess.
+func TestService_ResolveTenantByNotifyBody_AmbiguousFailsClosed(t *testing.T) {
+	svc, _, pay, _ := newSvc(t)
+	// Manufacture the cross-tenant collision that production's UNIQUE forbids.
+	pay.forceInsertRow(&Payment{TenantID: 1, StoreID: 10, OutTradeNo: "dup", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending, Provider: ProviderWxPay, Type: PaymentTypePay})
+	pay.forceInsertRow(&Payment{TenantID: 2, StoreID: 20, OutTradeNo: "dup", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending, Provider: ProviderWxPay, Type: PaymentTypePay})
+
+	_, err := svc.ResolveTenantByNotifyBody(context.Background(), nil, fakeBody("dup", "wx-tx-1", 100, true))
+	require.ErrorIs(t, err, ErrAmbiguousOutTradeNo, "ambiguous out_trade_no must fail closed")
+}
+
+// Bug #4 (happy path): a globally-unique out_trade_no resolves to exactly its
+// owning tenant.
+func TestService_ResolveTenantByNotifyBody_ResolvesOwner(t *testing.T) {
+	svc, _, _, _ := newSvc(t)
+	ctx1 := tenantCtx(1, 10)
+	activateSubMerchant(t, svc, ctx1, 10)
+	_, _, err := svc.Prepay(ctx1, PrepayInput{StoreID: 10, Subject: SubjectOrder, RefID: 1, AmountCents: 100, OutTradeNo: "o1"})
+	require.NoError(t, err)
+
+	tid, err := svc.ResolveTenantByNotifyBody(context.Background(), nil, fakeBody("o1", "wx-tx-1", 100, true))
+	require.NoError(t, err)
+	require.Equal(t, int64(1), tid)
+}
+
+// Bug #1: the headers map is threaded into the parser. A header-recording
+// parser proves HandleNotify / ResolveTenantByNotifyBody forward the headers
+// they are given (the production V3 parser needs them to verify the signature).
+type headerRecordingParser struct {
+	mu      sync.Mutex
+	lastHdr map[string]string
+	inner   NotifyParser
+}
+
+func (p *headerRecordingParser) ParseNotify(ctx context.Context, headers map[string]string, body []byte) (NotifyResult, error) {
+	p.mu.Lock()
+	p.lastHdr = headers
+	p.mu.Unlock()
+	return p.inner.ParseNotify(ctx, headers, body)
+}
+
+func (p *headerRecordingParser) seen() map[string]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastHdr
+}
+
+func TestService_NotifyForwardsHeadersToParser(t *testing.T) {
+	rec := &headerRecordingParser{inner: NewFakeWxPay()}
+	svc, _, _, _ := newSvc(t, WithNotifyParser(rec))
+	ctx := tenantCtx(1, 10)
+	activateSubMerchant(t, svc, ctx, 10)
+	_, _, err := svc.Prepay(ctx, PrepayInput{StoreID: 10, Subject: SubjectOrder, RefID: 1, AmountCents: 100, OutTradeNo: "o1"})
+	require.NoError(t, err)
+
+	hdr := map[string]string{
+		"Wechatpay-Timestamp": "1700000000",
+		"Wechatpay-Nonce":     "n",
+		"Wechatpay-Serial":    "s",
+		"Wechatpay-Signature": "sig",
+	}
+	_, err = svc.HandleNotify(ctx, hdr, fakeBody("o1", "wx-tx-1", 100, true))
+	require.NoError(t, err)
+	require.Equal(t, hdr, rec.seen(), "HandleNotify must forward the Wechatpay-* headers to the parser")
+}

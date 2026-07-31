@@ -18,8 +18,11 @@ var (
 	// HandleNotify leaves the DB untouched in this case.
 	ErrSignInvalid = errors.New("payment: notify signature invalid")
 
-	// ErrDuplicateOutTradeNo is returned by Prepay when out_trade_no already
-	// exists for the tenant (UNIQUE(tenant_id, out_trade_no)).
+	// ErrDuplicateOutTradeNo is returned by Prepay / PaymentRepo.Create when
+	// out_trade_no already exists. out_trade_no is globally unique across all
+	// tenants (migration 000020) because the unauthenticated notify callback
+	// resolves the owning tenant from out_trade_no alone; a collision would make
+	// that resolution ambiguous.
 	ErrDuplicateOutTradeNo = errors.New("payment: duplicate out_trade_no")
 
 	// ErrSubMerchantNotActive is returned by Prepay when the store has no
@@ -31,4 +34,17 @@ var (
 	// a state that can transition to success (e.g. refunded→success is an
 	// illegal reverse transition).
 	ErrStatusConflict = errors.New("payment: status conflict")
+
+	// ErrAmountMismatch is returned by HandleNotify when a success notify
+	// reports an amount that differs from the payment's recorded AmountCents.
+	// The payment is NOT marked success and NOT fulfilled; an audit ledger row
+	// with status="amount_mismatch" is written first so the discrepancy is
+	// recorded for manual reconciliation (短付/改价攻击防护).
+	ErrAmountMismatch = errors.New("payment: notify amount mismatch")
+
+	// ErrAmbiguousOutTradeNo is returned by GetByOutTradeNoAnyTenant when more
+	// than one tenant owns the same out_trade_no. out_trade_no is globally
+	// unique (migration 000020); a multi-hit means the uniqueness invariant is
+	// broken and tenant resolution must fail closed rather than guess.
+	ErrAmbiguousOutTradeNo = errors.New("payment: ambiguous out_trade_no across tenants")
 )

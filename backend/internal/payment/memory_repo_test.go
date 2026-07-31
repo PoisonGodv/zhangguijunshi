@@ -185,3 +185,93 @@ func TestMemoryRepo_OnlySentinelErrors(t *testing.T) {
 		t.Fatal("ErrNotFound identity broken")
 	}
 }
+
+// Create refuses a duplicate out_trade_no within the same tenant (mirrors the
+// PG ON CONFLICT guard) instead of silently overwriting the index entry.
+func TestMemoryPaymentRepo_CreateDuplicateOutTradeNo(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemoryPaymentRepo()
+	_, err := repo.Create(ctx, &Payment{TenantID: 1, StoreID: 10, OutTradeNo: "o1", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending})
+	require.NoError(t, err)
+	_, err = repo.Create(ctx, &Payment{TenantID: 1, StoreID: 10, OutTradeNo: "o1", Subject: SubjectOrder, AmountCents: 200, Status: PaymentStatusPending})
+	require.ErrorIs(t, err, ErrDuplicateOutTradeNo)
+}
+
+// Create enforces out_trade_no GLOBALLY (across tenants), matching migration
+// 000020's UNIQUE(out_trade_no): the notify path resolves tenant by out_trade_no
+// alone, so a cross-tenant collision must be refused at insert.
+func TestMemoryPaymentRepo_CreateCrossTenantDuplicateOutTradeNo(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemoryPaymentRepo()
+	_, err := repo.Create(ctx, &Payment{TenantID: 1, StoreID: 10, OutTradeNo: "shared", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending})
+	require.NoError(t, err)
+	_, err = repo.Create(ctx, &Payment{TenantID: 2, StoreID: 20, OutTradeNo: "shared", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending})
+	require.ErrorIs(t, err, ErrDuplicateOutTradeNo)
+}
+
+// GetByOutTradeNoAnyTenant fails closed with ErrAmbiguousOutTradeNo when the
+// global-uniqueness invariant is broken (two tenants hold the same out_trade_no).
+func TestMemoryPaymentRepo_GetByOutTradeNoAnyTenantAmbiguous(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemoryPaymentRepo()
+	repo.forceInsertRow(&Payment{TenantID: 1, StoreID: 10, OutTradeNo: "dup", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending})
+	repo.forceInsertRow(&Payment{TenantID: 2, StoreID: 20, OutTradeNo: "dup", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending})
+	_, err := repo.GetByOutTradeNoAnyTenant(ctx, "dup")
+	require.ErrorIs(t, err, ErrAmbiguousOutTradeNo)
+}
+
+// GetByOutTradeNoAnyTenant returns the single owner when out_trade_no is unique,
+// and ErrNotFound when absent.
+func TestMemoryPaymentRepo_GetByOutTradeNoAnyTenant(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemoryPaymentRepo()
+	created, _ := repo.Create(ctx, &Payment{TenantID: 7, StoreID: 10, OutTradeNo: "o1", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending})
+	got, err := repo.GetByOutTradeNoAnyTenant(ctx, "o1")
+	require.NoError(t, err)
+	require.Equal(t, created.ID, got.ID)
+	require.Equal(t, int64(7), got.TenantID)
+	_, err = repo.GetByOutTradeNoAnyTenant(ctx, "missing")
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// MarkFailed flips only pending→failed; a succeeded payment is left untouched
+// (a late failed callback must never revert success), and an absent/cross-tenant
+// id is a no-op (changed=false, nil error) mirroring the PG conditional UPDATE.
+func TestMemoryPaymentRepo_MarkFailed(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemoryPaymentRepo()
+	p, _ := repo.Create(ctx, &Payment{TenantID: 1, StoreID: 10, OutTradeNo: "o1", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending})
+
+	changed, err := repo.MarkFailed(ctx, 1, p.ID)
+	require.NoError(t, err)
+	require.True(t, changed)
+	got, _ := repo.GetByID(ctx, 1, p.ID)
+	require.Equal(t, PaymentStatusFailed, got.Status)
+
+	// Already-failed → no-op.
+	changed, err = repo.MarkFailed(ctx, 1, p.ID)
+	require.NoError(t, err)
+	require.False(t, changed)
+}
+
+func TestMemoryPaymentRepo_MarkFailedDoesNotRevertSuccess(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemoryPaymentRepo()
+	p, _ := repo.Create(ctx, &Payment{TenantID: 1, StoreID: 10, OutTradeNo: "o1", Subject: SubjectOrder, AmountCents: 100, Status: PaymentStatusPending})
+	_, _, err := repo.MarkSuccess(ctx, 1, p.ID, "wx-tx-1", fixedTime)
+	require.NoError(t, err)
+
+	changed, err := repo.MarkFailed(ctx, 1, p.ID)
+	require.NoError(t, err)
+	require.False(t, changed, "success must not revert to failed")
+	got, _ := repo.GetByID(ctx, 1, p.ID)
+	require.Equal(t, PaymentStatusSuccess, got.Status)
+}
+
+func TestMemoryPaymentRepo_MarkFailedAbsentNoOp(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemoryPaymentRepo()
+	changed, err := repo.MarkFailed(ctx, 1, 9999)
+	require.NoError(t, err)
+	require.False(t, changed)
+}

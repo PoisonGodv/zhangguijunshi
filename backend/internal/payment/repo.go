@@ -43,6 +43,17 @@ type PaymentRepo interface {
 	//   - other   → return (nil, false, ErrStatusConflict)
 	// Cross-tenant (or absent) → (nil, false, ErrNotFound).
 	MarkSuccess(ctx context.Context, tenantID, id int64, providerTxID string, paidAt time.Time) (p *Payment, changed bool, err error)
+	// MarkFailed is the guarded pending→failed transition used by the failed
+	// notify path. It flips status ONLY when the payment is still pending:
+	//   - pending → failed: return (true, nil)
+	//   - any other state (success/failed/refunded), or absent/cross-tenant:
+	//     no-op, return (false, nil)
+	// so a late failed callback can never revert an already-succeeded payment.
+	// Absent and not-pending are intentionally indistinguishable (PG implements
+	// this as a single conditional UPDATE whose RowsAffected is 0 in both cases;
+	// the Memory impl mirrors that). The caller has already tenant-scoped the
+	// read via GetByOutTradeNo before invoking MarkFailed.
+	MarkFailed(ctx context.Context, tenantID, id int64) (changed bool, err error)
 	UpdateStatus(ctx context.Context, tenantID, id int64, status PaymentStatus) error
 }
 

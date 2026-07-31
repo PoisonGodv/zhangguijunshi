@@ -66,16 +66,22 @@ ORDER BY id`
 	sqlSubMerchantUpdateStatus = `UPDATE sub_merchants SET status = $1, sub_mch_id = COALESCE(NULLIF($2, ''), sub_mch_id), approved_at = $3, updated_at = now() WHERE tenant_id = $4 AND id = $5`
 )
 
-// SQL for payments (migration 000012). MarkSuccess is a two-step
+// SQL for payments (migration 000012 + 000020). MarkSuccess is a two-step
 // read-then-conditional-update so the changed flag and ErrStatusConflict are
-// accurate.
+// accurate. Create is INSERT ... ON CONFLICT (tenant_id, out_trade_no) DO
+// NOTHING RETURNING id so a concurrent duplicate loses the race with
+// pgx.ErrNoRows (→ ErrDuplicateOutTradeNo) instead of a check-then-insert
+// window. GetByTradeAny reads up to two rows so the caller can detect a
+// cross-tenant out_trade_no collision and fail closed (migration 000020 makes
+// out_trade_no globally unique; >1 hit means the invariant is broken).
 const (
-	sqlPaymentCreate        = `INSERT INTO payments (tenant_id, store_id, sub_merchant_id, out_trade_no, provider, provider_tx_id, subject, ref_id, amount_cents, type, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`
+	sqlPaymentCreate        = `INSERT INTO payments (tenant_id, store_id, sub_merchant_id, out_trade_no, provider, provider_tx_id, subject, ref_id, amount_cents, type, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (tenant_id, out_trade_no) DO NOTHING RETURNING id`
 	sqlPaymentGetByID       = `SELECT id, tenant_id, store_id, sub_merchant_id, out_trade_no, provider, provider_tx_id, subject, ref_id, amount_cents, type, status, paid_at, created_at, updated_at FROM payments WHERE tenant_id = $1 AND id = $2`
 	sqlPaymentGetByTrade    = `SELECT id, tenant_id, store_id, sub_merchant_id, out_trade_no, provider, provider_tx_id, subject, ref_id, amount_cents, type, status, paid_at, created_at, updated_at FROM payments WHERE tenant_id = $1 AND out_trade_no = $2`
-	sqlPaymentGetByTradeAny = `SELECT id, tenant_id, store_id, sub_merchant_id, out_trade_no, provider, provider_tx_id, subject, ref_id, amount_cents, type, status, paid_at, created_at, updated_at FROM payments WHERE out_trade_no = $1 LIMIT 1`
+	sqlPaymentGetByTradeAny = `SELECT id, tenant_id, store_id, sub_merchant_id, out_trade_no, provider, provider_tx_id, subject, ref_id, amount_cents, type, status, paid_at, created_at, updated_at FROM payments WHERE out_trade_no = $1 LIMIT 2`
 	sqlPaymentGetForMark    = `SELECT id, tenant_id, store_id, sub_merchant_id, out_trade_no, provider, provider_tx_id, subject, ref_id, amount_cents, type, status, paid_at, created_at, updated_at FROM payments WHERE tenant_id = $1 AND id = $2`
 	sqlPaymentMarkSuccess   = `UPDATE payments SET status = 'success', provider_tx_id = $1, paid_at = $2, updated_at = now() WHERE tenant_id = $3 AND id = $4 AND status = 'pending' RETURNING id, tenant_id, store_id, sub_merchant_id, out_trade_no, provider, provider_tx_id, subject, ref_id, amount_cents, type, status, paid_at, created_at, updated_at`
+	sqlPaymentMarkFailed    = `UPDATE payments SET status = 'failed', updated_at = now() WHERE tenant_id = $1 AND id = $2 AND status = 'pending'`
 	sqlPaymentUpdateStat    = `UPDATE payments SET status = $1, updated_at = now() WHERE tenant_id = $2 AND id = $3`
 )
 
@@ -288,7 +294,10 @@ type PGPaymentRepo struct{ pool PGPool }
 // NewPGPaymentRepo constructs a PGPaymentRepo over pool.
 func NewPGPaymentRepo(pool PGPool) *PGPaymentRepo { return &PGPaymentRepo{pool: pool} }
 
-// Create inserts p and returns a copy with the allocated id.
+// Create inserts p and returns a copy with the allocated id. The INSERT uses
+// ON CONFLICT (tenant_id, out_trade_no) DO NOTHING RETURNING id: a concurrent
+// duplicate loses the race and yields pgx.ErrNoRows, mapped to
+// ErrDuplicateOutTradeNo (closing the check-then-insert window in Prepay).
 func (r *PGPaymentRepo) Create(ctx context.Context, p *Payment) (*Payment, error) {
 	if r == nil || r.pool == nil || p == nil {
 		return nil, ErrNotFound
@@ -297,6 +306,10 @@ func (r *PGPaymentRepo) Create(ctx context.Context, p *Payment) (*Payment, error
 		p.TenantID, p.StoreID, p.SubMerchantID, p.OutTradeNo, p.Provider, p.ProviderTxID,
 		p.Subject, p.RefID, p.AmountCents, p.Type, p.Status,
 	).Scan(&p.ID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// ON CONFLICT DO NOTHING swallowed the insert → duplicate out_trade_no.
+			return nil, ErrDuplicateOutTradeNo
+		}
 		return nil, fmt.Errorf("payment: pg payment create: %w", err)
 	}
 	return clonePayment(p), nil
@@ -334,21 +347,54 @@ func (r *PGPaymentRepo) GetByOutTradeNo(ctx context.Context, tenantID int64, out
 }
 
 // GetByOutTradeNoAnyTenant loads a payment by out_trade_no across all tenants
-// (notify-callback tenant resolution, CONTRACT §15.7). out_trade_no is globally
-// unique per tenant; the notify path cannot scope by tenant, so this query omits
-// the tenant filter. ErrNotFound when no payment matches.
+// (notify-callback tenant resolution, CONTRACT §15.7). The notify path cannot
+// scope by tenant, so this query omits the tenant filter. out_trade_no is
+// globally unique (migration 000020); the query reads up to two rows so a
+// cross-tenant collision is detected and fails closed with
+// ErrAmbiguousOutTradeNo rather than returning an arbitrary row. ErrNotFound
+// when no payment matches.
 func (r *PGPaymentRepo) GetByOutTradeNoAnyTenant(ctx context.Context, outTradeNo string) (*Payment, error) {
 	if r == nil || r.pool == nil {
 		return nil, ErrNotFound
 	}
-	p, err := scanPayment(r.pool.QueryRow(ctx, sqlPaymentGetByTradeAny, outTradeNo))
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
+	q, ok := r.pool.(queryer)
+	if !ok {
+		// Pool without multi-row Query: degrade to the single-row read (cannot
+		// detect ambiguity, but still resolves the common unique case).
+		p, err := scanPayment(r.pool.QueryRow(ctx, sqlPaymentGetByTradeAny, outTradeNo))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrNotFound
+			}
+			return nil, fmt.Errorf("payment: pg payment get by trade any-tenant: %w", err)
 		}
+		return p, nil
+	}
+	rows, err := q.Query(ctx, sqlPaymentGetByTradeAny, outTradeNo)
+	if err != nil {
 		return nil, fmt.Errorf("payment: pg payment get by trade any-tenant: %w", err)
 	}
-	return p, nil
+	defer rows.Close()
+	var found *Payment
+	for rows.Next() {
+		p, err := scanPayment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("payment: pg payment get by trade any-tenant scan: %w", err)
+		}
+		if found != nil {
+			// Second matching row → out_trade_no is not globally unique; the
+			// tenant cannot be resolved unambiguously. Fail closed.
+			return nil, ErrAmbiguousOutTradeNo
+		}
+		found = p
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("payment: pg payment get by trade any-tenant rows: %w", err)
+	}
+	if found == nil {
+		return nil, ErrNotFound
+	}
+	return found, nil
 }
 
 // MarkSuccess performs the idempotent pending→success transition: read current
@@ -383,6 +429,23 @@ func (r *PGPaymentRepo) MarkSuccess(ctx context.Context, tenantID, id int64, pro
 	default:
 		return nil, false, ErrStatusConflict
 	}
+}
+
+// MarkFailed performs the guarded pending→failed transition used by the failed
+// notify path: a single conditional UPDATE ... WHERE status='pending' flips the
+// state and reports changed via RowsAffected. A payment already in any other
+// state (success/failed/refunded) is left untouched (changed=false) so a late
+// failed callback can never revert an already-succeeded payment. Absent /
+// cross-tenant → (false, ErrNotFound).
+func (r *PGPaymentRepo) MarkFailed(ctx context.Context, tenantID, id int64) (bool, error) {
+	if r == nil || r.pool == nil {
+		return false, ErrNotFound
+	}
+	tag, err := r.pool.Exec(ctx, sqlPaymentMarkFailed, tenantID, id)
+	if err != nil {
+		return false, fmt.Errorf("payment: pg payment mark-failed: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // UpdateStatus sets the payment status (failed-notify / admin path).

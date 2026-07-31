@@ -181,10 +181,22 @@ func NewMemoryPaymentRepo() *MemoryPaymentRepo {
 }
 
 // Create allocates an id + timestamps and registers the out_trade_no in the
-// per-tenant uniqueness index. It returns a copy.
+// per-tenant uniqueness index. out_trade_no is globally unique across all
+// tenants (mirrors migration 000020's UNIQUE(out_trade_no)): if ANY tenant
+// already holds this out_trade_no the insert is refused with
+// ErrDuplicateOutTradeNo rather than overwriting the index entry — this closes
+// the check-then-insert race in Service.Prepay and keeps the notify path's
+// tenant-by-out_trade_no resolution unambiguous. It returns a copy.
 func (r *MemoryPaymentRepo) Create(_ context.Context, p *Payment) (*Payment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if p.OutTradeNo != "" {
+		for _, idx := range r.byTrade {
+			if _, exists := idx[p.OutTradeNo]; exists {
+				return nil, ErrDuplicateOutTradeNo
+			}
+		}
+	}
 	id := atomic.AddInt64(&r.seq, 1)
 	now := time.Now()
 	p.ID = id
@@ -231,17 +243,52 @@ func (r *MemoryPaymentRepo) GetByOutTradeNo(_ context.Context, tenantID int64, o
 }
 
 // GetByOutTradeNoAnyTenant scans every tenant's index for outTradeNo (the notify
-// path cannot scope by tenant, CONTRACT §15.7). out_trade_no is registered per
-// tenant so the first hit wins; ErrNotFound when no tenant has it.
+// path cannot scope by tenant, CONTRACT §15.7). out_trade_no is globally unique
+// (migration 000020); if more than one tenant nonetheless holds it — i.e. the
+// uniqueness invariant is broken — the resolution is ambiguous and fails closed
+// with ErrAmbiguousOutTradeNo rather than returning an arbitrary row.
+// ErrNotFound when no tenant has it.
 func (r *MemoryPaymentRepo) GetByOutTradeNoAnyTenant(_ context.Context, outTradeNo string) (*Payment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	var found *Payment
 	for _, idx := range r.byTrade {
 		if id, ok := idx[outTradeNo]; ok {
-			return clonePayment(r.rows[id]), nil
+			if found != nil {
+				return nil, ErrAmbiguousOutTradeNo
+			}
+			found = r.rows[id]
 		}
 	}
-	return nil, ErrNotFound
+	if found == nil {
+		return nil, ErrNotFound
+	}
+	return clonePayment(found), nil
+}
+
+// forceInsertRow stores p under a fresh id WITHOUT the global out_trade_no
+// uniqueness guard. It exists solely so tests can manufacture the
+// cross-tenant-duplicate state that production's UNIQUE(out_trade_no) forbids,
+// to exercise GetByOutTradeNoAnyTenant's ambiguity fail-closed path.
+func (r *MemoryPaymentRepo) forceInsertRow(p *Payment) *Payment {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := atomic.AddInt64(&r.seq, 1)
+	now := time.Now()
+	p.ID = id
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+	stored := clonePayment(p)
+	r.rows[id] = stored
+	if p.OutTradeNo != "" {
+		if r.byTrade[p.TenantID] == nil {
+			r.byTrade[p.TenantID] = make(map[string]int64)
+		}
+		r.byTrade[p.TenantID][p.OutTradeNo] = id
+	}
+	return clonePayment(stored)
 }
 
 // MarkSuccess performs the idempotent pending→success transition:
@@ -271,6 +318,29 @@ func (r *MemoryPaymentRepo) MarkSuccess(_ context.Context, tenantID, id int64, p
 		// failed/refunded cannot transition to success (irreversible state machine).
 		return nil, false, ErrStatusConflict
 	}
+}
+
+// MarkFailed performs the guarded pending→failed transition used by the failed
+// notify path: pending→failed returns (true, nil); any other state
+// (success/failed/refunded) — or an absent/cross-tenant id — is a no-op
+// returning (false, nil), so a late failed callback can never revert an
+// already-succeeded payment. The caller has already tenant-scoped the read
+// (GetByOutTradeNo) before invoking this, so the no-op-on-absent behaviour is
+// safe and mirrors PGPaymentRepo.MarkFailed exactly (a single conditional
+// UPDATE whose RowsAffected is 0 for both "not pending" and "absent").
+func (r *MemoryPaymentRepo) MarkFailed(_ context.Context, tenantID, id int64) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.rows[id]
+	if !ok || p.TenantID != tenantID {
+		return false, nil
+	}
+	if p.Status != PaymentStatusPending {
+		return false, nil
+	}
+	p.Status = PaymentStatusFailed
+	p.UpdatedAt = time.Now()
+	return true, nil
 }
 
 // UpdateStatus sets the payment status (used for failed notifies /
