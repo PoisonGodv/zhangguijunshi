@@ -85,6 +85,33 @@ type TagRule struct {
 	HighMarginMinPct int // (price-cost)/price*100 >= N 打「高毛利」
 }
 
+// ExpiryLookuper is the minimal read port the 临期 rule needs: the tenant's
+// per-product earliest (soonest) expiry across its active lots, keyed by
+// productID. storeID=0 spans all of the tenant's stores (the whole-tenant sweep
+// the BE-A-09 job runs); storeID>0 scopes to one store. The main thread adapts
+// inventory.Service onto this port (M7-A). Products with no expiry-bearing lot
+// are absent from the map, so their EarliestExpiry stays nil and 临期 never
+// fires for them spuriously.
+type ExpiryLookuper interface {
+	EarliestExpiryByProduct(ctx context.Context, tenantID, storeID int64) (map[int64]time.Time, error)
+}
+
+// EarliestExpiryFor returns the earliest expiry for productID from a map keyed
+// by productID (as produced by ExpiryLookuper), or nil when the product has no
+// expiry-bearing lot. It is a PURE, nil-safe helper: a nil/empty map yields nil
+// so the caller's 临期 judgement degrades to "not nearing" rather than failing.
+func EarliestExpiryFor(expiries map[int64]time.Time, productID int64) *time.Time {
+	if len(expiries) == 0 {
+		return nil
+	}
+	exp, ok := expiries[productID]
+	if !ok {
+		return nil
+	}
+	t := exp // fresh copy so callers cannot alias the map's stored value
+	return &t
+}
+
 // ComputeTags is a PURE function (no side effects): given one product view, a
 // rule, and the evaluation instant now, it returns the set of tags the product
 // should carry — de-duplicated and in the fixed order 临期 / 滞销 / 高毛利.

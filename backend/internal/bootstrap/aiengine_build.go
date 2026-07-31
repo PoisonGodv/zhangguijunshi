@@ -23,6 +23,7 @@ import (
 	aisignal "github.com/zhangguijunshi/backend/internal/aiengine/signal"
 	"github.com/zhangguijunshi/backend/internal/billing"
 	"github.com/zhangguijunshi/backend/internal/catalog"
+	"github.com/zhangguijunshi/backend/internal/dataquality"
 	"github.com/zhangguijunshi/backend/internal/groupbuy"
 	"github.com/zhangguijunshi/backend/internal/inventory"
 	"github.com/zhangguijunshi/backend/internal/margin"
@@ -72,12 +73,22 @@ func buildAIEngine(
 
 	cacheL1 := cache.NewMemoryCache()
 	semCache := semantic.NewMemoryCache(emb)
+	// M7-B: feed fused daily_product_sales (migration 000019) into the signal
+	// stage as real historical sales. Memory↔PG switch mirrors the cron repo
+	// convention; nil provider (no DB, dev) keeps pre-M7-B behaviour (backward
+	// compatible — WithSalesProvider(nil) is a no-op).
+	var salesRepo dataquality.SalesRepo = dataquality.NewMemorySalesRepo()
+	if database != nil {
+		salesRepo = dataquality.NewPGSalesRepo(database.Pool())
+	}
 	signalCollector := aisignal.NewCollector("fruit", "", signalLookuperAdapter{
 		catalogSvc:    catalogSvc,
 		inventorySvc:  inventorySvc,
 		membershipSvc: membershipSvc,
 		billingSvc:    billingSvc,
-	})
+	},
+		aisignal.WithSalesProvider(salesProviderAdapter{repo: salesRepo}),
+	)
 	ruleEngine := rule.NewEngine(rule.DefaultSeeds(), margin.Guard{MarginFloorPct: defaultMarginFloorPct})
 
 	// M3-S3 attribution + bandit + playbook (CONTRACT §14.7).

@@ -49,6 +49,10 @@ type jobs struct {
 	// either is unset.
 	dailySales dataquality.SalesRepo
 	tagWriter  dataquality.TagWriter
+	// expiry feeds the 临期 (nearing-expiry) tag with a whole-tenant per-product
+	// earliest batch expiry (M7-A). nil-guarded in dataqualityTenant: unset keeps
+	// EarliestExpiry nil so 临期 does not fire (pre-M7-A behaviour).
+	expiry dataquality.ExpiryLookuper
 }
 
 // registerJobs wires the 3 non-pregen jobs onto c, logging each registration and
@@ -68,8 +72,16 @@ func registerJobs(c *cron.Cron, svc *bootstrap.Services, log *zap.Logger) error 
 	if svc != nil && svc.Catalog != nil {
 		tagWriter = svc.Catalog
 	}
+	// M7-A 临期 tag input: inventory.Service implements the whole-tenant
+	// per-product earliest-expiry lookup; the thin adapter re-injects the
+	// explicit tenantID contract (tenant already rides in ctx, same convention
+	// as inventorySalesReverser below).
+	var expiry dataquality.ExpiryLookuper
+	if svc != nil && svc.Inventory != nil {
+		expiry = &inventoryExpiryLookuper{inv: svc.Inventory}
+	}
 
-	j := &jobs{svc: svc, log: log, now: time.Now, dailySales: salesRepo, tagWriter: tagWriter}
+	j := &jobs{svc: svc, log: log, now: time.Now, dailySales: salesRepo, tagWriter: tagWriter, expiry: expiry}
 
 	specs := []struct {
 		spec, name string
@@ -213,6 +225,14 @@ func (j *jobs) dataqualityTenant(tctx context.Context, tenantID int64, day, now 
 		return
 	}
 	rule := dataquality.TagRule{NearingDays: 3, StaleDays: 30, HighMarginMinPct: 40}
+	// M7-A 临期 input: one whole-tenant per-product earliest-expiry map (storeID=0
+	// covers all of the tenant's stores), fetched once and reused per product.
+	// Any error / nil port degrades to a nil map → EarliestExpiryFor returns nil
+	// → 临期 does not fire (pre-M7-A behaviour), never a crash (§0).
+	var expiries map[int64]time.Time
+	if j.expiry != nil {
+		expiries, _ = j.expiry.EarliestExpiryByProduct(tctx, tenantID, 0)
+	}
 	tagged := 0
 	written := 0
 	for _, p := range products {
@@ -221,12 +241,9 @@ func (j *jobs) dataqualityTenant(tctx context.Context, tenantID int64, day, now 
 			CostCents:     p.CostCents,
 			PriceCents:    p.PriceCents,
 			ShelfLifeDays: p.ShelfLifeDays,
-			// LIMITATION (documented, CONTRACT §9.3): EarliestExpiry stays nil.
-			// inventory.ListNearingBatches is per-store and returns nothing for
-			// the whole-tenant storeID=0 sweep, so a per-product earliest expiry
-			// is not cheaply available here. 临期 tagging awaits a whole-tenant
-			// batch-listing port; today only 滞销/高毛利 are meaningful.
-			EarliestExpiry: nil,
+			// M7-A: real per-product earliest batch expiry (whole-tenant). nil when
+			// the product has no dated batch / the port is unwired → 临期 not fired.
+			EarliestExpiry: dataquality.EarliestExpiryFor(expiries, p.ID),
 		}
 		// DaysSinceLastSale comes from the freshly-persisted fused daily sales
 		// (BE-A-08): the product's most recent sale_date. A product with no
@@ -321,4 +338,22 @@ func (a *inventorySalesReverser) ListSaleOut(ctx context.Context, tenantID, stor
 		out = append(out, dataquality.SaleQty{ProductID: m.ProductID, Qty: qty})
 	}
 	return out, nil
+}
+
+// ---- ExpiryLookuper adapter over inventory (M7-A) ---------------------------
+
+// inventoryExpiryLookuper adapts inventory.Service onto dataquality's
+// ExpiryLookuper port (防腐层). inventory.Service.EarliestExpiryByProduct reads
+// the tenant from ctx (ARCH-01 EnforceTenant); the cron's tctx already carries
+// it, so the explicit tenantID param is port-contract only (mirrors
+// inventorySalesReverser). storeID=0 = whole tenant.
+type inventoryExpiryLookuper struct {
+	inv *inventory.Service
+}
+
+func (a *inventoryExpiryLookuper) EarliestExpiryByProduct(ctx context.Context, tenantID, storeID int64) (map[int64]time.Time, error) {
+	if a == nil || a.inv == nil {
+		return nil, nil
+	}
+	return a.inv.EarliestExpiryByProduct(ctx, storeID)
 }

@@ -9,6 +9,7 @@ package dataquality
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 )
@@ -86,4 +87,43 @@ func (r *MemorySalesRepo) LastSaleDate(_ context.Context, tenantID, storeID, pro
 		}
 	}
 	return best, found, nil
+}
+
+// ListDailySales implements SalesRepo. It scans the tenant's cells within the
+// inclusive natural-day range [from, to] (storeID=0 = all of the tenant's
+// stores) and returns the matching per-product-per-day rows ordered by
+// product_id then sale_date. from/to are normalised to natural-day keys so the
+// range is calendar-wise regardless of time-of-day / location. A nil receiver
+// or an inverted range (from after to) returns an empty (non-nil) slice + nil
+// error (best-effort, cold-start safe).
+func (r *MemorySalesRepo) ListDailySales(_ context.Context, tenantID, storeID int64, from, to time.Time) ([]DailyProductSales, error) {
+	out := []DailyProductSales{}
+	if r == nil {
+		return out, nil
+	}
+	lo, hi := dateKey(from), dateKey(to)
+	if lo > hi {
+		return out, nil // inverted range → empty, not an error
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for k, v := range r.m {
+		if k.tenant != tenantID {
+			continue
+		}
+		if storeID != 0 && k.store != storeID {
+			continue
+		}
+		if k.date < lo || k.date > hi {
+			continue
+		}
+		out = append(out, DailyProductSales{ProductID: k.product, Day: v.day, Qty: v.qty})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ProductID != out[j].ProductID {
+			return out[i].ProductID < out[j].ProductID
+		}
+		return out[i].Day.Before(out[j].Day)
+	})
+	return out, nil
 }

@@ -126,6 +126,23 @@ type StockConsumer interface {
 	ConsumeFIFOAtomic(ctx context.Context, tenantID, storeID, productID, qty int64, mkMovement func(batchID, deducted int64) *Movement) ([]*Batch, error)
 }
 
+// ProductExpirer is an OPTIONAL repo capability for whole-tenant, per-product
+// earliest-expiry aggregation (M7-A). It is NOT part of BatchRepo (CONTRACT §9.3
+// fixes BatchRepo's six methods verbatim, same reason StockConsumer lives apart):
+// it sits behind a separate interface the Service reaches by type assertion,
+// degrading to an empty map when the repo does not provide it so 临期 tagging
+// simply does not fire rather than failing (nil-safe, §0 philosophy).
+//
+// Contract: return, for tenantID, each product's earliest (soonest) ExpiryDate
+// across its ACTIVE, positive-quantity lots that carry a non-nil ExpiryDate.
+// storeID=0 spans ALL of the tenant's stores (the whole-tenant sweep the
+// dataquality 临期 tag needs); storeID>0 scopes to that one store. Products with
+// no expiry-bearing lot are absent from the map. Every implementation MUST keep
+// tenant isolation: a different tenant's batches are never aggregated.
+type ProductExpirer interface {
+	EarliestExpiryByProduct(ctx context.Context, tenantID, storeID int64) (map[int64]time.Time, error)
+}
+
 // ProductLookuper is inventory's minimal view of the catalogue (防腐层). The
 // main thread adapts it onto catalog.Service; unit tests inject a fake. The
 // service uses it to confirm a product belongs to the ctx tenant before

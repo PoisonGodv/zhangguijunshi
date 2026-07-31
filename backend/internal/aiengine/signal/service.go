@@ -14,6 +14,11 @@ type Service struct {
 	now          func() time.Time
 	weatherFn    func() Weather
 	holidayFn    func() Holiday
+	// M7-B: real historical-sales input. salesProv is nil-safe — when unset (or
+	// it errors / returns nothing) Collect leaves Bundle.Sales nil and the
+	// inventory SlowMoving flag untouched (rule-only / cold-start degrades).
+	salesProv SalesProvider
+	salesCfg  salesConfig
 }
 
 // Option configures a Service.
@@ -34,6 +39,36 @@ func WithHolidayMock(fn func() Holiday) Option {
 	return func(s *Service) { s.holidayFn = fn }
 }
 
+// WithSalesProvider injects the real historical-sales provider (M7-B). The main
+// thread adapts dataquality.SalesRepo.ListDailySales to the SalesProvider port
+// and passes it here. nil (the default) disables the sales signal — Collect then
+// behaves exactly as before M7-B (backward-compatible).
+func WithSalesProvider(p SalesProvider) Option {
+	return func(s *Service) { s.salesProv = p }
+}
+
+// WithSalesWindowDays overrides the lookback window length (days, >=1) used to
+// read and aggregate historical sales. <=0 keeps the default
+// (DefaultSalesWindowDays).
+func WithSalesWindowDays(days int) Option {
+	return func(s *Service) {
+		if days >= 1 {
+			s.salesCfg.windowDays = days
+		}
+	}
+}
+
+// WithSlowMovingThresholdQty overrides the 滞销 cutoff: a product whose total
+// window sales is <= qty units is flagged slow-moving. <0 keeps the default
+// (DefaultSlowMovingThresholdQty).
+func WithSlowMovingThresholdQty(qty int64) Option {
+	return func(s *Service) {
+		if qty >= 0 {
+			s.salesCfg.slowThreshold = qty
+		}
+	}
+}
+
 // NewCollector builds a Collector. businessType defaults to "fruit" (cold-start
 // sample business per CONTRACT §12.3.8) when empty. city is carried through to
 // the Bundle. lk may be nil — Collect degrades to a zero Bundle in that case.
@@ -43,6 +78,7 @@ func NewCollector(businessType, city string, lk Lookuper, opts ...Option) *Servi
 		city:         city,
 		lk:           lk,
 		now:          time.Now,
+		salesCfg:     defaultSalesConfig(),
 	}
 	if s.businessType == "" {
 		s.businessType = "fruit"
@@ -69,9 +105,13 @@ func (s *Service) mockHoliday() Holiday {
 	return Holiday{Name: "无", DaysTo: -1, IsFestival: false}
 }
 
-// computeDataQuality derives a 0-100 trace score from what the Lookuper
-// returned. All-empty → 0 (cold-start entry); each present path adds signal.
-func computeDataQuality(inv []InventorySig, mem MemberStats, txn TxnSig) int {
+// computeDataQuality derives a 0-100 trace score from what the Lookuper and the
+// M7-B sales provider returned. All-empty → 0 (cold-start entry); each present
+// path adds signal. The three Lookuper paths keep their M3-S1 weights
+// (inventory 40 / members 30 / txn 30 = 100) and real historical sales add a
+// +10 bonus, capped at 100 so a fully-populated bundle still scores 100
+// (backward-compatible with the pre-M7-B 40/30/30 contract).
+func computeDataQuality(inv []InventorySig, mem MemberStats, txn TxnSig, sales []SalesSig) int {
 	score := 0
 	if len(inv) > 0 {
 		score += 40
@@ -81,6 +121,12 @@ func computeDataQuality(inv []InventorySig, mem MemberStats, txn TxnSig) int {
 	}
 	if txn.OrderCount > 0 || txn.RevenueCents > 0 || txn.NewMembers > 0 {
 		score += 30
+	}
+	if len(sales) > 0 {
+		score += 10 // M7-B: real historical-sales signal present
+	}
+	if score > 100 {
+		score = 100
 	}
 	return score
 }

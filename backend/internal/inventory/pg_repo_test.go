@@ -289,6 +289,35 @@ func TestPGBatchRepo_ConsumeFIFOAtomic_Insufficient(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPGBatchRepo_EarliestExpiryByProduct(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGBatchRepo(mock)
+	// MIN(expiry_date) GROUP BY product_id collapses each product to its soonest
+	// active lot; storeID=0 spans all of the tenant's stores via the ($2=0 OR ...)
+	// idiom. Args carry the tenant + store scope.
+	exp1 := fixedTime.AddDate(0, 0, 2)
+	exp2 := fixedTime.AddDate(0, 0, 20)
+	mock.ExpectQuery(sqlBatchEarliestExpiryByProduct).
+		WithArgs(int64(1), int64(0)).
+		WillReturnRows(pgxmock.NewRows([]string{"product_id", "min"}).
+			AddRow(int64(77), exp1).
+			AddRow(int64(88), exp2))
+	got, err := repo.EarliestExpiryByProduct(context.Background(), 1, 0)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.True(t, got[77].Equal(exp1))
+	require.True(t, got[88].Equal(exp2))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGBatchRepo_EarliestExpiryByProduct_NilPool(t *testing.T) {
+	// A nil pool degrades to an empty map (dev wires the memory repo).
+	repo := NewPGBatchRepo(nil)
+	got, err := repo.EarliestExpiryByProduct(context.Background(), 1, 0)
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
 func TestPGBatchRepo_NilPoolIsSafe(t *testing.T) {
 	// A nil repo / nil pool degrades to ErrNotFound (single / write) or an empty
 	// slice (list) rather than panicking. ConsumeFIFOAtomic bails before any tx.

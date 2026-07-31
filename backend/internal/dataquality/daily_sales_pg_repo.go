@@ -40,7 +40,30 @@ FROM daily_product_sales
 WHERE tenant_id = $1 AND ($2 = 0 OR store_id = $2) AND product_id = $3
 ORDER BY sale_date DESC
 LIMIT 1`
+
+	// sqlListDailySales reads back the fused per-product-per-day sales within the
+	// inclusive natural-day range [$3, $4] for (tenant, store). It is the read
+	// counterpart of sqlUpsertDailySales and the data source the AI signal stage
+	// (M7-B) consumes. sale_date is bound as a 'YYYY-MM-DD' string so the DATE
+	// column never sees a time-of-day / location. The ($2 = 0 OR store_id = $2)
+	// idiom makes storeID=0 scan all of the tenant's stores. Ordered by
+	// product_id then sale_date for deterministic downstream aggregation.
+	sqlListDailySales = `SELECT product_id, sale_date, qty
+FROM daily_product_sales
+WHERE tenant_id = $1 AND ($2 = 0 OR store_id = $2) AND sale_date >= $3 AND sale_date <= $4
+ORDER BY product_id, sale_date`
 )
+
+// queryer is the optional multi-row surface that the real *pgxpool.Pool and
+// pgxmock expose in addition to the frozen PGPool methods (QueryRow/Exec).
+// PGPool itself does not declare Query (signature frozen, matching the
+// bandit/attribution idiom), so ListDailySales type-asserts the concrete pool
+// to queryer. A pool that only satisfies PGPool (a hand-rolled fake) makes
+// ListDailySales return an empty slice — cold-start safe rather than a hard
+// failure.
+type queryer interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
 
 // PGSalesRepo is the pgx-backed SalesRepo. A nil pool makes writes return 0 and
 // reads return ok=false (dev wires MemorySalesRepo).
@@ -85,4 +108,43 @@ func (r *PGSalesRepo) LastSaleDate(ctx context.Context, tenantID, storeID, produ
 		return time.Time{}, false, fmt.Errorf("dataquality: pg last sale date: %w", err)
 	}
 	return d, true, nil
+}
+
+// ListDailySales reads back the fused per-product-per-day sales within the
+// inclusive natural-day range [from, to] for (tenantID, storeID); storeID=0
+// scans all of the tenant's stores. It type-asserts the pool to the optional
+// queryer interface for multi-row iteration (PGPool only declares
+// QueryRow/Exec); a pool lacking Query returns an empty (non-nil) slice rather
+// than failing (cold-start safe). A nil pool, an inverted range, or no matching
+// rows yields an empty (non-nil) slice + nil error. Rows are returned ordered by
+// product_id then sale_date (the SQL ORDER BY).
+func (r *PGSalesRepo) ListDailySales(ctx context.Context, tenantID, storeID int64, from, to time.Time) ([]DailyProductSales, error) {
+	out := []DailyProductSales{}
+	if r == nil || r.pool == nil {
+		return out, nil
+	}
+	fromKey, toKey := from.Format("2006-01-02"), to.Format("2006-01-02")
+	if fromKey > toKey {
+		return out, nil // inverted range → empty, not an error
+	}
+	q, ok := r.pool.(queryer)
+	if !ok {
+		return out, nil
+	}
+	rows, err := q.Query(ctx, sqlListDailySales, tenantID, storeID, fromKey, toKey)
+	if err != nil {
+		return nil, fmt.Errorf("dataquality: pg list daily sales: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var row DailyProductSales
+		if err := rows.Scan(&row.ProductID, &row.Day, &row.Qty); err != nil {
+			return nil, fmt.Errorf("dataquality: pg list daily sales scan: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("dataquality: pg list daily sales rows: %w", err)
+	}
+	return out, nil
 }

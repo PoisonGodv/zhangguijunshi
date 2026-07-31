@@ -704,3 +704,152 @@ func TestListNearingBatches_NoTenantRejected(t *testing.T) {
 		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
 	}
 }
+
+// --- EarliestExpiryByProduct (M7-A) ---
+
+func TestEarliestExpiryByProduct_WholeTenantPerProduct(t *testing.T) {
+	svc, _, clk := newService(tenantLookuper())
+	defer setNowForTest(clk.now)()
+	ctx := ctxFor(100, 10, 7)
+
+	now := clk.now()
+	// Product 1: two lots across two stores; the soonest is the store-11 one.
+	soon := now.AddDate(0, 0, 2)
+	later := now.AddDate(0, 0, 20)
+	purchaseExpiry(t, svc, clk, ctx, 1, 5, &later) // store 10 (via ctx)
+	if _, err := svc.PurchaseIn(ctx, PurchaseInInput{StoreID: 11, ProductID: 1, Quantity: 4, InPriceCents: 100, ExpiryDate: &soon}); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(time.Minute)
+	// Product 2: a single lot with no expiry -> absent from the map.
+	purchaseExpiry(t, svc, clk, ctx, 2, 8, nil)
+
+	// storeID=0 spans ALL of the tenant's stores: product 1's earliest is `soon`
+	// (the store-11 lot), product 2 is absent (no expiry-bearing lot).
+	got, err := svc.EarliestExpiryByProduct(ctx, 0)
+	if err != nil {
+		t.Fatalf("EarliestExpiryByProduct(0): %v", err)
+	}
+	exp, ok := got[1]
+	if !ok {
+		t.Fatalf("product 1 missing from map: %+v", got)
+	}
+	if !exp.Equal(soon) {
+		t.Errorf("product 1 earliest = %v, want soonest %v", exp, soon)
+	}
+	if _, ok := got[2]; ok {
+		t.Errorf("product 2 (no-expiry lot) must be absent, got %+v", got)
+	}
+}
+
+func TestEarliestExpiryByProduct_StoreScoped(t *testing.T) {
+	svc, _, clk := newService(tenantLookuper())
+	defer setNowForTest(clk.now)()
+	ctx := ctxFor(100, 10, 7)
+
+	now := clk.now()
+	soon := now.AddDate(0, 0, 2)
+	later := now.AddDate(0, 0, 20)
+	// store 10 (via ctx): later; store 11 (explicit): soon.
+	purchaseExpiry(t, svc, clk, ctx, 1, 5, &later)
+	if _, err := svc.PurchaseIn(ctx, PurchaseInInput{StoreID: 11, ProductID: 1, Quantity: 4, InPriceCents: 100, ExpiryDate: &soon}); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(time.Minute)
+
+	// storeID=10 -> only the store-10 lot (later), not the store-11 soon one.
+	got10, err := svc.EarliestExpiryByProduct(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := got10[1]; !exp.Equal(later) {
+		t.Errorf("store-10 earliest = %v, want %v (store-11 lot must not leak in)", exp, later)
+	}
+	// storeID=11 -> only the soon lot.
+	got11, err := svc.EarliestExpiryByProduct(ctx, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := got11[1]; !exp.Equal(soon) {
+		t.Errorf("store-11 earliest = %v, want %v", exp, soon)
+	}
+}
+
+func TestEarliestExpiryByProduct_ExcludesClearedAndNoExpiry(t *testing.T) {
+	svc, _, clk := newService(tenantLookuper())
+	defer setNowForTest(clk.now)()
+	ctx := ctxFor(100, 10, 7)
+
+	now := clk.now()
+	soon := now.AddDate(0, 0, 2)
+	// Active lot with an expiry -> present before drain.
+	purchaseExpiry(t, svc, clk, ctx, 1, 5, &soon)
+	if got, _ := svc.EarliestExpiryByProduct(ctx, 0); len(got) != 1 {
+		t.Fatalf("pre-drain map = %+v, want product 1 present", got)
+	}
+
+	// Drain product 1 -> its lot is cleared (qty=0) -> excluded.
+	if _, err := svc.ConsumeFIFO(ctx, 10, 1, 5, 1); err != nil {
+		t.Fatalf("ConsumeFIFO drain: %v", err)
+	}
+	got, err := svc.EarliestExpiryByProduct(ctx, 0)
+	if err != nil {
+		t.Fatalf("post-drain: %v", err)
+	}
+	if _, ok := got[1]; ok {
+		t.Errorf("cleared product 1 must be absent post-drain, got %+v", got)
+	}
+}
+
+func TestEarliestExpiryByProduct_CrossTenantInvisible(t *testing.T) {
+	svc, repo, clk := newService(tenantLookuper())
+	defer setNowForTest(clk.now)()
+	ctxA := ctxFor(100, 10, 7)
+	ctxB := ctxFor(200, 20, 8)
+
+	now := clk.now()
+	soon := now.AddDate(0, 0, 2)
+	purchaseExpiry(t, svc, clk, ctxA, 1, 5, &soon)
+
+	// Tenant B's whole-tenant sweep must NOT see tenant A's batch.
+	got, err := svc.EarliestExpiryByProduct(ctxB, 0)
+	if err != nil {
+		t.Fatalf("EarliestExpiryByProduct: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("tenant 200 saw tenant 100 expiry: %+v", got)
+	}
+	// Repo-level call for tenant 200 is also empty.
+	direct, err := repo.EarliestExpiryByProduct(ctxB, 200, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(direct) != 0 {
+		t.Errorf("repo cross-tenant leak: %+v", direct)
+	}
+}
+
+func TestEarliestExpiryByProduct_NoTenantRejected(t *testing.T) {
+	svc, _, _ := newService(tenantLookuper())
+	if _, err := svc.EarliestExpiryByProduct(context.Background(), 0); !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant err = %v, want ErrNoTenant", err)
+	}
+}
+
+// narrowRepo wraps a BatchRepo but hides the optional ProductExpirer capability,
+// proving the service degrades to an empty map (nil-safe) when the repo lacks it.
+type narrowRepo struct{ BatchRepo }
+
+func TestEarliestExpiryByProduct_RepoWithoutCapabilityDegrades(t *testing.T) {
+	// narrowRepo embeds BatchRepo as an interface field, so it does NOT satisfy
+	// ProductExpirer (the concrete method set is not promoted through an interface
+	// field). The service must return an empty map, not an error.
+	svc := New(narrowRepo{BatchRepo: NewMemoryBatchRepo()}, tenantLookuper(), WithNowFunc(newClock().now))
+	got, err := svc.EarliestExpiryByProduct(ctxFor(100, 10, 7), 0)
+	if err != nil {
+		t.Fatalf("degraded path err = %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("degraded path map = %+v, want empty", got)
+	}
+}

@@ -3522,3 +3522,44 @@ services 层：catalog.ts/inventory.ts/membership.ts（A2a）+ billing.ts/market
 ### 20.6 仍延后
 - **reach 定时发送时机强制**（新发现，非本次范围）：`jobqueue.Job.RunAt` 仅为观测性 hint，Redis Stream 消费端 `XREADGROUP` 立即读取、无 ZSET 延迟投递——"定时"消息 worker 一拿到即发。20.3 解决"落库可见"，"按时投递"需给 `pkg/jobqueue` 加延迟队列（共享件，独立里程碑）。
 - §19.9 余项：WX V3 真 `sub_mch_id` 透传 + Apply 字段级 RSA-OAEP；`internal/tenant` 跨租户平台运营后台。
+
+## 21. M7 数据质量闭环 + AI 信号真实化（2026-07-31）
+
+多 agent 并行实现（M7-A 临期 tag / M7-B 销量喂 AI）+ 主线程集成。`go build ./...` 全绿、`go test -race ./...` 全绿（47 包）、gofmt/vet clean。关闭 §20.4/§20.6 遗留的两项"尚未真实生效"缺口。
+
+### 21.1 临期 tag 真实触发（§20.4 遗留，修复）
+- 根因：`cmd/cron/jobs.go` 的 `dataqualityTenant` 里 `EarliestExpiry: nil` 恒空——`inventory.ListNearingBatches` 按店，全店 storeID=0 sweep 拿不到逐商品最早批期。
+- 修法（`internal/inventory/`）：新增可选能力接口 `ProductExpirer{ EarliestExpiryByProduct(ctx, tenantID, storeID) (map[int64]time.Time, error) }`（不进 `BatchRepo`，保 §9.3 六方法冻结）。`Service.EarliestExpiryByProduct(ctx, storeID)`：EnforceTenant → type-assert repo；repo 无此能力时**降级返回空 map（nil-safe，不报错）**。Memory 实现（读锁扫全库，active+qty>0+ExpiryDate≠nil，取每商品最早值）+ PG 实现（`MIN(expiry_date) GROUP BY product_id WHERE tenant_id=$1 AND ($2=0 OR store_id=$2)`）双实现，行级租户隔离。
+- 修法（`internal/dataquality/`）：新端口 `ExpiryLookuper`（job 侧防腐层）+ 纯函数 `EarliestExpiryFor(map, productID) *time.Time`（缺商品/空 map → nil，临期不触发而非报错）。
+- 接线（主线程 `cmd/cron/jobs.go`）：jobs struct 加 `expiry dataquality.ExpiryLookuper` 字段；registerJobs 构造 `inventoryExpiryLookuper{inv: svc.Inventory}`（薄 adapter，tenant 已由 cron tctx 注入 ctx）；`dataqualityTenant` 循环前一次性 `EarliestExpiryByProduct(tctx, tenantID, 0)` 拉全店 map，`EarliestExpiry: dataquality.EarliestExpiryFor(expiries, p.ID)`。
+- 行为变化：接入后临期 tag 在每日 01:00 sweep 中真实触发（批期 ≤ NearingDays 天）并写回 catalog。未接线/无批期商品仍不触发（向后兼容）。
+- 测试：inventory +6（全店/单店/排除无批期/跨租户/无tenant拒绝/无能力降级）+ pgxmock +2；dataquality +2（EarliestExpiryFor + ComputeTags 临期三态）。
+
+### 21.2 daily_product_sales 喂 AI 信号管线（§20.4 遗留，修复）
+- 根因：M6 落库的 `daily_product_sales` 融合销量只有 dataquality job 消费（LastSaleDate），AI signal 段拿不到真实历史销量。
+- 修法（`internal/dataquality/`）：`SalesRepo` 接口**新增** `ListDailySales(ctx, tenantID, storeID, from, to) ([]DailyProductSales, error)`（未动 Upsert/LastSaleDate 既有签名）。新类型 `DailyProductSales{ProductID, Day, Qty}`。Memory 实现（自然日区间、tenant/store 隔离、排序）+ PG 实现（`WHERE tenant_id AND sale_date BETWEEN`，queryer type-assert）双实现。
+- 修法（`internal/aiengine/signal/`）：新文件 `sales.go`——防腐端口 `SalesProvider{ DailySales(ctx, tenantID, storeID, from, to) ([]DailySale, error) }`（定义在 signal 域，不耦合 dataquality）；`SalesSig{ProductID, TotalQty, RecentQty, PriorQty, ActiveDays, Trend(up|down|flat), SlowMoving, BestSeller}`；纯函数 `aggregateSales`（近 N 天/趋势/滞销·畅销聚合）+ `markSlowMoving`（回填 inventory.SlowMoving）。`Bundle` 加 `Sales []SalesSig`；`Service` 加 `WithSalesProvider/WithSalesWindowDays(默认14)/WithSlowMovingThresholdQty(默认2)` 三 Option；`Collect` 并发读销量窗口聚合进 Bundle；`computeDataQuality` 加销量 bonus +10（封顶 100，向后兼容）。
+- 接线（主线程 `internal/bootstrap/`）：`adapters.go` 新 `salesProviderAdapter{repo dataquality.SalesRepo}`（ListDailySales→signal.DailySale 逐字段映射，nil repo→nil slice）；`aiengine_build.go` 在 `NewCollector` 前构造 `salesRepo`（memory↔pg 切换），`WithSalesProvider(salesProviderAdapter{repo})` 传入。
+- 行为变化：接入后 AI signal 段能基于真实历史销量产出 SalesSig（趋势/滞销/畅销），供 rule/agent 消费。无历史/无 DB 时降级为 pre-M7-B 行为（WithSalesProvider(nil) = no-op，向后兼容）。
+- 测试：signal `sales_test.go`（aggregateSales/markSlowMoving/Collect 消费/nil 降级/窗口选项）；dataquality memory + pgxmock 各补 ListDailySales。
+
+### 21.3 已知限制 / 后续
+- **语义缓存键未含销量维度**：`semantic.BuildSignalText` 只用 weather/days_to_expiry/sleep_30/holiday，不含 slow_moving/sales。销量变化可能命中旧语义缓存（L1 按 date 键、L2 TTL 24h，影响有限）。如需销量进语义键是后续独立改动。
+- **销量窗口止于昨日**：Collect 读 `[today-N, today-1]`——当日融合销量要等次日 cron 反推才有，符合 dataquality 时序。
+- **无历史不打滞销标**：`markSlowMoving` 只对窗口内有销量记录的商品判滞销，无历史商品不动 SlowMoving（避免新店误报）。
+- §20.6 余项：reach 定时发送时机强制已在 M7-S0 落地（`pkg/jobqueue` ZSET 延迟投递 + DelayPump，见 §22）；仍延后：WX V3 真 sub_mch_id + RSA-OAEP；internal/tenant 跨租户平台运营后台。
+
+## 22. M7-S0 改密 ver 校验 + jobqueue 延迟队列（2026-07-31，关闭 §20.5/§20.6）
+
+上一轮会话遗留的 WIP，本轮验证（build/`test -race` 全绿、gofmt/vet clean）后提交。
+
+### 22.1 改密 + ver claim 强制（§20.5 后续，修复）
+- `internal/auth/change_password.go`：`ChangePassword(ctx, tenantID, accountID, old, new)`——参数校验（非空/new≠old/长度6-64）→ FindByID（租户隔离，not-found 真 404 不折叠）→ VerifyPassword（任何失败折叠 ErrLoginFailed 防枚举）→ HashPassword+UpdatePassword → BumpVersion → VersionStore.Incr（boss+admin 双 scene，best-effort）。返回新 Account，**不重签 token**（强制重新登录为安全默认）。
+- `internal/auth/version_store.go`：`VersionStore{Get/Set/Incr}`（key `zg:ver:<scene>:<userID>`）。Memory + Redis 双实现，nil-safe（缺依赖→cache miss→allow，绝不锁死用户）。`VersionChecker` adapter 满足 middleware 的 `versionChecker`（保持 middleware 不 import internal/auth）。**契约**：login 必须先 Set DB version，Incr 仅在改密时调（fresh key INCR=1 会失配）。
+- `interfaces/http/middleware/auth.go`：`Auth(verifier, blocker, checker)` 增第三参；`cur>0 && cur>claims.Version` → ErrTokenInvalid(40101)。cache miss/error 一律 allow（可用性优先）。无 `claims.Version>0` 短路（首改 0→1 须能失效 ver-0 token）。
+- 路由：boss/admin 各加 `POST /auth/password`（account id+tenant 取自 JWT ctx，绝不取 body）。bootstrap 构造 Redis/Memory VersionStore 并经 `WithVersionStore` 注入 + Deps.VersionStore 传 router。
+
+### 22.2 jobqueue 延迟队列（§20.6 第 1 项，修复）
+- 根因：`Producer.Enqueue` 无脑 XADD，consumer XREADGROUP 立即消费 → 未来 RunAt 的"定时"消息一入队就发。
+- 修法（`pkg/jobqueue/delay.go` + `queue.go`）：未来且非零 RunAt → ZADD 进 `<stream>:delay` ZSET（score=RunAt.UnixNano，member=JSON 字段映射+随机 nonce 防 ZADD 折叠）；零/过去 RunAt 仍走立即 XADD（既有调用方/测试不受影响）。worker 新增 `DelayPump`（`NewDelayPump(client, cfg)`）后台循环：ZRANGEBYSCORE 取 due → **ZREM 抢占**（返回 1 者独占，跨 worker 副本 exactly-once）→ XADD 回 live Stream（复用四字段，parseJob 零改动）；XADD 失败则 now+5s 重入队（at-least-once，不丢）；corrupt member 丢弃（poison-pill 守卫）。nil client → Run no-op（dev 无延迟投递，正确）。
+- worker `cmd/worker/main.go`：consumer + pump 双循环并跑，优雅退出（bounded drain，任一自退则 cancel 另一个）。

@@ -27,6 +27,7 @@ type Bundle struct {
 	Holiday      Holiday        `json:"holiday"`
 	Inventory    []InventorySig `json:"inventory"`
 	Members      MemberStats    `json:"members"`
+	Sales        []SalesSig     `json:"sales"`        // M7-B: 近N天真实历史销量 (nil=无销量信号)
 	DataQuality  int            `json:"data_quality"` // 0-100, trace only
 }
 

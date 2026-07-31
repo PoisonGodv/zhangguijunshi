@@ -55,11 +55,13 @@ type txBeginner interface {
 	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
-// Compile-time guarantees that PGBatchRepo satisfies both the frozen BatchRepo
-// interface and the optional StockConsumer capability (CONTRACT §17.5.1).
+// Compile-time guarantees that PGBatchRepo satisfies the frozen BatchRepo
+// interface, the optional StockConsumer capability, and the optional
+// ProductExpirer capability (CONTRACT §17.5.1 / M7-A).
 var (
-	_ BatchRepo     = (*PGBatchRepo)(nil)
-	_ StockConsumer = (*PGBatchRepo)(nil)
+	_ BatchRepo      = (*PGBatchRepo)(nil)
+	_ StockConsumer  = (*PGBatchRepo)(nil)
+	_ ProductExpirer = (*PGBatchRepo)(nil)
 )
 
 // SQL for inventory_batches (migration 000002). expiry_date / expiry_warn_date
@@ -96,6 +98,17 @@ FOR UPDATE`
 SET quantity = $1, status = $2
 WHERE tenant_id = $3 AND id = $4
 RETURNING id, tenant_id, store_id, product_id, quantity, in_price_cents, expiry_date, expiry_warn_date, status, created_at, updated_at`
+	// EarliestExpiryByProduct (M7-A): whole-tenant (storeID=0) or single-store
+	// per-product earliest expiry. MIN(expiry_date) ignores NULLs, so lots without
+	// an expiry never contribute; the GROUP BY collapses each product to its
+	// soonest active lot. The ($2 = 0 OR store_id = $2) idiom keeps the SQL a
+	// single constant (QueryMatcherEqual friendly) while letting storeID=0 span
+	// all of the tenant's stores. tenant_id in the WHERE enforces row isolation.
+	sqlBatchEarliestExpiryByProduct = `SELECT product_id, MIN(expiry_date)
+FROM inventory_batches
+WHERE tenant_id = $1 AND ($2 = 0 OR store_id = $2)
+AND status = 'active' AND quantity > 0 AND expiry_date IS NOT NULL
+GROUP BY product_id`
 )
 
 // SQL for inventory_movements (migration 000002). batch_id / ref_order_id /
@@ -318,6 +331,41 @@ func (r *PGBatchRepo) ListNearingBatches(ctx context.Context, tenantID, storeID 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("inventory: pg batch list nearing rows: %w", err)
+	}
+	return out, nil
+}
+
+// EarliestExpiryByProduct implements the optional ProductExpirer capability
+// (M7-A): for tenantID it returns each product's earliest (soonest) expiry_date
+// across its active, positive-quantity lots via MIN(expiry_date) GROUP BY
+// product_id. storeID=0 spans all of the tenant's stores (the ($2 = 0 OR
+// store_id = $2) idiom); storeID>0 scopes to one store. Lots without an expiry
+// are excluded (MIN ignores NULLs + the IS NOT NULL filter). tenant_id in the
+// WHERE enforces row isolation. A nil/non-Query pool yields an empty map.
+func (r *PGBatchRepo) EarliestExpiryByProduct(ctx context.Context, tenantID, storeID int64) (map[int64]time.Time, error) {
+	out := make(map[int64]time.Time)
+	if r == nil || r.pool == nil {
+		return out, nil
+	}
+	q, ok := r.pool.(queryer)
+	if !ok {
+		return out, nil
+	}
+	rows, err := q.Query(ctx, sqlBatchEarliestExpiryByProduct, tenantID, storeID)
+	if err != nil {
+		return nil, fmt.Errorf("inventory: pg earliest expiry: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var productID int64
+		var expiry time.Time
+		if err := rows.Scan(&productID, &expiry); err != nil {
+			return nil, fmt.Errorf("inventory: pg earliest expiry scan: %w", err)
+		}
+		out[productID] = expiry
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("inventory: pg earliest expiry rows: %w", err)
 	}
 	return out, nil
 }

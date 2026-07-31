@@ -36,6 +36,25 @@ type SalesRepo interface {
 	// within (tenantID, storeID); storeID=0 scans all of the tenant's stores.
 	// ok=false when the product has no recorded sale.
 	LastSaleDate(ctx context.Context, tenantID, storeID, productID int64) (last time.Time, ok bool, err error)
+
+	// ListDailySales reads back the fused per-product-per-day sales within the
+	// inclusive natural-day range [from, to] for (tenantID, storeID); storeID=0
+	// scans all of the tenant's stores. This is the read counterpart of
+	// UpsertDailySales and the data source the AI signal stage (M7-B) consumes
+	// for real historical-sales signals (近N天销量 / 趋势 / 滞销·畅销). Rows are
+	// returned ordered by product_id then sale_date; an empty range / no data
+	// yields an empty (non-nil) slice + nil error (best-effort, cold-start safe).
+	ListDailySales(ctx context.Context, tenantID, storeID int64, from, to time.Time) ([]DailyProductSales, error)
+}
+
+// DailyProductSales is one product's fused sales on one natural day, as read
+// back from daily_product_sales (migration 000019). It is the per-day read
+// counterpart of SaleQty (which carries no date). Qty is a sold count
+// (non-amount), never floating point.
+type DailyProductSales struct {
+	ProductID int64
+	Day       time.Time
+	Qty       int64
 }
 
 // TagWriter writes a computed BE-A-09 tag set onto one product. catalog.Service

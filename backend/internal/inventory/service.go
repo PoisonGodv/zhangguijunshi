@@ -262,6 +262,36 @@ func (s *Service) ListNearingBatches(ctx context.Context, storeID int64, withinD
 	return batches, nil
 }
 
+// EarliestExpiryByProduct returns, for the ctx tenant, each product's earliest
+// (soonest) ExpiryDate across its active, positive-quantity lots — whole-tenant
+// when storeID==0 (the dataquality 临期 sweep scope) or scoped to one store when
+// storeID>0 (M7-A). Products with no expiry-bearing lot are absent from the map.
+//
+// It delegates to the repo's optional ProductExpirer capability. When the repo
+// does not provide it the call degrades to an empty map (nil-safe, §0): 临期
+// tagging then simply does not fire rather than erroring. This is the port the
+// BE-A-09 临期 tag was missing — ListNearingBatches is per-store and returns
+// nothing for the storeID=0 sweep, so EarliestExpiry stayed nil and the tag
+// never fired.
+func (s *Service) EarliestExpiryByProduct(ctx context.Context, storeID int64) (map[int64]time.Time, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pe, ok := s.repo.(ProductExpirer)
+	if !ok {
+		return map[int64]time.Time{}, nil
+	}
+	m, err := pe.EarliestExpiryByProduct(ctx, tenantID, storeID)
+	if err != nil {
+		return nil, mapRepoErr(err)
+	}
+	if m == nil {
+		m = map[int64]time.Time{}
+	}
+	return m, nil
+}
+
 // ListMovements returns the ctx tenant's ledger entries matching f.
 func (s *Service) ListMovements(ctx context.Context, f MovementFilter) ([]*Movement, error) {
 	tenantID, err := multitenancy.EnforceTenant(ctx)

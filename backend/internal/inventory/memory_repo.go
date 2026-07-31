@@ -200,6 +200,38 @@ func (r *MemoryBatchRepo) ListNearingBatches(_ context.Context, tenantID, storeI
 	return out, nil
 }
 
+// EarliestExpiryByProduct implements the optional ProductExpirer capability
+// (M7-A). It scans every batch under a read lock and, for tenantID, returns each
+// product's earliest (soonest) ExpiryDate across its active, positive-quantity
+// lots that carry a non-nil ExpiryDate. storeID=0 spans all of the tenant's
+// stores; storeID>0 scopes to that one store. Cross-tenant lots are invisible.
+// The returned times are fresh copies so callers cannot alias stored state.
+func (r *MemoryBatchRepo) EarliestExpiryByProduct(_ context.Context, tenantID, storeID int64) (map[int64]time.Time, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make(map[int64]time.Time)
+	for _, b := range r.batches {
+		if b.TenantID != tenantID {
+			continue
+		}
+		if storeID > 0 && b.StoreID != storeID {
+			continue
+		}
+		if b.Status != BatchStatusActive || b.Quantity <= 0 {
+			continue
+		}
+		if b.ExpiryDate == nil {
+			continue
+		}
+		cur, ok := out[b.ProductID]
+		if !ok || b.ExpiryDate.Before(cur) {
+			out[b.ProductID] = *b.ExpiryDate // fresh value copy, no aliasing
+		}
+	}
+	return out, nil
+}
+
 // AppendMovement implements BatchRepo. The movement is deep-copied and assigned
 // an id; CreatedAt is stamped by the caller (service) so it can share the
 // injected clock.

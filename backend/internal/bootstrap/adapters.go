@@ -20,6 +20,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/catalog"
 	"github.com/zhangguijunshi/backend/internal/compliance/contentfilter"
 	"github.com/zhangguijunshi/backend/internal/compliance/freqcircuit"
+	"github.com/zhangguijunshi/backend/internal/dataquality"
 	"github.com/zhangguijunshi/backend/internal/groupbuy"
 	"github.com/zhangguijunshi/backend/internal/inventory"
 	"github.com/zhangguijunshi/backend/internal/margin"
@@ -305,6 +306,27 @@ func (a signalLookuperAdapter) Members(ctx context.Context, _ int64) (signal.Mem
 
 func (a signalLookuperAdapter) DailyTxn(_ context.Context, _, _ int64, _ string) (signal.TxnSig, error) {
 	return signal.TxnSig{}, nil
+}
+
+// salesProviderAdapter adapts dataquality.SalesRepo.ListDailySales onto
+// signal.SalesProvider (M7-B): the fused daily_product_sales rows become the
+// signal stage's real historical-sales input. nil repo → nil slice (degraded,
+// no error), so an unwired store never breaks Collect.
+type salesProviderAdapter struct{ repo dataquality.SalesRepo }
+
+func (a salesProviderAdapter) DailySales(ctx context.Context, tenantID, storeID int64, from, to time.Time) ([]signal.DailySale, error) {
+	if a.repo == nil {
+		return nil, nil
+	}
+	rows, err := a.repo.ListDailySales(ctx, tenantID, storeID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]signal.DailySale, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, signal.DailySale{ProductID: r.ProductID, Day: r.Day, Qty: r.Qty})
+	}
+	return out, nil
 }
 
 // couponIssuerAdapter adapts marketing.Service.Issue to exec.CouponIssuer.
