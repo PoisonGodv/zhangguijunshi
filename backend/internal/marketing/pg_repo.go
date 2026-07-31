@@ -48,6 +48,14 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// txBeginner is the optional transaction surface used by IssueToMember to make
+// the quota increment + member-coupon insert all-or-nothing. Both *pgxpool.Pool
+// and pgxmock satisfy it; a pool lacking BeginTx degrades to the legacy
+// two-step (autocommit) path so the repo stays functional over any PGPool.
+type txBeginner interface {
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
+}
+
 // Compile-time guarantee that PGCouponRepo satisfies the frozen CouponRepo.
 var _ CouponRepo = (*PGCouponRepo)(nil)
 
@@ -345,8 +353,12 @@ func (r *PGCouponRepo) ListCoupons(ctx context.Context, tenantID int64, f Coupon
 //  1. Load coupon (tenant-scoped); ErrNotFound when absent/cross-tenant.
 //  2. Go validation: active + within valid window → else ErrCouponInactive.
 //  3. Quota pre-check: issued>=quota → ErrQuotaExhausted (clear error, no write).
-//  4. Conditional UPDATE issued=issued+1 WHERE under quota (race-safe);
-//     pgx.ErrNoRows → quota raced → ErrQuotaExhausted.
+//  4. Conditional UPDATE issued=issued+1 WHERE under quota (race-safe) and the
+//     member-coupon INSERT run inside ONE transaction so a failed INSERT rolls
+//     the increment back (no issued leak, quota self-heals). The conditional
+//     UPDATE's pgx.ErrNoRows → quota raced → Rollback + ErrQuotaExhausted; an
+//     INSERT failure → Rollback (issued not incremented). Success → Commit.
+//     A pool lacking BeginTx degrades to the legacy autocommit two-step path.
 //  5. Resolve expire (caller's expireAt else coupon.ValidTo) and INSERT the
 //     member-coupon, RETURNING the full row.
 func (r *PGCouponRepo) IssueToMember(ctx context.Context, tenantID, memberID, couponID int64, source string, strategyID int64, expireAt *time.Time, now time.Time) (*MemberCoupon, error) {
@@ -369,13 +381,6 @@ func (r *PGCouponRepo) IssueToMember(ctx context.Context, tenantID, memberID, co
 	if c.TotalQuota > 0 && c.Issued >= c.TotalQuota {
 		return nil, ErrQuotaExhausted
 	}
-	var newIssued int64
-	if err := r.pool.QueryRow(ctx, sqlCouponIncrementIssued, tenantID, couponID).Scan(&newIssued); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrQuotaExhausted
-		}
-		return nil, fmt.Errorf("marketing: pg issue increment: %w", err)
-	}
 	exp := expireAt
 	if exp == nil {
 		v := c.ValidTo
@@ -385,8 +390,70 @@ func (r *PGCouponRepo) IssueToMember(ctx context.Context, tenantID, memberID, co
 	if src == "" {
 		src = SourceManual
 	}
+
+	// Transactional path: the quota increment and the member-coupon insert are
+	// all-or-nothing. *pgxpool.Pool and pgxmock both satisfy txBeginner.
+	if beginner, ok := r.pool.(txBeginner); ok {
+		return r.issueTx(ctx, beginner, tenantID, memberID, couponID, src, strategyID, *exp, now)
+	}
+	// Degrade: pool without BeginTx — legacy autocommit two-step (the increment
+	// can leak on INSERT failure, but this path only runs over a non-tx pool).
+	return r.issueTwoStep(ctx, tenantID, memberID, couponID, src, strategyID, *exp, now)
+}
+
+// issueTx runs the quota increment + member-coupon insert inside one pgx
+// transaction so a failed INSERT rolls the issued++ back (no quota leak).
+func (r *PGCouponRepo) issueTx(ctx context.Context, beginner txBeginner, tenantID, memberID, couponID int64, src string, strategyID int64, exp, now time.Time) (*MemberCoupon, error) {
+	tx, err := beginner.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("marketing: pg issue begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	// Conditional increment: issued advances only while still under quota.
+	// ErrNoRows → quota raced away → Rollback (issued untouched) + sentinel.
+	var newIssued int64
+	if err := tx.QueryRow(ctx, sqlCouponIncrementIssued, tenantID, couponID).Scan(&newIssued); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrQuotaExhausted
+		}
+		return nil, fmt.Errorf("marketing: pg issue increment: %w", err)
+	}
+
+	// Insert the member-coupon. Any failure (e.g. UNIQUE violation) rolls the
+	// increment back so issued never leaks and the quota self-heals.
+	mc, err := scanMemberCoupon(tx.QueryRow(ctx, sqlMCInsert,
+		tenantID, memberID, couponID, MCStatusUnused, src, nullIntID(strategyID), now, exp,
+	))
+	if err != nil {
+		return nil, fmt.Errorf("marketing: pg issue insert member-coupon: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("marketing: pg issue commit: %w", err)
+	}
+	committed = true
+	return mc, nil
+}
+
+// issueTwoStep is the legacy autocommit fallback for a pool lacking BeginTx:
+// the conditional increment and the member-coupon insert run as two separate
+// statements. Preserved so the repo stays functional over any PGPool.
+func (r *PGCouponRepo) issueTwoStep(ctx context.Context, tenantID, memberID, couponID int64, src string, strategyID int64, exp, now time.Time) (*MemberCoupon, error) {
+	var newIssued int64
+	if err := r.pool.QueryRow(ctx, sqlCouponIncrementIssued, tenantID, couponID).Scan(&newIssued); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrQuotaExhausted
+		}
+		return nil, fmt.Errorf("marketing: pg issue increment: %w", err)
+	}
 	mc, err := scanMemberCoupon(r.pool.QueryRow(ctx, sqlMCInsert,
-		tenantID, memberID, couponID, MCStatusUnused, src, nullIntID(strategyID), now, *exp,
+		tenantID, memberID, couponID, MCStatusUnused, src, nullIntID(strategyID), now, exp,
 	))
 	if err != nil {
 		return nil, fmt.Errorf("marketing: pg issue insert member-coupon: %w", err)

@@ -12,6 +12,7 @@ package marketing
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -187,13 +188,16 @@ func TestPGCouponRepo_ListCoupons(t *testing.T) {
 func TestPGCouponRepo_IssueToMember(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGCouponRepo(mock)
-	// Step 1: load coupon (active, in-window, under quota).
+	// Step 1: load coupon (active, in-window, under quota) — outside the tx.
 	mock.ExpectQuery(sqlCouponGetByID).
 		WithArgs(int64(1), int64(3)).
 		WillReturnRows(pgxmock.NewRows(couponColumns()).AddRow(
 			int64(3), int64(1), int64(10), "券", TypeCash, []byte(`{}`),
 			validFrom, validTo, int64(10), int64(3), StatusActive, int64(5), fixedTime, fixedTime,
 		))
+	// Steps 2+3 run inside ONE transaction (quota increment + member-coupon
+	// insert are all-or-nothing).
+	mock.ExpectBegin()
 	// Step 2: conditional increment RETURNING issued (3 → 4).
 	mock.ExpectQuery(sqlCouponIncrementIssued).
 		WithArgs(int64(1), int64(3)).
@@ -205,6 +209,7 @@ func TestPGCouponRepo_IssueToMember(t *testing.T) {
 			int64(99), int64(1), int64(7), int64(3), MCStatusUnused, SourceAIStrategy, int64(55),
 			fixedTime, nil, validTo, nil,
 		))
+	mock.ExpectCommit()
 	mc, err := repo.IssueToMember(context.Background(), 1, 7, 3, SourceAIStrategy, 55, nil, fixedTime)
 	require.NoError(t, err)
 	require.Equal(t, int64(99), mc.ID)
@@ -236,18 +241,54 @@ func TestPGCouponRepo_IssueToMemberRacedQuota(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGCouponRepo(mock)
 	// Pre-check passes (9 < 10) but the conditional UPDATE returns no rows:
-	// a concurrent issuer took the last slot between read and update.
+	// a concurrent issuer took the last slot between read and update. The tx
+	// rolls back (issued untouched) and surfaces ErrQuotaExhausted.
 	mock.ExpectQuery(sqlCouponGetByID).
 		WithArgs(int64(1), int64(3)).
 		WillReturnRows(pgxmock.NewRows(couponColumns()).AddRow(
 			int64(3), int64(1), int64(10), "券", TypeCash, []byte(`{}`),
 			validFrom, validTo, int64(10), int64(9), StatusActive, int64(5), fixedTime, fixedTime,
 		))
+	mock.ExpectBegin()
 	mock.ExpectQuery(sqlCouponIncrementIssued).
 		WithArgs(int64(1), int64(3)).
 		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
 	_, err := repo.IssueToMember(context.Background(), 1, 7, 3, SourceManual, 0, nil, fixedTime)
 	require.ErrorIs(t, err, ErrQuotaExhausted)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGCouponRepo_IssueToMemberInsertFailsRollsBack is the regression test for
+// the issued-leak bug: the conditional issued++ used to autocommit before the
+// member-coupon INSERT, so a failed INSERT (e.g. UNIQUE violation) permanently
+// leaked one unit of quota with no member-coupon to show for it. Now both run
+// in one transaction, so the INSERT failure must Rollback — issued is NOT
+// incremented and the quota self-heals.
+func TestPGCouponRepo_IssueToMemberInsertFailsRollsBack(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGCouponRepo(mock)
+	// Load coupon (active, in-window, under quota) — outside the tx.
+	mock.ExpectQuery(sqlCouponGetByID).
+		WithArgs(int64(1), int64(3)).
+		WillReturnRows(pgxmock.NewRows(couponColumns()).AddRow(
+			int64(3), int64(1), int64(10), "券", TypeCash, []byte(`{}`),
+			validFrom, validTo, int64(10), int64(3), StatusActive, int64(5), fixedTime, fixedTime,
+		))
+	mock.ExpectBegin()
+	// Increment succeeds inside the tx (3 → 4)...
+	mock.ExpectQuery(sqlCouponIncrementIssued).
+		WithArgs(int64(1), int64(3)).
+		WillReturnRows(pgxmock.NewRows([]string{"issued"}).AddRow(int64(4)))
+	// ...but the member-coupon INSERT fails (e.g. duplicate key).
+	mock.ExpectQuery(sqlMCInsert).
+		WithArgs(int64(1), int64(7), int64(3), MCStatusUnused, SourceManual, nil, fixedTime, validTo).
+		WillReturnError(errors.New(`ERROR: duplicate key value violates unique constraint "member_coupons_tenant_id_member_id_coupon_id_issued_at_key"`))
+	// The increment must be rolled back — no Commit, issued stays at 3.
+	mock.ExpectRollback()
+	_, err := repo.IssueToMember(context.Background(), 1, 7, 3, SourceManual, 0, nil, fixedTime)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "insert member-coupon")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
