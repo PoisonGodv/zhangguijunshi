@@ -84,10 +84,24 @@ type AccountRepo interface {
 	// BumpVersion atomically increments users.version for the account and returns
 	// the new value. This is the hook for revoke-on-password-change: bumping
 	// version invalidates every previously issued token (their ver no longer
-	// matches). Returns ErrAccountNotFound when no row was updated. The
-	// password-change flow that calls this is a follow-up; the capability lands
-	// now so callers (and tests) can rely on it.
+	// matches). Returns ErrAccountNotFound when no row was updated.
 	BumpVersion(ctx context.Context, id int64) (int64, error)
+
+	// FindByID loads an active account by primary key within tenantID. Used by
+	// the password-change flow to re-load the account after identifying it from
+	// the verified JWT — the tenant scope (ARCH-01) means a cross-tenant id can
+	// never be loaded, so a forged account_id in a token from another tenant
+	// resolves to ErrAccountNotFound rather than to someone else's row.
+	FindByID(ctx context.Context, tenantID, id int64) (*Account, error)
+
+	// UpdatePassword writes the new bcrypt hash for the account. It does NOT bump
+	// version — that is a separate explicit BumpVersion call so ChangePassword
+	// controls ordering (write hash → bump version → invalidate cached tokens).
+	// Scoped by id (the caller has already tenant-verified the account via
+	// FindByID). Returns ErrAccountNotFound when no row was updated (concurrent
+	// delete / unknown id) so the caller can distinguish a missing account from a
+	// real DB fault.
+	UpdatePassword(ctx context.Context, id int64, newHash string) error
 }
 
 // phonePepper is the fixed app-level salt folded into phone_hash. The users

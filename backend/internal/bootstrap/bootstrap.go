@@ -83,8 +83,9 @@ type Services struct {
 
 	// Auth + C-side auth (wxshop login) / boss+admin password login share one
 	// AuthService; the AccountRepo drives the real BE-A-01 login.
-	AuthSvc     *auth.AuthService
-	AccountRepo auth.AccountRepo
+	AuthSvc      *auth.AuthService
+	AccountRepo  auth.AccountRepo
+	VersionStore auth.VersionStore
 
 	// Domain services.
 	Catalog      *catalog.Service
@@ -247,6 +248,19 @@ func BuildServices(ctx context.Context, cfg *config.Config, log *zap.Logger, inf
 		}, wxsdk.New(wxOpts...), jwtMgr, sessStore, consumerRepo)
 		s.AuthSvc = authSvc.WithAccountRepo(accountRepo)
 		s.AccountRepo = accountRepo
+
+		// VersionStore (CONTRACT §20.6): caches each account's current
+		// token-version so the Auth middleware can enforce the JWT `ver` claim
+		// (revoke-on-password-change) WITHOUT a per-request DB hit. Redis when a
+		// client is wired (cross-process safe under horizontal api scale), else
+		// in-memory (single-process dev). nil-safe at the middleware layer: a
+		// nil store disables the ver check (best-effort availability).
+		var versionStore auth.VersionStore = auth.NewMemoryVersionStore()
+		if jobCmd != nil {
+			versionStore = auth.NewRedisVersionStore(jobCmd)
+		}
+		s.AuthSvc = s.AuthSvc.WithVersionStore(versionStore)
+		s.VersionStore = versionStore
 	}
 
 	// ---- M1-S1 catalog + billing (CONTRACT §8). ----

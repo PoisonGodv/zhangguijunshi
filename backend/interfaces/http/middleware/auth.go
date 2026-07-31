@@ -35,9 +35,22 @@ type jtiBlocker interface {
 	IsBlocked(ctx context.Context, jti string) (bool, error)
 }
 
+// versionChecker is the optional per-(scene,userID) current-version lookup the
+// Auth middleware uses to enforce the JWT `ver` claim (CONTRACT §20.5). It is
+// satisfied by a thin adapter around auth.VersionStore (auth.VersionChecker).
+// The indirection keeps this package auth-agnostic (no import of internal/auth);
+// the router constructs the adapter and passes it in. A nil checker disables the
+// ver check entirely (backward compatible — every existing call that passes nil
+// behaves exactly as before).
+type versionChecker interface {
+	CurrentVersion(ctx context.Context, scene string, userID int64) (int64, error)
+}
+
 // Auth returns a gin middleware that authenticates via ES256 JWT. A missing or
-// invalid token short-circuits with errcode.ErrTokenInvalid (40101).
-func Auth(verifier tokenVerifier, blocker jtiBlocker) gin.HandlerFunc {
+// invalid token short-circuits with errcode.ErrTokenInvalid (40101). When a
+// versionChecker is supplied, a token whose `ver` is behind the account's
+// current version (password changed / kicked) is also rejected as stale.
+func Auth(verifier tokenVerifier, blocker jtiBlocker, checker versionChecker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw := extractBearer(c.GetHeader("Authorization"))
 		if raw == "" {
@@ -59,6 +72,31 @@ func Auth(verifier tokenVerifier, blocker jtiBlocker) gin.HandlerFunc {
 				return
 			}
 			if blocked {
+				httpx.Fail(c, errcode.ErrTokenInvalid)
+				c.Abort()
+				return
+			}
+		}
+
+		// ver claim enforcement (CONTRACT §20.5): if a versionChecker is wired,
+		// compare the token's ver against the account's current cached version.
+		// cur > claims.Version means the token was minted before a password
+		// change / kick → stale → reject (ErrTokenInvalid, 40101).
+		//
+		// TRADE-OFF (best-effort, availability-first): a cache miss (cur == 0) or
+		// a checker error MUST allow. The version cache is a Redis flap surface;
+		// if it goes down we MUST NOT lock every authenticated user out (§0
+		// nil-safe philosophy). So a stale token only fails when the cache can
+		// authoritatively say it is stale; otherwise it passes. The keying
+		// (claims.Scene, parseSubjectID(claims.Subject)) is exactly what login
+		// writes via VersionStore.Set, so a warmed cache always has the baseline.
+		//
+		// Note: no `claims.Version > 0` short-circuit here. An account starts at
+		// version 0 and the FIRST password change bumps 0 -> 1; guarding on
+		// claims.Version > 0 would let ver-0 tokens survive that first change.
+		// The cost is one cache lookup per request; the correctness is required.
+		if checker != nil {
+			if cur, cErr := checker.CurrentVersion(c.Request.Context(), claims.Scene, parseSubjectID(claims.Subject)); cErr == nil && cur > 0 && cur > claims.Version {
 				httpx.Fail(c, errcode.ErrTokenInvalid)
 				c.Abort()
 				return

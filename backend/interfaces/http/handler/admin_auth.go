@@ -12,6 +12,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
+	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
 // AdminAuthHandler exposes the platform-admin auth endpoints.
@@ -72,4 +73,30 @@ func (h *AdminAuthHandler) Logout(c *gin.Context) {
 		return
 	}
 	httpx.OK(c, gin.H{"logged_out": true})
+}
+
+// ChangePassword verifies the old password, writes a new hash, and bumps the
+// account's token version (invalidating all previously-issued tokens via the
+// middleware ver check). The account id + tenant come from the verified JWT
+// context, NEVER the body (ARCH-01). Reuses the shared changePasswordRequest
+// shape defined in boss_auth.go. On success the client MUST re-login (the
+// version bump invalidates the current session by design).
+// POST /v1/admin/auth/password
+func (h *AdminAuthHandler) ChangePassword(c *gin.Context) {
+	var req changePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	tc, ok := multitenancy.FromContext(c.Request.Context())
+	if !ok || tc.UserID == 0 {
+		httpx.Fail(c, errcode.ErrTokenInvalid)
+		return
+	}
+	acc, err := h.svc.ChangePassword(c.Request.Context(), tc.TenantID, tc.UserID, req.OldPassword, req.NewPassword)
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"changed": true, "version": acc.Version})
 }

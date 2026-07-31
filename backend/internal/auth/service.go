@@ -39,7 +39,8 @@ type AuthService struct {
 	jwt          *jwt.Manager
 	store        jwt.SessionStore
 	repo         ConsumerRepo
-	accountRepo  AccountRepo // staff-account repo; nil disables boss/admin login (CONTRACT §19)
+	accountRepo  AccountRepo  // staff-account repo; nil disables boss/admin login (CONTRACT §19)
+	versionStore VersionStore // token-version cache; nil disables ver enforcement (CONTRACT §20.5)
 	appID        string
 	secret       string
 	accessTTL    time.Duration
@@ -199,6 +200,12 @@ func (s *AuthService) issuePair(ctx context.Context, c *Consumer) (*LoginResult,
 	}, s.refreshTTL)
 	if err != nil {
 		return nil, errcode.ErrInternal
+	}
+	// Seed the version cache so the middleware's ver check has a baseline to
+	// compare against (nil store -> skip; ver check stays best-effort). Keyed by
+	// (SceneConsumer, c.ID) which == (claims.Scene, parseSubjectID(subject)).
+	if s.versionStore != nil {
+		_ = s.versionStore.Set(ctx, jwt.SceneConsumer, c.ID, c.Version)
 	}
 	return &LoginResult{
 		AccessToken:  access,

@@ -118,6 +118,54 @@ func TestMemoryRepo_BumpVersion(t *testing.T) {
 	require.ErrorIs(t, err, ErrAccountNotFound)
 }
 
+// TestMemoryRepo_FindByID proves FindByID is tenant-scoped: same-tenant loads,
+// cross-tenant / unknown / soft-deleted all miss (ARCH-01).
+func TestMemoryRepo_FindByID(t *testing.T) {
+	repo := NewMemoryAccountRepo()
+	seeded, err := repo.SeedAccount(1, 1, "find me", "13700000000", "manager", "pw12345")
+	require.NoError(t, err)
+
+	got, err := repo.FindByID(t.Context(), 1, seeded.ID)
+	require.NoError(t, err)
+	require.Equal(t, seeded.ID, got.ID)
+	require.Equal(t, int64(1), got.TenantID)
+	require.Equal(t, "manager", got.Role)
+
+	// Cross-tenant id behaves as absent.
+	_, err = repo.FindByID(t.Context(), 2, seeded.ID)
+	require.ErrorIs(t, err, ErrAccountNotFound)
+	// Unknown id.
+	_, err = repo.FindByID(t.Context(), 1, 999999)
+	require.ErrorIs(t, err, ErrAccountNotFound)
+}
+
+// TestMemoryRepo_UpdatePassword proves UpdatePassword overwrites the hash
+// (without bumping version) and the new hash verifies on the next read.
+func TestMemoryRepo_UpdatePassword(t *testing.T) {
+	repo := NewMemoryAccountRepo()
+	seeded, err := repo.SeedAccount(1, 1, "pw ops", "13800000077", "owner", "oldpw12345")
+	require.NoError(t, err)
+
+	before, err := repo.FindByID(t.Context(), 1, seeded.ID)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), before.Version) // version untouched by UpdatePassword
+	require.NoError(t, VerifyPassword(before.PasswordHash, "oldpw12345"))
+
+	newHash, err := HashPassword("newpw12345")
+	require.NoError(t, err)
+	require.NoError(t, repo.UpdatePassword(t.Context(), seeded.ID, newHash))
+
+	after, err := repo.FindByID(t.Context(), 1, seeded.ID)
+	require.NoError(t, err)
+	require.Equal(t, newHash, after.PasswordHash)
+	require.Equal(t, int64(0), after.Version) // still 0 — UpdatePassword does NOT bump
+	require.NoError(t, VerifyPassword(after.PasswordHash, "newpw12345"))
+	require.Error(t, VerifyPassword(after.PasswordHash, "oldpw12345")) // old pw dead
+
+	// Unknown id.
+	require.ErrorIs(t, repo.UpdatePassword(t.Context(), 999999, newHash), ErrAccountNotFound)
+}
+
 func TestSentinels_AreErrcodeTyped(t *testing.T) {
 	// All three must satisfy errcode.Err so httpx.FailError maps them without a
 	// handler type switch, and must carry distinct, sensible codes.

@@ -42,6 +42,19 @@ WHERE tenant_id = $1 AND username = $2 AND deleted_at IS NULL AND status = 'acti
 LIMIT 1`
 	sqlAccountTouchLogin  = `UPDATE users SET last_login_at = now() WHERE id = $1`
 	sqlAccountBumpVersion = `UPDATE users SET version = version + 1 WHERE id = $1 RETURNING version`
+	// sqlAccountByID reuses the active-row + tenant scope so a cross-tenant or
+	// soft-deleted id behaves as absent. The password-change flow identifies the
+	// account from the JWT (tenant_id + account_id), and this is the chokepoint
+	// that makes a cross-tenant forged id resolve to ErrAccountNotFound.
+	sqlAccountByID = `SELECT id, tenant_id, store_id, name, role, status, password_hash, version, last_login_at
+FROM users
+WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL AND status = 'active'
+LIMIT 1`
+	// sqlAccountUpdatePassword writes only the hash; version is untouched here.
+	// ChangePassword calls BumpVersion separately so the version cache can be
+	// invalidated in lock-step with the hash write. RowsAffected()==0 means the
+	// id no longer exists → the caller maps that to ErrAccountNotFound.
+	sqlAccountUpdatePassword = `UPDATE users SET password_hash = $2 WHERE id = $1`
 )
 
 // scanAccount decodes one users row into an Account. store_id, password_hash
@@ -131,4 +144,39 @@ func (r *PGAccountRepo) BumpVersion(ctx context.Context, id int64) (int64, error
 		return 0, fmt.Errorf("auth: pg account bump version: %w", err)
 	}
 	return v, nil
+}
+
+// FindByID implements AccountRepo. The tenant scope (tenant_id = $1) is the
+// ARCH-01 row-level isolation guard: a cross-tenant id resolves to no row →
+// ErrAccountNotFound. A nil pool degrades to ErrAccountNotFound (nil-safe §0).
+func (r *PGAccountRepo) FindByID(ctx context.Context, tenantID, id int64) (*Account, error) {
+	if r == nil || r.pool == nil {
+		return nil, ErrAccountNotFound
+	}
+	a, err := scanAccount(r.pool.QueryRow(ctx, sqlAccountByID, tenantID, id))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAccountNotFound
+		}
+		return nil, fmt.Errorf("auth: pg account find by id: %w", err)
+	}
+	return a, nil
+}
+
+// UpdatePassword implements AccountRepo: writes the new bcrypt hash WITHOUT
+// bumping version (BumpVersion is a separate explicit call). Zero rows affected
+// (unknown / soft-deleted id) degrades to ErrAccountNotFound; other DB faults
+// are wrapped. A nil pool degrades to ErrAccountNotFound (nil-safe §0).
+func (r *PGAccountRepo) UpdatePassword(ctx context.Context, id int64, newHash string) error {
+	if r == nil || r.pool == nil {
+		return ErrAccountNotFound
+	}
+	tag, err := r.pool.Exec(ctx, sqlAccountUpdatePassword, id, newHash)
+	if err != nil {
+		return fmt.Errorf("auth: pg account update password: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAccountNotFound
+	}
+	return nil
 }

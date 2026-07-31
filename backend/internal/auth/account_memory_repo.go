@@ -172,3 +172,32 @@ func (r *MemoryAccountRepo) BumpVersion(_ context.Context, id int64) (int64, err
 	acc.Version++
 	return acc.Version, nil
 }
+
+// FindByID implements AccountRepo; it loads an active account by primary key
+// within tenantID. Cross-tenant or inactive ids behave as absent
+// (ErrAccountNotFound) — the tenant scope enforces row-level isolation.
+func (r *MemoryAccountRepo) FindByID(_ context.Context, tenantID, id int64) (*Account, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	acc, ok := r.byID[id]
+	if !ok || acc.TenantID != tenantID || acc.Status != "active" {
+		return nil, ErrAccountNotFound
+	}
+	cp := *acc
+	return &cp, nil
+}
+
+// UpdatePassword implements AccountRepo; it overwrites the stored bcrypt hash.
+// It does NOT bump version (ChangePassword calls BumpVersion explicitly so the
+// version cache is invalidated in step with the hash write). Unknown id →
+// ErrAccountNotFound.
+func (r *MemoryAccountRepo) UpdatePassword(_ context.Context, id int64, newHash string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	acc, ok := r.byID[id]
+	if !ok {
+		return ErrAccountNotFound
+	}
+	acc.PasswordHash = newHash
+	return nil
+}

@@ -7,14 +7,22 @@
 //	                     both AI caches)
 //	reach_due_send     → reach Service.Send (deferred message whose window opened)
 //
+// It runs TWO Redis loops side by side (CONTRACT §20.3):
+//   - jobqueue.Consumer drains the live Stream (XREADGROUP) and dispatches.
+//   - jobqueue.DelayPump sweeps the <stream>:delay ZSET and XADDs due members
+//     onto the live Stream once their RunAt arrives. This is what makes a
+//     scheduled (future RunAt) message actually wait — without it, the consumer
+//     would fire it the instant the producer enqueued it. The pump is a shared
+//     mechanism; every job type with a future RunAt benefits automatically.
+//
 // Nil-safe degradation (CONTRACT §0): with no Redis (local dev) there is nothing
 // to consume, so the worker logs and exits 0 cleanly instead of spinning. With
 // no scheduler / reach wired the corresponding job is logged + dropped (nil) so
 // a missing dependency never wedges the stream.
 //
 // The binary owns ONLY: config + logger, BuildServices, the redis.Cmdable
-// decision, the consumer lifecycle, and graceful shutdown on SIGINT/SIGTERM. All
-// domain wiring lives in internal/bootstrap.
+// decision, the consumer + pump lifecycles, and graceful shutdown on
+// SIGINT/SIGTERM. All domain wiring lives in internal/bootstrap.
 package main
 
 import (
@@ -36,9 +44,10 @@ import (
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
-// shutdownGrace bounds how long run waits for the consumer's Run loop to drain
-// after cancel before giving up and closing infra. The idle loop paces itself
-// on the XREADGROUP BLOCK (cfg.JobQueue.Block), so a few seconds is generous.
+// shutdownGrace bounds how long run waits for the consumer's and pump's Run
+// loops to drain after cancel before giving up and closing infra. The consumer's
+// idle loop paces itself on the XREADGROUP BLOCK (cfg.JobQueue.Block); the pump
+// paces on its sweep interval. A few seconds is generous for both.
 const shutdownGrace = 5 * time.Second
 
 func main() {
@@ -88,39 +97,66 @@ func run() error {
 	}
 
 	consumer := jobqueue.NewConsumer(cmdable, cfg.JobQueue, &dispatcher{svc: svc})
+	// DelayPump moves future-RunAt jobs out of the <stream>:delay ZSET and onto
+	// the live Stream once they are due, so the consumer above actually delivers
+	// them at RunAt (CONTRACT §20.3). Same cfg.JobQueue so producer (api) and
+	// pump (worker) resolve the same stream + delay lane.
+	pump := jobqueue.NewDelayPump(cmdable, cfg.JobQueue)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	runErr := make(chan error, 1)
-	go func() {
-		runErr <- consumer.Run(ctx)
-	}()
+	// Both loops return nil on clean ctx cancel; the pump is nil-safe just like
+	// the consumer (a nil cmdable already exited above, so both really run here).
+	type runResult struct {
+		name string
+		err  error
+	}
+	results := make(chan runResult, 2)
+	go func() { results <- runResult{"consumer", consumer.Run(ctx)} }()
+	go func() { results <- runResult{"pump", pump.Run(ctx)} }()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	// drainRemaining waits (bounded by shutdownGrace PER remaining loop) for the
+	// goroutines still outstanding after cancel. already is how many have already
+	// reported (0 on signal path, 1 on the "loop stopped on its own" path).
+	drainRemaining := func(already int) error {
+		for i := 0; i < 2-already; i++ {
+			select {
+			case r := <-results:
+				if r.err != nil {
+					return fmt.Errorf("%s run: %w", r.name, r.err)
+				}
+			case <-time.After(shutdownGrace):
+				log.Warn("loop did not stop within grace period",
+					zap.Duration("grace", shutdownGrace))
+			}
+		}
+		return nil
+	}
 
 	select {
 	case sig := <-stop:
 		log.Info("shutdown signal received", zap.String("signal", sig.String()))
 		cancel()
-		// Wait (bounded) for the read loop to drain before closing infra.
-		select {
-		case err := <-runErr:
-			if err != nil {
-				return fmt.Errorf("consumer run: %w", err)
-			}
-		case <-time.After(shutdownGrace):
-			log.Warn("consumer did not stop within grace period",
-				zap.Duration("grace", shutdownGrace))
+		// Wait (bounded) for both loops to drain before closing infra.
+		if err := drainRemaining(0); err != nil {
+			return err
 		}
-	case err := <-runErr:
-		// Run returned on its own (nil client, or a fatal group-create error).
+	case r := <-results:
+		// One loop returned on its own (nil client handled earlier; here it is
+		// either a clean nil or a fatal group-create / sweep error). Cancel so
+		// the sibling drains too, then wait for it.
 		cancel()
-		if err != nil {
-			return fmt.Errorf("consumer run: %w", err)
+		if r.err != nil {
+			return fmt.Errorf("%s run: %w", r.name, r.err)
 		}
-		log.Info("consumer stopped on its own")
+		log.Info("loop stopped on its own", zap.String("loop", r.name))
+		if err := drainRemaining(1); err != nil {
+			return err
+		}
 	}
 
 	log.Info("shutdown complete")

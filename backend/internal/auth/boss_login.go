@@ -86,6 +86,13 @@ func (s *AuthService) signStaffPair(ctx context.Context, acc *Account, scene str
 	if err != nil {
 		return nil, errcode.ErrInternal
 	}
+	// Seed the version cache so the middleware's ver check has a baseline to
+	// compare future tokens against (nil store -> skip; ver check best-effort).
+	// Keyed by (scene, acc.ID) which == (claims.Scene, parseSubjectID(subject)),
+	// so login write and middleware read agree on the tuple (CONTRACT §20.5).
+	if s.versionStore != nil {
+		_ = s.versionStore.Set(ctx, scene, acc.ID, acc.Version)
+	}
 	return &LoginResult{
 		AccessToken:  access,
 		RefreshToken: refresh,

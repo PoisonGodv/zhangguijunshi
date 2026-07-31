@@ -146,6 +146,73 @@ func TestPGAccountRepo_BumpVersion_DBError(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPGAccountRepo_FindByID(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	hash, _ := HashPassword("boss12345")
+	// A non-zero version proves FindByID surfaces the live version column.
+	mock.ExpectQuery(sqlAccountByID).
+		WithArgs(int64(1), int64(2001)).
+		WillReturnRows(pgxmock.NewRows(accountColumns()).AddRow(
+			int64(2001), int64(1), int64(1), "demo owner", "owner", "active", hash, int64(5), fixedTime,
+		))
+	acc, err := repo.FindByID(context.Background(), 1, 2001)
+	require.NoError(t, err)
+	require.Equal(t, int64(2001), acc.ID)
+	require.Equal(t, int64(1), acc.TenantID)
+	require.Equal(t, hash, acc.PasswordHash)
+	require.Equal(t, int64(5), acc.Version) // live version column, not a constant
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGAccountRepo_FindByID_NotFound(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	// Either a cross-tenant id or a genuinely unknown id resolves to no row.
+	mock.ExpectQuery(sqlAccountByID).
+		WithArgs(int64(1), int64(9999)).
+		WillReturnError(pgx.ErrNoRows)
+	_, err := repo.FindByID(context.Background(), 1, 9999)
+	require.ErrorIs(t, err, ErrAccountNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGAccountRepo_UpdatePassword(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	newHash, _ := HashPassword("newpw12345")
+	// UPDATE affects exactly one row -> success, no error.
+	mock.ExpectExec(sqlAccountUpdatePassword).
+		WithArgs(int64(2001), newHash).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	require.NoError(t, repo.UpdatePassword(context.Background(), 2001, newHash))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGAccountRepo_UpdatePassword_NotFound(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	// Zero rows affected (unknown / soft-deleted id) -> ErrAccountNotFound.
+	mock.ExpectExec(sqlAccountUpdatePassword).
+		WithArgs(int64(9999), "irrelevant").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	err := repo.UpdatePassword(context.Background(), 9999, "irrelevant")
+	require.ErrorIs(t, err, ErrAccountNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGAccountRepo_UpdatePassword_DBError(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	mock.ExpectExec(sqlAccountUpdatePassword).
+		WithArgs(int64(2001), "x").
+		WillReturnError(errors.New("boom")) // non-NoRows DB error is wrapped
+	err := repo.UpdatePassword(context.Background(), 2001, "x")
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrAccountNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPGAccountRepo_TouchLogin(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGAccountRepo(mock)
@@ -175,11 +242,18 @@ func TestPGAccountRepo_NilPoolIsSafe(t *testing.T) {
 	require.ErrorIs(t, err, ErrAccountNotFound)
 	// TouchLogin on a nil pool is a no-op (best-effort; login flow ignores err).
 	require.NoError(t, repo.TouchLogin(context.Background(), 1))
+	// New id/write paths also degrade to ErrAccountNotFound on a nil pool.
+	_, err = repo.FindByID(context.Background(), 1, 1)
+	require.ErrorIs(t, err, ErrAccountNotFound)
+	require.ErrorIs(t, repo.UpdatePassword(context.Background(), 1, "h"), ErrAccountNotFound)
 
 	// Nil repo pointer is also safe (methods on nil *PGAccountRepo).
 	var nilRepo *PGAccountRepo
 	_, err = nilRepo.FindByPhone(context.Background(), 1, "13800000001")
 	require.ErrorIs(t, err, ErrAccountNotFound)
+	_, err = nilRepo.FindByID(context.Background(), 1, 1)
+	require.ErrorIs(t, err, ErrAccountNotFound)
+	require.ErrorIs(t, nilRepo.UpdatePassword(context.Background(), 1, "h"), ErrAccountNotFound)
 }
 
 // TestPGAccountRepo_ScanNullableTypes is a focused check that scanAccount

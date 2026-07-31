@@ -14,6 +14,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
+	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
 // BossAuthHandler exposes the boss auth endpoints.
@@ -30,6 +31,14 @@ type bossLoginRequest struct {
 	TenantID int64  `json:"tenant_id" binding:"required,min=1"`
 	Phone    string `json:"phone" binding:"required"`
 	Password string `json:"password" binding:"required"`
+}
+
+// changePasswordRequest is the body for both boss and admin password-change.
+// Only old/new passwords come from the body; the account id and tenant are taken
+// from the verified JWT context (ARCH-01) — never trusted from the body.
+type changePasswordRequest struct {
+	OldPassword string `json:"old_password" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required"`
 }
 
 // Login authenticates a staff member by phone + password.
@@ -64,4 +73,32 @@ func (h *BossAuthHandler) Logout(c *gin.Context) {
 		return
 	}
 	httpx.OK(c, gin.H{"logged_out": true})
+}
+
+// ChangePassword verifies the old password, writes a new hash, and bumps the
+// account's token version (invalidating all previously-issued tokens via the
+// middleware ver check). The account id + tenant come from the verified JWT
+// context, NEVER the body (ARCH-01). On success the client MUST re-login: the
+// version bump invalidates the current session by design (forcing a fresh
+// credential check after a password change is the secure default); this handler
+// does not re-sign a fresh pair.
+// POST /v1/boss/auth/password
+func (h *BossAuthHandler) ChangePassword(c *gin.Context) {
+	var req changePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	tc, ok := multitenancy.FromContext(c.Request.Context())
+	if !ok || tc.UserID == 0 {
+		// No resolved identity — Auth middleware did not run / token had no sub.
+		httpx.Fail(c, errcode.ErrTokenInvalid)
+		return
+	}
+	acc, err := h.svc.ChangePassword(c.Request.Context(), tc.TenantID, tc.UserID, req.OldPassword, req.NewPassword)
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"changed": true, "version": acc.Version})
 }

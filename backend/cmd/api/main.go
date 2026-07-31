@@ -73,6 +73,7 @@ func run() error {
 			JWT:          svc.JWT,
 			Store:        svc.Sess,
 			AuthSvc:      svc.AuthSvc,
+			VersionStore: svc.VersionStore,
 			Catalog:      svc.Catalog,
 			Billing:      svc.Billing,
 			Inventory:    svc.Inventory,

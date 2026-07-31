@@ -3,6 +3,16 @@
 // process's in-process producers (reach scheduled-send / pregen incremental)
 // and the worker binary's consumers.
 //
+// Delayed delivery (CONTRACT §20.3 gap closure): a Job whose RunAt is in the
+// future is NOT XADDed to the live Stream immediately — that would make a
+// "scheduled" message fire the instant the worker picks it up. Instead the
+// Producer ZADDs it into a ZSET delay lane (<stream>:delay) scored by
+// RunAt.UnixNano(), and the worker's DelayPump loop ZREM-claims each due member
+// and XADDs it onto the live Stream only once RunAt arrives. The consumer's
+// parseJob is unchanged because the pump replays the SAME four stream fields the
+// immediate path writes. Zero/past RunAt still takes the immediate XADD path, so
+// existing callers and tests are unaffected.
+//
 // Both Producer and Consumer depend only on redis.Cmdable so that:
 //   - production wires a real *redis.Client (from pkg/redisx);
 //   - tests wire an in-process miniredis client.
@@ -64,7 +74,7 @@ type Job struct {
 	Type     string    // routing key, must match a Job* constant
 	Payload  []byte    // opaque, round-tripped as a string field
 	TenantID int64     // multi-tenant scoping for the consumer handler
-	RunAt    time.Time // earliest execution hint (observability; not a delay)
+	RunAt    time.Time // earliest delivery time; future & non-zero routes into the ZSET delay lane (CONTRACT §20.3)
 }
 
 // Job type constants. Producers and consumers agree on these strings; adding a
@@ -123,6 +133,15 @@ func NewProducer(client redis.Cmdable, cfg config.JobQueueConfig) *Producer {
 // Enqueue appends job to the Stream (XADD with approximate MAXLEN trimming).
 // With a nil client it logs a warning and returns nil so dev (no Redis) never
 // breaks a request flow on the queue being absent.
+//
+// Routing (CONTRACT §20.3):
+//   - RunAt zero or in the past → immediate XADD (unchanged; fieldRunAt still
+//     stamped for observability).
+//   - RunAt in the future → ZADD into the <stream>:delay ZSET scored by
+//     RunAt.UnixNano(); the worker's DelayPump later moves it onto the live
+//     Stream once RunAt arrives. The ZSET member is the serialized field map
+//     (see encodeDelayMember) so the pump can replay the exact same four fields
+//     the immediate path writes — parseJob stays unchanged.
 func (p *Producer) Enqueue(ctx context.Context, job Job) error {
 	if p == nil || p.client == nil {
 		// dev 无 Redis：记一条警告后干净退化为 no-op，不阻断业务。
@@ -130,14 +149,43 @@ func (p *Producer) Enqueue(ctx context.Context, job Job) error {
 			job.Type, job.TenantID)
 		return nil
 	}
+
+	// Build the canonical four stream fields once; both branches write the same
+	// field set so the consumer's parseJob decodes either path identically.
+	fields := map[string]string{
+		fieldType:    job.Type,
+		fieldPayload: string(job.Payload),
+		fieldTenant:  strconv.FormatInt(job.TenantID, 10),
+		fieldRunAt:   strconv.FormatInt(job.RunAt.UnixNano(), 10),
+	}
+
+	// 延迟投递：RunAt 在未来 → 进 ZSET 延迟队列，由 worker 端 DelayPump 到点搬运。
+	if now := time.Now(); !job.RunAt.IsZero() && job.RunAt.After(now) {
+		member, err := encodeDelayMember(fields)
+		if err != nil {
+			return fmt.Errorf("jobqueue: encode delay member: %w", err)
+		}
+		zset := p.delayZset()
+		if err := p.client.ZAdd(ctx, zset, redis.Z{
+			Score:  float64(job.RunAt.UnixNano()),
+			Member: member,
+		}).Err(); err != nil {
+			return fmt.Errorf("jobqueue: zadd delay: %w", err)
+		}
+		log.Printf("jobqueue: delayed enqueue type=%s tenant=%d run_at=%s (zset=%s)",
+			job.Type, job.TenantID, job.RunAt.UTC().Format(time.RFC3339Nano), zset)
+		return nil
+	}
+
+	// 立即投递：XADD + MAXLEN ~ N 近似裁剪（原行为不变）。
 	args := &redis.XAddArgs{
 		Stream: p.stream,
 		Approx: true, // MAXLEN ~ N : 近似裁剪，摊薄 XADD 延迟
 		Values: map[string]interface{}{
-			fieldType:    job.Type,
-			fieldPayload: string(job.Payload),
-			fieldTenant:  strconv.FormatInt(job.TenantID, 10),
-			fieldRunAt:   strconv.FormatInt(job.RunAt.UnixNano(), 10),
+			fieldType:    fields[fieldType],
+			fieldPayload: fields[fieldPayload],
+			fieldTenant:  fields[fieldTenant],
+			fieldRunAt:   fields[fieldRunAt],
 		},
 	}
 	if p.maxLen > 0 {
@@ -149,6 +197,14 @@ func (p *Producer) Enqueue(ctx context.Context, job Job) error {
 	}
 	log.Printf("jobqueue: enqueued type=%s tenant=%d id=%s", job.Type, job.TenantID, id)
 	return nil
+}
+
+// delayZset returns the ZSET key used as the delay lane. It is DERIVED from the
+// Stream name so the producer (api process) and the DelayPump (worker process)
+// agree on the same lane without a separate config field: <stream>:delay. With
+// the default stream "zg:jobs" this is "zg:jobs:delay".
+func (p *Producer) delayZset() string {
+	return delayZsetName(p.stream)
 }
 
 // --------------------------- Consumer ---------------------------

@@ -37,3 +37,20 @@ services:
     # 的 ports 列表（compose v2.20+ 支持），避免 8080 冲突。
     ports: !override
       - "18080:8080"
+
+  # worker / cron 复用 backend 镜像 + 同一组合根（internal/bootstrap），同样
+  # 需要真实 ES256 密钥（BuildServices 会 init jwt）。prod.yml 里这两个服务没有
+  # 挂密钥卷，这里补上同一把本地生成的 key，避免它们回落到 DevKey 或直接 fatal。
+  backend-worker:
+    volumes:
+      - ./secrets/jwt-key.pem:/app/configs/jwt-key.pem:ro
+    environment:
+      ZG_JWT_KEY_FILE: /app/configs/jwt-key.pem
+      ZG_JWT_KEY_ID: local-prod-1
+
+  backend-cron:
+    volumes:
+      - ./secrets/jwt-key.pem:/app/configs/jwt-key.pem:ro
+    environment:
+      ZG_JWT_KEY_FILE: /app/configs/jwt-key.pem
+      ZG_JWT_KEY_ID: local-prod-1

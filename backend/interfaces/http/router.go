@@ -56,6 +56,13 @@ type Deps struct {
 	JWT     *jwt.Manager
 	Store   jwt.SessionStore
 	AuthSvc *auth.AuthService
+	// VersionStore caches each account's current token-version so the JWT
+	// middleware can enforce the `ver` claim without a per-request DB hit
+	// (CONTRACT §20.5). nil disables ver enforcement (best-effort allow — the
+	// degraded mode for local dev without Redis). Bootstrap constructs a
+	// RedisVersionStore (prod) or MemoryVersionStore (dev) and sets this field;
+	// the router wraps it in an auth.VersionChecker for the Auth middleware.
+	VersionStore auth.VersionStore
 	// M1-S1 domain services (nil in the minimal test fixture).
 	Catalog *catalog.Service
 	Billing *billing.Service
@@ -146,6 +153,8 @@ func wireBoss(r *gin.Engine, deps Deps) {
 	if deps.AuthSvc != nil {
 		bh := handler.NewBossAuthHandler(deps.AuthSvc)
 		boss.POST("/auth/logout", bh.Logout)
+		// Change password (authed): account id + tenant from JWT ctx, never body.
+		boss.POST("/auth/password", bh.ChangePassword)
 	}
 	// Boss image upload → COS (nil client ⇒ handler reports "COS 未配置").
 	ah := handler.NewAssetHandler(deps.COS)
@@ -297,7 +306,7 @@ func wireWxshop(r *gin.Engine, deps Deps) {
 // JWT manager is wired (minimal test fixture without the auth stack).
 func wxshopAuthMW(deps Deps) gin.HandlerFunc {
 	if deps.JWT != nil {
-		return middleware.Auth(deps.JWT, deps.Store)
+		return middleware.Auth(deps.JWT, deps.Store, auth.NewVersionChecker(deps.VersionStore))
 	}
 	return middleware.MockTenant()
 }
@@ -321,6 +330,8 @@ func wireAdmin(r *gin.Engine, deps Deps) {
 		ah := handler.NewAdminAuthHandler(deps.AuthSvc)
 		admin.GET("/me", ah.Me)
 		admin.POST("/auth/logout", ah.Logout)
+		// Change password (authed): account id + tenant from JWT ctx, never body.
+		admin.POST("/auth/password", ah.ChangePassword)
 	}
 }
 
@@ -332,7 +343,7 @@ func bossAdminAuthMW(deps Deps, scene string) gin.HandlerFunc {
 	if deps.DevMock || deps.JWT == nil {
 		return middleware.MockTenant()
 	}
-	authMW := middleware.Auth(deps.JWT, deps.Store)
+	authMW := middleware.Auth(deps.JWT, deps.Store, auth.NewVersionChecker(deps.VersionStore))
 	sceneMW := middleware.RequireScene(scene)
 	return func(c *gin.Context) {
 		authMW(c)
