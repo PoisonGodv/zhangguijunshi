@@ -50,12 +50,15 @@ func (c *Client) WithBaseURL(u string) *Client {
 	return c
 }
 
-// objectURL 拼出对象的完整 URL（key 前补 leading slash）。
+// objectURL 拼出对象的完整 URL（key 前补 leading slash，逐段百分号编码）。
+// 返回编码后的 URL，既作为请求 URL（http 客户端据此生成与之一致的 RequestURI），
+// 也作为 PutObject 的返回值交给调用方直接使用，避免含空格/中文等字符的 key 产出
+// 不可直接请求的裸路径。
 func (c *Client) objectURL(key string) string {
 	base := c.baseURL
 	// 去掉末尾斜杠再拼接，避免双斜杠。
 	for len(base) > 0 && base[len(base)-1] == '/' {
 		base = base[:len(base)-1]
 	}
-	return base + objectPath(key)
+	return base + escapedObjectPath(key)
 }

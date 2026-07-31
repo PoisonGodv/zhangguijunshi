@@ -40,7 +40,11 @@ func (c *Client) PutObject(ctx context.Context, key, contentType string, r io.Re
 	}
 	now := time.Now()
 	kt := keyTime(now, defaultSignWindow)
-	auth := buildAuthorization(http.MethodPut, req.URL.Path, nil, signHeaders, c.cfg.SecretID, c.cfg.SecretKey, kt)
+	// 用百分号编码后的路径参与签名：http 客户端实际发送的是 req.URL.RequestURI()
+	// （= EscapedPath() + query），若用解码后的 req.URL.Path 签名，含特殊字符
+	// （空格 / 中文 / & 等）的 key 会导致签名覆盖路径与线上 RequestURI 不一致而
+	// 校验失败。EscapedPath() 与 escapedObjectPath() 的编码规则一致。
+	auth := buildAuthorization(http.MethodPut, req.URL.EscapedPath(), nil, signHeaders, c.cfg.SecretID, c.cfg.SecretKey, kt)
 	req.Header.Set("Authorization", auth)
 
 	resp, err := c.hc.Do(req)

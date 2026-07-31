@@ -95,6 +95,72 @@ func TestPutObject_SignsAndReturnsURL(t *testing.T) {
 	}
 }
 
+// TestPutObject_SpecialCharKey_SignsEscapedPath 是签名路径 bug 的回归测试：
+// 旧实现用解码后的 req.URL.Path 计算签名，而 http 客户端实际发送的是百分号编码
+// 的 RequestURI，导致含空格/中文等字符的 key 签名覆盖路径与线上路径不一致而校验
+// 失败。这里让假对象存储按「线上真实路径」(r.URL.EscapedPath()) 复算签名来模拟
+// COS 服务端的校验口径。
+func TestPutObject_SpecialCharKey_SignsEscapedPath(t *testing.T) {
+	cfg := config.COSConfig{SecretID: "AKIDtest", SecretKey: "secrettest"}
+
+	keys := []string{
+		"uploads/2026/07/a b.png", // 空格
+		"uploads/2026/07/中文.png",  // 中文
+		"uploads/2026/07/a&b.png", // &
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			var (
+				gotRequestURI string
+				gotEscaped    string
+				gotAuth       string
+				gotHostHdr    string
+				gotCType      string
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotRequestURI = r.RequestURI
+				gotEscaped = r.URL.EscapedPath()
+				gotAuth = r.Header.Get("Authorization")
+				gotHostHdr = r.Host
+				gotCType = r.Header.Get("Content-Type")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			c := New(cfg).WithBaseURL(srv.URL)
+			u, err := c.PutObject(context.Background(), key, "image/png", strings.NewReader("x"))
+			if err != nil {
+				t.Fatalf("PutObject(%q): %v", key, err)
+			}
+			wantEscaped := escapedObjectPath(key)
+			if gotEscaped != wantEscaped {
+				t.Errorf("wire path = %q, want escaped %q", gotEscaped, wantEscaped)
+			}
+			if !strings.HasPrefix(gotRequestURI, wantEscaped) {
+				t.Errorf("RequestURI = %q does not start with escaped path %q", gotRequestURI, wantEscaped)
+			}
+			if u != srv.URL+wantEscaped {
+				t.Errorf("returned url = %q, want %s%s", u, srv.URL, wantEscaped)
+			}
+
+			// 签名必须恰好覆盖线上传输的编码路径（COS 服务端校验口径）。
+			a := parseAuth(t, gotAuth)
+			headers := map[string]string{"host": gotHostHdr, "content-type": gotCType}
+			wantSig, _, _ := signature(http.MethodPut, gotEscaped, nil, headers, cfg.SecretKey, a["q-sign-time"])
+			if wantSig != a["q-signature"] {
+				t.Errorf("signature does not cover escaped path:\n got  %q\n want %q", a["q-signature"], wantSig)
+			}
+			// 对于编码后与解码后不同的 key，额外确认「按解码路径复算」会不匹配——
+			// 证明本用例真能复现原 bug（否则该 key 无法区分新旧实现）。
+			if decoded := objectPath(key); decoded != gotEscaped {
+				if decSig, _, _ := signature(http.MethodPut, decoded, nil, headers, cfg.SecretKey, a["q-sign-time"]); decSig == a["q-signature"] {
+					t.Errorf("signature unexpectedly matches decoded path; case would not catch the bug")
+				}
+			}
+		})
+	}
+}
+
 func TestPutObject_Non2xxError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -150,6 +216,44 @@ func TestSignedURL_SelfConsistent(t *testing.T) {
 	wantSig, _, _ := signature(http.MethodGet, objectPath("uploads/2026/07/a.png"), nil, nil, cfg.SecretKey, kt)
 	if wantSig != q.Get("q-signature") {
 		t.Errorf("url signature mismatch:\n got  %q\n want %q", q.Get("q-signature"), wantSig)
+	}
+}
+
+// TestSignedURL_SpecialCharKey 验证临时下载 URL 对含特殊字符的 key：签名覆盖的
+// 路径与 URL 里实际拼出的路径一致（都是百分号编码形式），且可被 url.Parse 还原。
+func TestSignedURL_SpecialCharKey(t *testing.T) {
+	cfg := config.COSConfig{SecretID: "AKID", SecretKey: "sk", Region: "ap-guangzhou", Bucket: "mybucket"}
+	c := New(cfg)
+
+	keys := []string{
+		"uploads/2026/07/a b.png",
+		"uploads/2026/07/中文.png",
+		"uploads/2026/07/a&b.png",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			raw, err := c.SignedURL(context.Background(), key, 0)
+			if err != nil {
+				t.Fatalf("SignedURL(%q): %v", key, err)
+			}
+			wantEscaped := escapedObjectPath(key)
+			if !strings.HasPrefix(raw, "https://mybucket.cos.ap-guangzhou.myqcloud.com"+wantEscaped+"?") {
+				t.Errorf("url path not escaped as expected: %q (want prefix ...%s?)", raw, wantEscaped)
+			}
+			u, err := url.Parse(raw)
+			if err != nil {
+				t.Fatalf("parse url: %v", err)
+			}
+			if u.EscapedPath() != wantEscaped {
+				t.Errorf("url EscapedPath = %q, want %q", u.EscapedPath(), wantEscaped)
+			}
+			// 签名覆盖的路径必须与 URL 实际路径一致。
+			q := u.Query()
+			wantSig, _, _ := signature(http.MethodGet, u.EscapedPath(), nil, nil, cfg.SecretKey, q.Get("q-sign-time"))
+			if wantSig != q.Get("q-signature") {
+				t.Errorf("url signature mismatch:\n got  %q\n want %q", q.Get("q-signature"), wantSig)
+			}
+		})
 	}
 }
 

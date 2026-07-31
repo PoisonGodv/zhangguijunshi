@@ -107,12 +107,15 @@ func signature(method, urlPath string, params, headers map[string]string, secret
 
 // signedURL 生成临时下载 URL（临时密钥/匿名访问场景，签名放 query）。
 // 与 header 方案用同一套 q-sign 计算，但把 q-* 参数拼到 query 上返回完整 URL。
+// 签名与拼 URL 用同一份百分号编码路径（escapedObjectPath），保证签名覆盖的路径
+// 与客户端实际请求的 RequestURI 一致，含特殊字符的 key 不会签名不匹配。
 func signedURL(method, baseURL, key string, params map[string]string, secretID, secretKey string, ttl time.Duration, now time.Time) string {
 	kt := keyTime(now, ttl)
+	ep := escapedObjectPath(key)
 	// 临时 URL 方案的签名 header/param 为空集（下载 GET 通常无需参与签名的 header）。
-	sig, _, _ := signature(method, objectPath(key), params, nil, secretKey, kt)
+	sig, _, _ := signature(method, ep, params, nil, secretKey, kt)
 
-	u := strings.TrimRight(baseURL, "/") + objectPath(key)
+	u := strings.TrimRight(baseURL, "/") + ep
 	q := url.Values{}
 	for k, v := range params {
 		q.Set(k, v)
@@ -133,6 +136,19 @@ func objectPath(key string) string {
 		return key
 	}
 	return "/" + key
+}
+
+// escapedObjectPath 返回对象 path 的百分号编码形式（保证 leading slash）：先补
+// leading slash，再逐段 url.PathEscape（保留 "/" 分隔符本身不编码）。其结果与
+// url.Parse(base+path).EscapedPath()——也就是线上请求真实的 RequestURI——一致，
+// 因此拿它同时参与签名与拼 URL，可避免含特殊字符（空格 / 中文 / & 等）的 key 因
+// 「签名用解码路径、发送用编码路径」而签名不匹配。
+func escapedObjectPath(key string) string {
+	segs := strings.Split(objectPath(key), "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
 }
 
 // headerMap 从 http.Header 抽取参与签名的 headers 为小写 key map。
