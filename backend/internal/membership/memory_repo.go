@@ -461,7 +461,7 @@ func (r *MemoryMemberRepo) ListPointsLog(_ context.Context, tenantID, memberID i
 }
 
 // findMemberIDByPhone implements MemberRepo.
-func (r *MemoryMemberRepo) findMemberIDByPhone(tenantID int64, phoneHash string) (int64, bool) {
+func (r *MemoryMemberRepo) findMemberIDByPhone(_ context.Context, tenantID int64, phoneHash string) (int64, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	id, ok := r.memberIDByPhone[identityKey(tenantID, phoneHash)]
@@ -469,7 +469,7 @@ func (r *MemoryMemberRepo) findMemberIDByPhone(tenantID int64, phoneHash string)
 }
 
 // findMemberIDByOpenID implements MemberRepo.
-func (r *MemoryMemberRepo) findMemberIDByOpenID(tenantID int64, openID string) (int64, bool) {
+func (r *MemoryMemberRepo) findMemberIDByOpenID(_ context.Context, tenantID int64, openID string) (int64, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	id, ok := r.memberIDByOpenID[identityKey(tenantID, openID)]
@@ -481,7 +481,7 @@ func (r *MemoryMemberRepo) findMemberIDByOpenID(tenantID int64, openID string) (
 // balance + append the consume flow when consumeCents>0 (ErrInsufficientBalance
 // with NO state changed when it would overdraw), accrue points + append the
 // earn flow when earnPoints>0, then touch LastVisitAt/UpdatedAt.
-func (r *MemoryMemberRepo) redeemAtomic(tenantID, memberID int64, now time.Time, consumeCents, earnPoints, refOrderID int64) (*redeemOutcome, error) {
+func (r *MemoryMemberRepo) redeemAtomic(_ context.Context, tenantID, memberID int64, now time.Time, consumeCents, earnPoints, refOrderID int64) (*redeemOutcome, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -558,7 +558,7 @@ func (r *MemoryMemberRepo) redeemAtomic(tenantID, memberID int64, now time.Time,
 // directly to the sub-merchant (反二清: the platform never holds the money); this
 // method books the balance only. operatorID is accepted for the audit contract
 // but not yet persisted (the M1-S2 balance-flow row has no operator column).
-func (r *MemoryMemberRepo) rechargeAtomic(tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error) {
+func (r *MemoryMemberRepo) rechargeAtomic(_ context.Context, tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

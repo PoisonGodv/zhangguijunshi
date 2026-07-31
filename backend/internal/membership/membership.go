@@ -114,20 +114,27 @@ type MemberRepo interface {
 	ListMembersPage(ctx context.Context, tenantID int64, f MemberFilter) (ListMembersResult, error)
 
 	// findMemberIDByPhone returns the id of the member registered under
-	// (tenantID, phoneHash); ok=false when none. Drives Join idempotency.
-	findMemberIDByPhone(tenantID int64, phoneHash string) (id int64, ok bool)
+	// (tenantID, phoneHash); ok=false when none. Drives Join idempotency. The
+	// caller's ctx is threaded through so cancellation / deadline / trace
+	// propagate to the underlying lookup (no detached context.Background()).
+	findMemberIDByPhone(ctx context.Context, tenantID int64, phoneHash string) (id int64, ok bool)
 
 	// findMemberIDByOpenID returns the id of the member registered under
-	// (tenantID, openID); ok=false when none. Drives Join idempotency.
-	findMemberIDByOpenID(tenantID int64, openID string) (id int64, ok bool)
+	// (tenantID, openID); ok=false when none. Drives Join idempotency. The
+	// caller's ctx is threaded through so cancellation / deadline / trace
+	// propagate to the underlying lookup (no detached context.Background()).
+	findMemberIDByOpenID(ctx context.Context, tenantID int64, openID string) (id int64, ok bool)
 
 	// redeemAtomic performs the Redeem critical section — load account, check
 	// balance, deduct, append consume log; accrue points, append earn log;
 	// update member Points/LastVisitAt — as one atomic step. It returns the
 	// post-state so the service can build RedeemResult without a racy re-read.
 	// Implementations MUST change NO state when the balance would overdraw
-	// (return ErrInsufficientBalance).
-	redeemAtomic(tenantID, memberID int64, now time.Time, consumeCents, earnPoints, refOrderID int64) (*redeemOutcome, error)
+	// (return ErrInsufficientBalance). The caller's ctx is threaded through so
+	// the transaction is no longer detached from the request's trace; the pg
+	// repo wraps it in context.WithoutCancel so a client disconnect cannot
+	// abort a money movement mid-flight (see pg_repo.go).
+	redeemAtomic(ctx context.Context, tenantID, memberID int64, now time.Time, consumeCents, earnPoints, refOrderID int64) (*redeemOutcome, error)
 
 	// rechargeAtomic performs the Recharge critical section (M4-S1 BE-B-12) —
 	// load account (absent → ErrNotFound), enforce the regional per-card cap
@@ -136,8 +143,11 @@ type MemberRepo interface {
 	// BalanceCents+=amount + GiftCents+=gift, append the recharge balance-flow,
 	// and return the updated account — as one atomic step. The fund flow itself
 	// is settled by WeChat Pay directly to the sub-merchant (反二清: the platform
-	// never holds the money); this method only books the balance.
-	rechargeAtomic(tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error)
+	// never holds the money); this method only books the balance. The caller's
+	// ctx is threaded through so the transaction is no longer detached from the
+	// request's trace; the pg repo wraps it in context.WithoutCancel so a client
+	// disconnect cannot abort a money movement mid-flight (see pg_repo.go).
+	rechargeAtomic(ctx context.Context, tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error)
 
 	// UpdateAccountRegionCap sets RegionCapCents for the (tenantID, memberID)
 	// account (admin / compliance; the main thread seeds it from the tenant's

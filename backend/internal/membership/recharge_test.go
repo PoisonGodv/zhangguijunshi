@@ -389,7 +389,7 @@ func TestRecharge_ConcurrentSafe(t *testing.T) {
 func TestRechargeAtomic_MissingAccount(t *testing.T) {
 	r := newRig()
 	// No Join → no account for member 9999 under tenant 100.
-	if _, err := r.repo.rechargeAtomic(100, 9999, baseNow, 20000, 2000, 0, 0); !errors.Is(err, ErrNotFound) {
+	if _, err := r.repo.rechargeAtomic(ctx, 100, 9999, baseNow, 20000, 2000, 0, 0); !errors.Is(err, ErrNotFound) {
 		t.Errorf("rechargeAtomic missing account err = %v, want ErrNotFound", err)
 	}
 }
@@ -405,7 +405,7 @@ func TestRechargeAtomic_CapBreachesReturnErrBalanceOver(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 0 + 20000 + 2000 = 22000 > 10000 → reject.
-	if _, err := r.repo.rechargeAtomic(100, m.ID, baseNow, 20000, 2000, 0, 0); !errors.Is(err, errcode.ErrBalanceOver) {
+	if _, err := r.repo.rechargeAtomic(ctx, 100, m.ID, baseNow, 20000, 2000, 0, 0); !errors.Is(err, errcode.ErrBalanceOver) {
 		t.Errorf("rechargeAtomic cap err = %v, want errcode.ErrBalanceOver", err)
 	}
 }

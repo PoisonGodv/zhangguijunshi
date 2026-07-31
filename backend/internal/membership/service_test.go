@@ -548,7 +548,7 @@ func TestMemoryMemberRepo_DefensiveCopy(t *testing.T) {
 		t.Errorf("stored phone mutated: %q", got.PhoneHash)
 	}
 	// Idempotency index still keyed by the original phone.
-	if _, ok := repo.findMemberIDByPhone(100, "ph"); !ok {
+	if _, ok := repo.findMemberIDByPhone(ctx, 100, "ph"); !ok {
 		t.Error("phone idempotency index lost after input mutation")
 	}
 }

@@ -136,12 +136,12 @@ func (s *Service) findExisting(ctx context.Context, tenantID int64, phoneHash, o
 		return m
 	}
 	if phoneHash != "" {
-		if id, ok := s.repo.findMemberIDByPhone(tenantID, phoneHash); ok {
+		if id, ok := s.repo.findMemberIDByPhone(ctx, tenantID, phoneHash); ok {
 			return lookup(id, true)
 		}
 	}
 	if openID != "" {
-		if id, ok := s.repo.findMemberIDByOpenID(tenantID, openID); ok {
+		if id, ok := s.repo.findMemberIDByOpenID(ctx, tenantID, openID); ok {
 			return lookup(id, true)
 		}
 	}
@@ -267,7 +267,7 @@ func (s *Service) Redeem(ctx context.Context, in RedeemInput) (*RedeemResult, er
 	}
 
 	now := s.now()
-	out, err := s.repo.redeemAtomic(tenantID, memberID, now, in.ConsumeCents, in.EarnPoints, in.RefOrderID)
+	out, err := s.repo.redeemAtomic(ctx, tenantID, memberID, now, in.ConsumeCents, in.EarnPoints, in.RefOrderID)
 	if err != nil {
 		return nil, err // ErrInsufficientBalance / ErrNotFound
 	}
@@ -318,7 +318,7 @@ func (s *Service) Recharge(ctx context.Context, in RechargeInput) (*RechargeResu
 
 	gift := GiftForAmount(in.AmountCents)
 	now := s.now()
-	acc, err := s.repo.rechargeAtomic(tenantID, in.MemberID, now, in.AmountCents, gift, in.RefPaymentID, in.OperatorID)
+	acc, err := s.repo.rechargeAtomic(ctx, tenantID, in.MemberID, now, in.AmountCents, gift, in.RefPaymentID, in.OperatorID)
 	if err != nil {
 		return nil, err // errcode.ErrBalanceOver (cap) / ErrNotFound
 	}

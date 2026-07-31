@@ -560,13 +560,14 @@ func (r *PGMemberRepo) ListPointsLog(ctx context.Context, tenantID, memberID int
 
 // findMemberIDByPhone returns the id of the member registered under
 // (tenantID, phoneHash); ok=false when none. Drives Join idempotency. A nil pool
-// yields (0, false).
-func (r *PGMemberRepo) findMemberIDByPhone(tenantID int64, phoneHash string) (int64, bool) {
+// yields (0, false). The caller's ctx is threaded through so cancellation /
+// deadline / trace propagate to the lookup (no detached context.Background()).
+func (r *PGMemberRepo) findMemberIDByPhone(ctx context.Context, tenantID int64, phoneHash string) (int64, bool) {
 	if r == nil || r.pool == nil {
 		return 0, false
 	}
 	var id int64
-	if err := r.pool.QueryRow(context.Background(), sqlMemberIDByPhone, tenantID, phoneHash).Scan(&id); err != nil {
+	if err := r.pool.QueryRow(ctx, sqlMemberIDByPhone, tenantID, phoneHash).Scan(&id); err != nil {
 		return 0, false
 	}
 	return id, true
@@ -574,13 +575,14 @@ func (r *PGMemberRepo) findMemberIDByPhone(tenantID int64, phoneHash string) (in
 
 // findMemberIDByOpenID returns the id of the member registered under
 // (tenantID, openID); ok=false when none. Drives Join idempotency. A nil pool
-// yields (0, false).
-func (r *PGMemberRepo) findMemberIDByOpenID(tenantID int64, openID string) (int64, bool) {
+// yields (0, false). The caller's ctx is threaded through so cancellation /
+// deadline / trace propagate to the lookup (no detached context.Background()).
+func (r *PGMemberRepo) findMemberIDByOpenID(ctx context.Context, tenantID int64, openID string) (int64, bool) {
 	if r == nil || r.pool == nil {
 		return 0, false
 	}
 	var id int64
-	if err := r.pool.QueryRow(context.Background(), sqlMemberIDByOpenID, tenantID, openID).Scan(&id); err != nil {
+	if err := r.pool.QueryRow(ctx, sqlMemberIDByOpenID, tenantID, openID).Scan(&id); err != nil {
 		return 0, false
 	}
 	return id, true
@@ -594,7 +596,14 @@ func (r *PGMemberRepo) findMemberIDByOpenID(tenantID int64, openID string) (int6
 // disambiguated from a missing account via sqlAccountExists, mirroring the
 // memory repo's distinct ErrNotFound / ErrInsufficientBalance outcomes. NO state
 // is committed when the balance would overdraw (the transaction rolls back).
-func (r *PGMemberRepo) redeemAtomic(tenantID, memberID int64, now time.Time, consumeCents, earnPoints, refOrderID int64) (*redeemOutcome, error) {
+//
+// The caller's ctx is threaded through (no detached context.Background()) so
+// the transaction joins the request's trace. It is wrapped in
+// context.WithoutCancel: this is a money movement (stored-value deduction), so
+// a client disconnect / request cancellation must NOT abort the deduction
+// mid-flight and leave the balance and its audit log divergent — but the trace
+// context (and thus observability) is preserved.
+func (r *PGMemberRepo) redeemAtomic(ctx context.Context, tenantID, memberID int64, now time.Time, consumeCents, earnPoints, refOrderID int64) (*redeemOutcome, error) {
 	if r == nil || r.pool == nil {
 		return nil, ErrNotFound
 	}
@@ -602,7 +611,7 @@ func (r *PGMemberRepo) redeemAtomic(tenantID, memberID int64, now time.Time, con
 	if !ok {
 		return nil, ErrNotFound
 	}
-	ctx := context.Background()
+	ctx = context.WithoutCancel(ctx)
 	tx, err := starter.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("membership: pg redeem begin: %w", err)
@@ -679,7 +688,14 @@ func (r *PGMemberRepo) redeemAtomic(tenantID, memberID int64, now time.Time, con
 // credit balance+gift, and append the recharge balance-flow. operatorID is
 // accepted for the audit contract but not yet persisted (the M1-S2 balance-log
 // row has no operator column), matching the memory repo.
-func (r *PGMemberRepo) rechargeAtomic(tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error) {
+//
+// The caller's ctx is threaded through (no detached context.Background()) so
+// the transaction joins the request's trace. It is wrapped in
+// context.WithoutCancel: this is a money movement (stored-value credit), so a
+// client disconnect / request cancellation must NOT abort the credit mid-flight
+// and leave the balance and its audit log divergent — but the trace context
+// (and thus observability) is preserved.
+func (r *PGMemberRepo) rechargeAtomic(ctx context.Context, tenantID, memberID int64, now time.Time, amountCents, giftCents, refPaymentID, operatorID int64) (*BalanceAccount, error) {
 	if r == nil || r.pool == nil {
 		return nil, ErrNotFound
 	}
@@ -687,7 +703,7 @@ func (r *PGMemberRepo) rechargeAtomic(tenantID, memberID int64, now time.Time, a
 	if !ok {
 		return nil, ErrNotFound
 	}
-	ctx := context.Background()
+	ctx = context.WithoutCancel(ctx)
 	tx, err := starter.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("membership: pg recharge begin: %w", err)

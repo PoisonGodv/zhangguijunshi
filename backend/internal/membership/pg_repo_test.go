@@ -29,6 +29,12 @@ var _ MemberRepo = (*PGMemberRepo)(nil)
 
 var fixedTime = time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC)
 
+// ctx is the package-level background context the pgxmock tests thread through
+// the repo methods (the atomic critical sections now take a ctx first param so
+// they are no longer detached from the caller). Local test functions that need
+// a tenant-scoped ctx shadow this with their own `ctx :=`.
+var ctx = context.Background()
+
 // newMockPool builds a pgxmock pool with plain-equality SQL matching.
 func newMockPool(t *testing.T) pgxmock.PgxPoolIface {
 	t.Helper()
@@ -230,7 +236,7 @@ func TestPGMemberRepo_FindMemberIDByPhone(t *testing.T) {
 	mock.ExpectQuery(sqlMemberIDByPhone).
 		WithArgs(int64(1), "ph_123").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(42)))
-	id, ok := repo.findMemberIDByPhone(1, "ph_123")
+	id, ok := repo.findMemberIDByPhone(ctx, 1, "ph_123")
 	require.True(t, ok)
 	require.Equal(t, int64(42), id)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -242,7 +248,7 @@ func TestPGMemberRepo_FindMemberIDByPhoneMiss(t *testing.T) {
 	mock.ExpectQuery(sqlMemberIDByPhone).
 		WithArgs(int64(1), "missing").
 		WillReturnError(pgx.ErrNoRows)
-	id, ok := repo.findMemberIDByPhone(1, "missing")
+	id, ok := repo.findMemberIDByPhone(ctx, 1, "missing")
 	require.False(t, ok)
 	require.Equal(t, int64(0), id)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -254,7 +260,7 @@ func TestPGMemberRepo_FindMemberIDByOpenID(t *testing.T) {
 	mock.ExpectQuery(sqlMemberIDByOpenID).
 		WithArgs(int64(1), "oABC").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(43)))
-	id, ok := repo.findMemberIDByOpenID(1, "oABC")
+	id, ok := repo.findMemberIDByOpenID(ctx, 1, "oABC")
 	require.True(t, ok)
 	require.Equal(t, int64(43), id)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -288,7 +294,7 @@ func TestPGMemberRepo_RedeemAtomic_ConsumeAndEarn(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
-	out, err := repo.redeemAtomic(1, 42, fixedTime, 500, 10, 700)
+	out, err := repo.redeemAtomic(ctx, 1, 42, fixedTime, 500, 10, 700)
 	require.NoError(t, err)
 	require.NotNil(t, out.account)
 	require.Equal(t, int64(500), out.account.BalanceCents)
@@ -311,7 +317,7 @@ func TestPGMemberRepo_RedeemAtomic_PointsOnly(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
-	out, err := repo.redeemAtomic(1, 42, fixedTime, 0, 15, 0)
+	out, err := repo.redeemAtomic(ctx, 1, 42, fixedTime, 0, 15, 0)
 	require.NoError(t, err)
 	require.Nil(t, out.account) // points-only ⇒ no account in outcome
 	require.Equal(t, int64(15), out.member.Points)
@@ -335,7 +341,7 @@ func TestPGMemberRepo_RedeemAtomic_InsufficientBalance(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{"one"}).AddRow(int64(1)))
 	mock.ExpectRollback()
 
-	_, err := repo.redeemAtomic(1, 42, fixedTime, 500, 10, 700)
+	_, err := repo.redeemAtomic(ctx, 1, 42, fixedTime, 500, 10, 700)
 	require.ErrorIs(t, err, ErrInsufficientBalance)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -354,7 +360,7 @@ func TestPGMemberRepo_RedeemAtomic_NoAccount(t *testing.T) {
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
 
-	_, err := repo.redeemAtomic(1, 42, fixedTime, 500, 10, 700)
+	_, err := repo.redeemAtomic(ctx, 1, 42, fixedTime, 500, 10, 700)
 	require.ErrorIs(t, err, ErrNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -370,7 +376,7 @@ func TestPGMemberRepo_RedeemAtomic_MemberNotFound(t *testing.T) {
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
 
-	_, err := repo.redeemAtomic(1, 99, fixedTime, 0, 10, 0)
+	_, err := repo.redeemAtomic(ctx, 1, 99, fixedTime, 0, 10, 0)
 	require.ErrorIs(t, err, ErrNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -398,7 +404,7 @@ func TestPGMemberRepo_RechargeAtomic_Happy(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
-	acc, err := repo.rechargeAtomic(1, 42, fixedTime, 20000, 2000, 0, 7)
+	acc, err := repo.rechargeAtomic(ctx, 1, 42, fixedTime, 20000, 2000, 0, 7)
 	require.NoError(t, err)
 	require.Equal(t, int64(20000), acc.BalanceCents)
 	require.Equal(t, int64(2000), acc.GiftCents)
@@ -419,7 +425,7 @@ func TestPGMemberRepo_RechargeAtomic_CapBreach(t *testing.T) {
 		))
 	mock.ExpectRollback()
 
-	_, err := repo.rechargeAtomic(1, 42, fixedTime, 20000, 2000, 0, 7)
+	_, err := repo.rechargeAtomic(ctx, 1, 42, fixedTime, 20000, 2000, 0, 7)
 	require.ErrorIs(t, err, errcode.ErrBalanceOver)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -433,8 +439,115 @@ func TestPGMemberRepo_RechargeAtomic_NoAccount(t *testing.T) {
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
 
-	_, err := repo.rechargeAtomic(1, 99, fixedTime, 20000, 2000, 0, 7)
+	_, err := repo.rechargeAtomic(ctx, 1, 99, fixedTime, 20000, 2000, 0, 7)
 	require.ErrorIs(t, err, ErrNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// ===== ctx threading regression (the context.Background() detachment fix) =====
+
+// ctxKey is the private key type the ctx-threading regression tests use to tag a
+// request context and assert the atomic critical sections receive it.
+type ctxKey struct{}
+
+// ctxCapturePool wraps a pgxmock pool and records the ctx handed to BeginTx, so
+// the tests can assert redeemAtomic / rechargeAtomic thread the CALLER's ctx
+// into the transaction (the pre-fix code used a detached context.Background(),
+// losing cancellation / deadline / trace).
+type ctxCapturePool struct {
+	pgxmock.PgxPoolIface
+	lastBeginCtx context.Context
+}
+
+func (c *ctxCapturePool) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	c.lastBeginCtx = ctx
+	return c.PgxPoolIface.BeginTx(ctx, opts)
+}
+
+// TestPGMemberRepo_AtomicThreadsCallerCtx is the regression test for the
+// "atomic critical sections used context.Background()" bug. It proves both
+// redeemAtomic and rechargeAtomic propagate the caller's ctx into BeginTx:
+//   - the request-scoped value survives (trace / tenant context is preserved);
+//   - the caller's cancellation is detached via context.WithoutCancel, so an
+//     already-cancelled request ctx does NOT abort a money movement mid-flight
+//     (the tx still commits) — the deliberate half-commit-ambiguity choice.
+func TestPGMemberRepo_AtomicThreadsCallerCtx(t *testing.T) {
+	mock := newMockPool(t)
+	cap := &ctxCapturePool{PgxPoolIface: mock}
+	repo := NewPGMemberRepo(cap)
+
+	// A request ctx that carries a trace-style value AND is already cancelled
+	// (simulating a client that disconnected after the handler started).
+	base := context.WithValue(context.Background(), ctxKey{}, "trace-123")
+	cctx, cancel := context.WithCancel(base)
+	cancel()
+
+	// --- redeemAtomic: value propagates, cancellation is detached (commits). ---
+	mock.ExpectBegin()
+	mock.ExpectQuery(sqlMemberRedeemTouch).
+		WithArgs(int64(10), fixedTime, int64(1), int64(42)).
+		WillReturnRows(pgxmock.NewRows(memberColumns()).AddRow(
+			int64(42), int64(1), int64(10), "ph_1", nil, "Alice", "normal", int64(10), int64(0), fixedTime, nil, "active", fixedTime, fixedTime,
+		))
+	mock.ExpectExec(sqlPointsLogAppend).
+		WithArgs(int64(1), int64(42), "earn", int64(10), int64(10), nullInt64(0), fixedTime).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	_, err := repo.redeemAtomic(cctx, 1, 42, fixedTime, 0, 10, 0)
+	require.NoError(t, err, "a cancelled request ctx must not abort the money movement (WithoutCancel)")
+	require.NotNil(t, cap.lastBeginCtx, "BeginTx must have been called")
+	require.Equal(t, "trace-123", cap.lastBeginCtx.Value(ctxKey{}), "the caller's trace value must reach the transaction")
+	require.NoError(t, cap.lastBeginCtx.Err(), "cancellation must be detached so the deduction commits")
+	require.NoError(t, mock.ExpectationsWereMet())
+
+	// --- rechargeAtomic: same guarantees on the credit path. ---
+	mock.ExpectBegin()
+	mock.ExpectQuery(sqlAccountGet).
+		WithArgs(int64(1), int64(42)).
+		WillReturnRows(pgxmock.NewRows(accountColumns()).AddRow(
+			int64(50), int64(1), int64(42), int64(0), int64(0), nil, fixedTime, fixedTime,
+		))
+	mock.ExpectQuery(sqlAccountCredit).
+		WithArgs(int64(20000), int64(2000), int64(1), int64(42)).
+		WillReturnRows(pgxmock.NewRows(accountColumns()).AddRow(
+			int64(50), int64(1), int64(42), int64(20000), int64(2000), nil, fixedTime, fixedTime,
+		))
+	mock.ExpectExec(sqlBalanceLogAppend).
+		WithArgs(int64(1), int64(42), int64(50), "recharge", int64(20000), int64(20000), nullInt64(0), fixedTime).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	_, err = repo.rechargeAtomic(cctx, 1, 42, fixedTime, 20000, 2000, 0, 7)
+	require.NoError(t, err, "a cancelled request ctx must not abort the money movement (WithoutCancel)")
+	require.Equal(t, "trace-123", cap.lastBeginCtx.Value(ctxKey{}), "the caller's trace value must reach the transaction")
+	require.NoError(t, cap.lastBeginCtx.Err(), "cancellation must be detached so the credit commits")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGMemberRepo_FindMemberIDThreadsCallerCtx proves the idempotency lookups
+// now receive the caller's ctx (pre-fix they used a detached
+// context.Background(), so a cancelled/timed-out request still issued the query
+// with no trace linkage).
+func TestPGMemberRepo_FindMemberIDThreadsCallerCtx(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGMemberRepo(mock)
+
+	base := context.WithValue(context.Background(), ctxKey{}, "trace-xyz")
+
+	mock.ExpectQuery(sqlMemberIDByPhone).
+		WithArgs(int64(1), "ph_123").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(42)))
+	id, ok := repo.findMemberIDByPhone(base, 1, "ph_123")
+	require.True(t, ok)
+	require.Equal(t, int64(42), id)
+
+	mock.ExpectQuery(sqlMemberIDByOpenID).
+		WithArgs(int64(1), "oABC").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(43)))
+	id, ok = repo.findMemberIDByOpenID(base, 1, "oABC")
+	require.True(t, ok)
+	require.Equal(t, int64(43), id)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -478,10 +591,10 @@ func TestPGRepo_NilPoolIsSafe(t *testing.T) {
 	_, err = repo.CreateMember(context.Background(), &Member{TenantID: 1})
 	require.ErrorIs(t, err, ErrNotFound)
 
-	_, err = repo.redeemAtomic(1, 1, fixedTime, 100, 10, 0)
+	_, err = repo.redeemAtomic(ctx, 1, 1, fixedTime, 100, 10, 0)
 	require.ErrorIs(t, err, ErrNotFound)
 
-	_, err = repo.rechargeAtomic(1, 1, fixedTime, 100, 10, 0, 0)
+	_, err = repo.rechargeAtomic(ctx, 1, 1, fixedTime, 100, 10, 0, 0)
 	require.ErrorIs(t, err, ErrNotFound)
 
 	require.ErrorIs(t, repo.UpdateAccountRegionCap(context.Background(), 1, 1, 50000), ErrNotFound)
@@ -503,10 +616,10 @@ func TestPGRepo_NilPoolIsSafe(t *testing.T) {
 	require.Empty(t, logs)
 
 	// Identity lookups degrade to (0, false).
-	id, ok := repo.findMemberIDByPhone(1, "ph")
+	id, ok := repo.findMemberIDByPhone(ctx, 1, "ph")
 	require.False(t, ok)
 	require.Equal(t, int64(0), id)
-	id, ok = repo.findMemberIDByOpenID(1, "oABC")
+	id, ok = repo.findMemberIDByOpenID(ctx, 1, "oABC")
 	require.False(t, ok)
 	require.Equal(t, int64(0), id)
 
