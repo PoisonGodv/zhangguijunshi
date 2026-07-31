@@ -17,6 +17,15 @@
 //   - production wires a real *redis.Client (from pkg/redisx);
 //   - tests wire an in-process miniredis client.
 //
+// at-least-once across replicas (CONTRACT §19): delivery does NOT depend on a
+// same-named consumer restarting to re-read its own pending list. A consumer
+// that crashes after XREADGROUP but before XAck strands its entries in ITS
+// pending list, which no other consumer's "0" read ever touches. The Consumer's
+// Run loop therefore also runs a periodic XAUTOCLAIM sweep that re-homes any
+// entry idle longer than MinIdle onto a surviving consumer and re-processes it.
+// Entries that keep failing past MaxDeliveries are parked on the <stream>:dlq
+// dead-letter stream instead of being retried forever.
+//
 // Nil-safe degradation (CONTRACT §0 "tolerate a missing dependency"): when the
 // caller hands a nil Cmdable — i.e. local dev has no Redis — the Producer logs
 // a warning and returns nil (enqueue becomes a no-op so business flows are not
@@ -66,7 +75,42 @@ const (
 	// (e.g. Redis flapped). The idle path already paces itself via Block on the
 	// ">" read, so this only guards the error path.
 	errBackoff = 200 * time.Millisecond
+
+	// defaultMinIdle is the XAUTOCLAIM MIN-IDLE-TIME: a pending entry must have
+	// been idle (delivered but neither ACKed nor re-delivered) for at least this
+	// long before another consumer may claim it. It MUST exceed the longest
+	// Handle duration so a slow-but-healthy handler is not robbed mid-flight;
+	// 30s is a conservative default for the reach/pregen handlers.
+	defaultMinIdle = 30 * time.Second
+
+	// defaultClaimInterval paces the idle-pending reclaim sweep inside Run. The
+	// loop body already ticks at ~cfg.Block cadence, so this only decides how
+	// many of those ticks actually issue an XAUTOCLAIM. 5s keeps orphan pickup
+	// latency low without burning Redis QPS when the PEL is empty.
+	defaultClaimInterval = 5 * time.Second
+
+	// defaultMaxDeliveries is the poison-pill ceiling: once an entry's delivery
+	// count (XPENDING detail) exceeds this it is parked on the <stream>:dlq
+	// stream and ACKed away instead of being retried forever. In the recommended
+	// 5..10 band; 8 gives a transiently-failing job plenty of retries.
+	defaultMaxDeliveries = 8
+
+	// pendingScanCap bounds the XPENDING detail query used to read per-entry
+	// delivery counts for poison detection. Generous so a large PEL cannot
+	// truncate the lookup and hide a poison entry's true count.
+	pendingScanCap = 1000
 )
+
+// dlqSuffix is appended to the resolved Stream name to form the dead-letter
+// stream (<stream>:dlq). Poison entries (delivery count over the ceiling) are
+// XADDed there — preserving the raw fields for later inspection — before being
+// ACKed + XDel'ed off the live stream so they stop blocking the PEL.
+const dlqSuffix = ":dlq"
+
+// dlqStreamName derives the dead-letter stream key from a resolved Stream name.
+func dlqStreamName(stream string) string {
+	return stream + dlqSuffix
+}
 
 // Job is one unit of asynchronous work carried over the Stream. Payload is an
 // opaque caller-defined blob (typically JSON); the queue never inspects it.
@@ -91,9 +135,11 @@ const (
 
 // Handler processes a single Job inside the Consumer read loop. The returned
 // error decides ACK vs. redelivery (see Consumer.Run): nil → ACK + XDel so the
-// entry leaves the Stream; non-nil → the entry is left in the consumer's
-// pending list and redelivered on the next loop iteration. Handle must be
-// idempotent because redelivery is at-least-once.
+// entry leaves the Stream; non-nil → the entry is left pending and redelivered
+// — by the same consumer's next "0" read, OR, if that consumer dies, by any
+// sibling via the XAUTOCLAIM reclaim sweep (so at-least-once is guaranteed
+// across replicas, not just within one consumer). Handle must be idempotent
+// because redelivery is at-least-once.
 type Handler interface {
 	Handle(ctx context.Context, job Job) error
 }
@@ -213,11 +259,27 @@ func (p *Producer) delayZset() string {
 // cancelled. Multiple Consumer instances sharing the same group but distinct
 // Consumer names split the workload with no double-delivery (Redis consumer
 // group semantics).
+//
+// at-least-once guarantee (CONTRACT §19): it does NOT rely on a same-named
+// consumer restarting to re-read its own pending list. A consumer that crashes
+// (or whose Handle keeps failing) leaves entries stranded in ITS pending list,
+// which no other consumer's "0" read ever touches. Run therefore also runs a
+// periodic XAUTOCLAIM sweep (see reclaimIdlePending) that re-homes any entry
+// idle longer than MinIdle onto THIS consumer and re-processes it — so a dead
+// replica's orphans are recovered by any surviving sibling. Entries that keep
+// failing past MaxDeliveries are parked on the <stream>:dlq dead-letter stream
+// instead of being retried forever.
 type Consumer struct {
 	client  redis.Cmdable
 	cfg     config.JobQueueConfig
 	handler Handler
 	count   int64 // XREADGROUP COUNT (overrides via WithCount)
+
+	// reclaim tuning (defaults applied in NewConsumer; override via options).
+	minIdle       time.Duration // XAUTOCLAIM MIN-IDLE-TIME (must exceed longest Handle)
+	claimInterval time.Duration // how often Run issues an XAUTOCLAIM sweep
+	maxDeliveries int64         // poison-pill ceiling (XPENDING delivery count)
+	lastClaim     time.Time     // wall-clock of the last reclaim sweep (paces sweeps)
 }
 
 // ConsumerOption configures a Consumer (functional-option style, matches the
@@ -236,6 +298,41 @@ func WithCount(n int64) ConsumerOption {
 	}
 }
 
+// WithMinIdle overrides the XAUTOCLAIM MIN-IDLE-TIME: how long a pending entry
+// must sit idle before another consumer may claim it. MUST exceed the longest
+// Handle duration or a slow-but-healthy handler could be robbed mid-flight.
+// Production uses the 30s default; tests set it tiny (e.g. 1ms) so reclaim is
+// observable without real sleeping.
+func WithMinIdle(d time.Duration) ConsumerOption {
+	return func(c *Consumer) {
+		if d > 0 {
+			c.minIdle = d
+		}
+	}
+}
+
+// WithClaimInterval overrides how often Run issues an idle-pending reclaim
+// sweep (XAUTOCLAIM). Production uses the ~5s default; tests set it tiny so a
+// dead consumer's orphan is re-homed promptly.
+func WithClaimInterval(d time.Duration) ConsumerOption {
+	return func(c *Consumer) {
+		if d > 0 {
+			c.claimInterval = d
+		}
+	}
+}
+
+// WithMaxDeliveries overrides the poison-pill ceiling: once an entry's delivery
+// count exceeds n it is parked on the <stream>:dlq dead-letter stream and ACKed
+// away instead of being retried forever.
+func WithMaxDeliveries(n int64) ConsumerOption {
+	return func(c *Consumer) {
+		if n > 0 {
+			c.maxDeliveries = n
+		}
+	}
+}
+
 // NewConsumer builds a Consumer over client. cfg supplies Stream / Group /
 // Consumer / Block (empty / zero fall back to defaults). handler is invoked per
 // delivered entry; a nil handler is replaced by a no-op so a mis-wired
@@ -246,10 +343,13 @@ func NewConsumer(client redis.Cmdable, cfg config.JobQueueConfig, handler Handle
 		handler = HandlerFunc(func(context.Context, Job) error { return nil })
 	}
 	c := &Consumer{
-		client:  client,
-		cfg:     cfg,
-		handler: handler,
-		count:   defaultReadCount,
+		client:        client,
+		cfg:           cfg,
+		handler:       handler,
+		count:         defaultReadCount,
+		minIdle:       defaultMinIdle,
+		claimInterval: defaultClaimInterval,
+		maxDeliveries: defaultMaxDeliveries,
 	}
 	for _, o := range opts {
 		o(c)
@@ -265,11 +365,20 @@ func NewConsumer(client redis.Cmdable, cfg config.JobQueueConfig, handler Handle
 //     Handle failure or a crash). BLOCK is ignored by Redis for non-">" IDs so
 //     this returns immediately when the pending list is empty.
 //  3. XREADGROUP ... ID ">" — block up to cfg.Block for never-delivered entries.
+//  4. Periodically (every claimInterval) run an XAUTOCLAIM sweep
+//     (reclaimIdlePending) that re-homes entries stranded in OTHER consumers'
+//     pending lists — e.g. a replica that crashed mid-Handle — onto THIS
+//     consumer and re-processes them. This is what actually delivers the
+//     at-least-once contract across replicas: it does NOT depend on a
+//     same-named consumer coming back to re-read its own PEL. Entries whose
+//     delivery count exceeds maxDeliveries are parked on <stream>:dlq instead
+//     of being retried forever (poison-pill guard).
 //
 // Per-entry ACK/redelivery policy (see process):
 //   - Handle ok            → XAck + XDel (entry leaves the group PEL and the Stream).
 //   - Handle error         → log + do NOT ack; entry stays pending and is
-//     redelivered on the next iteration's "0" read.
+//     redelivered on the next iteration's "0" read (same consumer) or, if that
+//     consumer dies, reclaimed via XAUTOCLAIM by a sibling.
 //   - unparseable entry    → log + XAck + XDel (a corrupt entry can never be
 //     handled, so we drop it rather than hot-loop forever;
 //     this is a deliberate poison-pill guard, documented
@@ -287,9 +396,13 @@ func (c *Consumer) Run(ctx context.Context) error {
 	stream, group, consumer, block := c.resolved()
 
 	// Create the consumer group if absent. MKSTREAM also creates the stream on
-	// first run. BUSYGROUP (group already exists from a prior start / another
-	// worker) is expected and ignored — idempotent bootstrap.
-	if err := c.client.XGroupCreateMkStream(ctx, stream, group, "$").Err(); err != nil {
+	// first run. Start at "0" (NOT "$") so entries XADDed BEFORE the group was
+	// created — e.g. an api producer that enqueued while no worker was up, or
+	// before this replica joined — are still reachable by the ">" read. "$"
+	// would silently drop them (CONTRACT §19 gap closure). BUSYGROUP (group
+	// already exists from a prior start / another worker) is expected and
+	// ignored — idempotent bootstrap.
+	if err := c.client.XGroupCreateMkStream(ctx, stream, group, "0").Err(); err != nil {
 		if !isBusyGroup(err) {
 			return fmt.Errorf("jobqueue: xgroup create mkstream (%s/%s): %w", stream, group, err)
 		}
@@ -309,7 +422,130 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 		// 3) block for new entries (ID ">").
 		c.readOnce(ctx, stream, group, consumer, ">", block)
+
+		// 4) periodically reclaim orphans stranded in other consumers' PELs
+		//    (crashed / failing replicas). Paced by claimInterval so the hot
+		//    loop does not issue an XAUTOCLAIM on every tick.
+		if time.Since(c.lastClaim) >= c.claimInterval {
+			c.lastClaim = time.Now()
+			c.reclaimIdlePending(ctx, stream, group, consumer)
+		}
 	}
+}
+
+// reclaimIdlePending issues one XAUTOCLAIM to re-home entries that have been
+// idle (delivered but not ACKed) for at least minIdle — i.e. stranded in some
+// other consumer's pending list, typically because that consumer crashed or its
+// Handle keeps failing. Every claimed entry is pushed through the SAME process()
+// pipeline as a normal read (so ACK / redelivery / poison handling is uniform).
+//
+// This is the cross-replica half of the at-least-once contract: without it, a
+// consumer that dies after XREADGROUP but before XAck leaves its entries
+// pending FOREVER — no other consumer's "0" read ever sees another consumer's
+// PEL. XAUTOCLAIM is the standard Redis mechanism to recover them.
+//
+// minIdle MUST exceed the longest Handle duration (default 30s) so a slow but
+// healthy handler is not robbed mid-flight by a sibling sweep.
+//
+// Poison guard: before processing, entries whose delivery count (from XPENDING
+// detail) already exceeds maxDeliveries are parked on the <stream>:dlq
+// dead-letter stream and ACKed away — a message that keeps failing is almost
+// certainly a poison pill and must not be retried forever.
+//
+// Errors are logged and swallowed: reclaim is best-effort and must never crash
+// the read loop. A NOGROUP here means the group vanished; the next readOnce
+// rebuilds it (see its NOGROUP branch), so we just return.
+func (c *Consumer) reclaimIdlePending(ctx context.Context, stream, group, consumer string) {
+	if ctx.Err() != nil {
+		return
+	}
+	msgs, _, err := c.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   stream,
+		Group:    group,
+		Consumer: consumer,
+		MinIdle:  c.minIdle,
+		Start:    "0", // scan the whole PEL; XAUTOCLAIM returns a cursor but one pass per interval is enough
+		Count:    c.count,
+	}).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) || ctx.Err() != nil {
+			return
+		}
+		if isNoGroup(err) {
+			// group gone; readOnce's NOGROUP branch will recreate it next tick.
+			return
+		}
+		log.Printf("jobqueue: xautoclaim error (%s/%s): %v", stream, group, err)
+		return
+	}
+	if len(msgs) == 0 {
+		return
+	}
+	log.Printf("jobqueue: reclaimed %d idle pending entr%s (min_idle=%s) on %s/%s",
+		len(msgs), plural(len(msgs)), c.minIdle, stream, consumer)
+
+	// Read delivery counts once for poison detection. Best-effort: if XPENDING
+	// fails we fall through with an empty map and simply retry next sweep.
+	counts := c.pendingCounts(ctx, stream, group)
+
+	for _, msg := range msgs {
+		if ctx.Err() != nil {
+			return
+		}
+		if n := counts[msg.ID]; n > c.maxDeliveries {
+			// Poison pill: retried too many times. Park it on the DLQ (raw
+			// fields preserved for inspection) and ACK it away so it stops
+			// blocking the PEL and being reclaimed forever.
+			c.deadLetter(ctx, stream, group, msg, n)
+			continue
+		}
+		c.process(ctx, stream, group, msg)
+	}
+}
+
+// pendingCounts returns the delivery count for every currently-pending entry in
+// the group (XPENDING detail form). Used by reclaimIdlePending to detect poison
+// entries. Returns an empty map on any error (reclaim then just retries later).
+func (c *Consumer) pendingCounts(ctx context.Context, stream, group string) map[string]int64 {
+	out := make(map[string]int64)
+	ext, err := c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  group,
+		Start:  "-",
+		End:    "+",
+		Count:  pendingScanCap,
+	}).Result()
+	if err != nil {
+		if !errors.Is(err, redis.Nil) && !isNoGroup(err) && ctx.Err() == nil {
+			log.Printf("jobqueue: xpending error (%s/%s): %v", stream, group, err)
+		}
+		return out
+	}
+	for _, e := range ext {
+		out[e.ID] = e.RetryCount
+	}
+	return out
+}
+
+// deadLetter parks a poison entry on the <stream>:dlq stream (preserving its raw
+// fields for later inspection) and then ACKs + XDel's it off the live stream so
+// it leaves the group PEL and stops being retried. All steps are best-effort and
+// logged; a DLQ write failure still ACKs the entry away (a poison message must
+// not wedge the consumer forever — losing it to the DLQ is the lesser evil).
+func (c *Consumer) deadLetter(ctx context.Context, stream, group string, msg redis.XMessage, deliveries int64) {
+	dlq := dlqStreamName(stream)
+	values := make(map[string]interface{}, len(msg.Values)+1)
+	for k, v := range msg.Values {
+		values[k] = v
+	}
+	values["orig_id"] = msg.ID // traceability: which live-stream entry this was
+	if _, err := c.client.XAdd(ctx, &redis.XAddArgs{Stream: dlq, Values: values}).Result(); err != nil {
+		log.Printf("jobqueue: dlq xadd failed id=%s (dlq=%s): %v — acking away anyway", msg.ID, dlq, err)
+	} else {
+		log.Printf("jobqueue: poison entry id=%s parked on %s after %d deliveries (> max %d)",
+			msg.ID, dlq, deliveries, c.maxDeliveries)
+	}
+	c.ackAndDel(ctx, stream, group, msg.ID)
 }
 
 // readOnce issues one XREADGROUP at the given id and dispatches every returned
@@ -319,8 +555,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 //
 // Error handling: redis.Nil (no data) is normal and silent; a cancelled context
 // is a clean stop (returns silently so the top-level loop's pre-check returns
-// nil); any other error is logged and we back off errBackoff before returning,
-// so a flapping Redis never hot-loops or kills the worker.
+// nil); a NOGROUP error means the consumer group vanished at runtime (e.g. an
+// operator XGROUP DESTROY, or the stream was trimmed to empty and recreated) —
+// we rebuild it at "0" so the loop keeps draining instead of logging + backing
+// off forever; any other error is logged and we back off errBackoff before
+// returning, so a flapping Redis never hot-loops or kills the worker.
 func (c *Consumer) readOnce(ctx context.Context, stream, group, consumer, id string, blockArg time.Duration) {
 	args := &redis.XReadGroupArgs{
 		Group:    group,
@@ -337,6 +576,21 @@ func (c *Consumer) readOnce(ctx context.Context, stream, group, consumer, id str
 		}
 		if ctx.Err() != nil {
 			return // graceful: ctx cancelled mid-read
+		}
+		if isNoGroup(err) {
+			// The group is gone. Recreate it at "0" (MKSTREAM also re-creates
+			// the stream if it was deleted) so the loop self-heals instead of
+			// spinning on log+backoff forever. BUSYGROUP means a sibling beat
+			// us to it — fine either way.
+			log.Printf("jobqueue: NOGROUP on %s/%s (id=%q): recreating group at \"0\"", stream, group, id)
+			if cerr := c.client.XGroupCreateMkStream(ctx, stream, group, "0").Err(); cerr != nil && !isBusyGroup(cerr) {
+				log.Printf("jobqueue: recreate group failed (%s/%s): %v", stream, group, cerr)
+			}
+			select {
+			case <-time.After(errBackoff):
+			case <-ctx.Done():
+			}
+			return
 		}
 		log.Printf("jobqueue: xreadgroup error (id=%q): %v", id, err)
 		select {
@@ -442,4 +696,25 @@ func isBusyGroup(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "busygroup")
+}
+
+// isNoGroup reports whether err is the "no such consumer group" error emitted by
+// both real Redis and miniredis ("NOGROUP No such consumer group '...' for key
+// name '...'"). readOnce uses it to rebuild a group that vanished at runtime;
+// reclaimIdlePending / pendingCounts use it to silently skip a sweep that raced
+// a group deletion.
+func isNoGroup(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "nogroup")
+}
+
+// plural returns "y" or "ies" so reclaim log lines read naturally ("1 entry" /
+// "3 entries") without pulling in a pluralization library.
+func plural(n int) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
 }

@@ -174,6 +174,28 @@ func TestDispatcher_CorruptReachPayload(t *testing.T) {
 	}
 }
 
+// TestDispatcher_ReachInvalidTenant: a reach_due_send job that decodes fine but
+// carries an invalid tenant (TenantID <= 0) can NEVER be delivered — reach.Send
+// enforces the tenant from ctx and rejects a non-positive one every time. It must
+// be dropped (Warn + nil) like a poison pill, NOT returned as an error (which
+// would redeliver it forever and, via the queue's XAUTOCLAIM sweep, re-home it
+// across replicas indefinitely). Regression for the permanent-redelivery bug.
+func TestDispatcher_ReachInvalidTenant(t *testing.T) {
+	svc := newTestServices(t)
+	d := &dispatcher{svc: svc}
+
+	for _, tenant := range []int64{0, -1} {
+		job := jobqueue.Job{
+			Type:     jobqueue.JobReachDueSend,
+			Payload:  reachPayload(t), // valid payload; only the tenant is bad
+			TenantID: tenant,
+		}
+		if err := d.Handle(context.Background(), job); err != nil {
+			t.Fatalf("Handle(reach_due_send, tenant=%d) = %v, want nil (poison drop)", tenant, err)
+		}
+	}
+}
+
 // TestEnvOr covers the env-fallback helper used to select ZG_ENV.
 func TestEnvOr(t *testing.T) {
 	const key = "ZG_WORKER_ENVOR_TEST"

@@ -14,12 +14,19 @@ package jobqueue
 //
 // Atomicity / ownership model (no Lua, miniredis-safe):
 //   - The pump lists due members with ZRANGEBYSCORE (via ZRangeArgs ByScore).
-//   - For each member it issues ZREM; only the pump whose ZREM returns 1 owns
-//     the job. Sibling pumps racing on the same member see ZREM return 0 and
-//     skip it → exactly-once handoff across worker replicas.
-//   - Only after a successful claim does the pump XADD the job onto the live
-//     Stream. If that XADD fails, the member is re-ZADDed at now+backoff so the
-//     job is retried rather than lost (at-least-once).
+//   - For each due member it FIRST XADDs the job onto the live Stream, and ONLY
+//     THEN ZREMs the member from the ZSET. This ordering is deliberate and is
+//     the at-least-once guarantee: if the pump crashes (or the XADD fails)
+//     AFTER the old "ZREM-first" claim but BEFORE the XADD, the job was lost
+//     forever — it was already removed from the ZSET yet never reached the
+//     Stream. Publishing first means a crash at any point leaves the job either
+//     still in the ZSET (not yet ZREM'd → retried next sweep) or already on the
+//     Stream (delivered). The only cost is the occasional DUPLICATE delivery
+//     when two sibling pumps both XADD the same member before either ZREMs —
+//     which is acceptable because every Handler is required to be idempotent
+//     (the queue is at-least-once, never exactly-once, by contract).
+//   - If the XADD fails the member is left in the ZSET untouched, so the next
+//     sweep retries it (at-least-once; nothing is lost).
 
 import (
 	"context"
@@ -57,11 +64,6 @@ const (
 	// huge backlog can't starve the consumer's own XREADGROUP or the ctx
 	// pre-check.
 	defaultPumpBatch = 64
-
-	// requeueBackoff is the score bump applied when a claimed member's XADD
-	// fails: the job is re-staged at now+backoff so the next sweep retries it
-	// instead of hot-looping on a failing Stream.
-	requeueBackoff = 5 * time.Second
 )
 
 // delayZsetName derives the delay ZSET key from a resolved Stream name. Shared
@@ -140,7 +142,9 @@ func truncMember(s string) string {
 // DelayPump is a background loop (run inside the worker) that moves due delayed
 // jobs from the ZSET delay lane onto the live Stream so the existing Consumer
 // delivers them. One pump per worker process; sibling pumps across worker
-// replicas cooperate via ZREM-claim (exactly-once handoff).
+// replicas cooperate via publish(XADD)-then-claim(ZREM) — at-least-once: a job
+// is never lost, though racing siblings may occasionally publish a duplicate,
+// which the idempotent Handler absorbs (see claimAndPublish).
 //
 // Nil-safe (CONTRACT §0): with a nil client Run logs and returns nil without
 // looping, mirroring Consumer — dev (no Redis) simply has no delayed delivery,
@@ -306,47 +310,50 @@ func (p *DelayPump) sweep(ctx context.Context) (int, error) {
 	return delivered, nil
 }
 
-// claimAndPublish atomically claims a ZSET member (ZREM) and, on success,
-// re-publishes it onto the live Stream. Returns true iff THIS pump owned and
-// disposed of the member (published OR deliberately dropped as poison); returns
-// false if a sibling won the claim, the claim errored, or the job was re-staged
-// for a later retry (XADD failure).
+// claimAndPublish moves ONE due ZSET member onto the live Stream. Returns true
+// iff THIS pump published the job (or deliberately dropped it as poison); false
+// if the publish failed (member left in the ZSET for a later retry) so Run's
+// pacing treats it as "not delivered".
 //
-// Failure / claim semantics:
-//   - ZREM err      → leave the member in the ZSET, return false (next sweep
-//     retries; nothing is lost).
-//   - ZREM == 0     → a sibling pump already claimed it, return false
-//     (exactly-once across replicas).
-//   - corrupt member → drop it (already removed), return true so we don't
-//     re-stage garbage. Mirrors the Consumer's poison-pill guard.
-//   - XADD err      → re-ZADD at now+requeueBackoff so the job is retried (do
-//     NOT lose it); return false. If the re-ZADD also fails the job is gone —
-//     logged loudly; inherent to a Redis-down mid-sweep.
+// ORDERING IS THE SAFETY PROPERTY — publish (XADD) FIRST, then claim (ZREM):
+//
+//   - decode err / empty type → poison member: ZREM it (remove the garbage so
+//     it is not retried forever) and return true. Mirrors the Consumer's
+//     poison-pill guard.
+//   - XADD err → leave the member in the ZSET untouched and return false; the
+//     next sweep retries it. Nothing is lost (this is exactly the crash window
+//     the old ZREM-first order could not survive).
+//   - XADD ok → ZREM the member. If ZREM returns 0 a sibling pump already
+//     removed it (and likely also XADDed it) → a DUPLICATE delivery, which is
+//     acceptable: the queue is at-least-once and every Handler must be
+//     idempotent. We still return true because we did publish.
+//
+// A crash at any point is safe: before the ZREM the job is still in the ZSET
+// (retried), after the XADD it is already on the Stream (delivered). There is no
+// window in which the job exists in neither place — the bug the old
+// claim-then-publish order had.
 func (p *DelayPump) claimAndPublish(ctx context.Context, member string) bool {
-	// 原子抢占：只有 ZREM 返回 1 的那个 pump 拿到这条 job。
-	removed, err := p.client.ZRem(ctx, p.zset, member).Result()
-	if err != nil {
-		log.Printf("jobqueue: delay pump zrem failed (member=%s): %v", truncMember(member), err)
-		return false
-	}
-	if removed == 0 {
-		return false // 被别的 pump 抢走了
-	}
-
 	fields, err := decodeDelayMember(member)
 	if err != nil {
-		// 解析失败：垃圾成员，丢弃，不再放回（否则永远卡住）。
+		// 解析失败：垃圾成员，从 ZSET 移除后丢弃（否则永远卡住）。
+		if _, zerr := p.client.ZRem(ctx, p.zset, member).Result(); zerr != nil {
+			log.Printf("jobqueue: delay pump zrem(corrupt) failed (member=%s): %v", truncMember(member), zerr)
+		}
 		log.Printf("jobqueue: delay pump dropping corrupt delay member: %v (member=%s)",
 			err, truncMember(member))
 		return true
 	}
 	if fields[fieldType] == "" {
-		// 缺 type：消费者无法路由，等同 poison，丢弃。
+		// 缺 type：消费者无法路由，等同 poison，移除后丢弃。
+		if _, zerr := p.client.ZRem(ctx, p.zset, member).Result(); zerr != nil {
+			log.Printf("jobqueue: delay pump zrem(empty-type) failed (member=%s): %v", truncMember(member), zerr)
+		}
 		log.Printf("jobqueue: delay pump dropping member with empty type (member=%s)", truncMember(member))
 		return true
 	}
 
 	// 复用立即路径的四个字段名投递到 live Stream，parseJob 无需改动。
+	// 先 XADD：只有真的写进 live Stream 之后才去 ZREM 抢占，崩溃在任何位置都不丢消息。
 	args := &redis.XAddArgs{
 		Stream: p.stream,
 		Approx: true,
@@ -362,16 +369,26 @@ func (p *DelayPump) claimAndPublish(ctx context.Context, member string) bool {
 	}
 	id, err := p.client.XAdd(ctx, args).Result()
 	if err != nil {
-		// XADD 失败：把 job 以 now+backoff 重新放回延迟队列，避免丢失。
-		requeueScore := float64(p.nowFunc().Add(requeueBackoff).UnixNano())
-		if zerr := p.client.ZAdd(ctx, p.zset, redis.Z{Score: requeueScore, Member: member}).Err(); zerr != nil {
-			log.Printf("jobqueue: delay pump XADD failed AND re-stage failed (member=%s): xadd=%v zadd=%v — JOB LOST",
-				truncMember(member), err, zerr)
-		} else {
-			log.Printf("jobqueue: delay pump xadd failed (member=%s): %v — re-staged at +%s",
-				truncMember(member), err, requeueBackoff)
-		}
+		// XADD 失败：成员留在 ZSET 原样不动，下一轮 sweep 重试（at-least-once，绝不丢）。
+		log.Printf("jobqueue: delay pump xadd failed (member=%s): %v — left in zset for retry",
+			truncMember(member), err)
 		return false
+	}
+
+	// XADD 成功后才 ZREM 抢占。removed==0 说明兄弟 pump 已抢先移除（并很可能也已
+	// XADD）→ 重复投递，属 at-least-once 可接受范围（handler 要求幂等）。
+	removed, err := p.client.ZRem(ctx, p.zset, member).Result()
+	if err != nil {
+		// ZREM 出错：job 已在 live Stream（不丢），成员可能残留在 ZSET → 下轮会重复
+		// 投递一次，幂等 handler 可吸收。记日志即可。
+		log.Printf("jobqueue: delay pump zrem failed after xadd (member=%s stream_id=%s): %v — possible duplicate delivery",
+			truncMember(member), id, err)
+		return true
+	}
+	if removed == 0 {
+		log.Printf("jobqueue: delay pump duplicate publish (member=%s stream_id=%s): sibling already claimed — idempotent handler absorbs",
+			truncMember(member), id)
+		return true
 	}
 	log.Printf("jobqueue: delay pump delivered type=%s tenant=%s stream_id=%s",
 		fields[fieldType], fields[fieldTenant], id)

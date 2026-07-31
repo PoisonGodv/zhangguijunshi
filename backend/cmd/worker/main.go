@@ -169,7 +169,7 @@ func run() error {
 // Return contract (drives the queue's ACK / redelivery — see jobqueue.Consumer):
 //
 //	nil → job is done, OR deliberately dropped (unknown type / corrupt payload /
-//	      missing dependency). The queue ACKs + XDel's the entry.
+//	      invalid tenant / missing dependency). The queue ACKs + XDel's the entry.
 //	err → transient failure. The queue leaves the entry pending and redelivers it
 //	      on the next loop (at-least-once). Handlers must therefore be idempotent.
 type dispatcher struct {
@@ -211,6 +211,18 @@ func (d *dispatcher) handlePregen(ctx context.Context, job jobqueue.Job) error {
 // the Job (the producer stripped it from ctx when enqueuing) and is rebuilt into
 // a tenant-scoped ctx here because reach.Send enforces tenant from ctx.
 func (d *dispatcher) handleReachDueSend(ctx context.Context, job jobqueue.Job) error {
+	// Poison-pill guard: a message that decodes fine but carries an invalid
+	// tenant (TenantID <= 0) can NEVER be delivered — reach.Send enforces the
+	// tenant from ctx and rejects a non-positive one every time. Returning an
+	// error here would redeliver it forever (and, via the queue's XAUTOCLAIM
+	// sweep, re-home it across replicas indefinitely). Treat it like a corrupt
+	// payload: Warn + return nil so the queue ACKs it away.
+	if job.TenantID <= 0 {
+		d.svc.Log.Warn("worker: dropping reach_due_send with invalid tenant (poison pill)",
+			zap.Int64("tenant_id", job.TenantID))
+		return nil
+	}
+
 	var payload reach.ScheduledSendPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		// Corrupt payload: it can never decode, so drop (nil) rather than

@@ -3,7 +3,9 @@ package jobqueue
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -232,12 +234,17 @@ func TestDelayPump_NilSafe(t *testing.T) {
 	}))
 }
 
-// TestDelayPump_ConcurrentExactlyOnce: two DelayPumps over one Redis (sibling
-// worker replicas) racing on ONE due job must deliver it EXACTLY ONCE. The
-// ZREM-claim is the ownership boundary: only the pump whose ZREM returns 1
-// publishes; the loser's ZREM returns 0 and it skips. Asserted via a handler
-// counter that must end at 1 even after both pumps have swept many times.
-func TestDelayPump_ConcurrentExactlyOnce(t *testing.T) {
+// TestDelayPump_ConcurrentAtLeastOnce: two DelayPumps over one Redis (sibling
+// worker replicas) racing on ONE due job must NEVER LOSE it. The pump publishes
+// (XADD) FIRST and only then claims (ZREM), so a crash at any point leaves the
+// job either still in the ZSET or already on the Stream — never in neither. The
+// trade-off is that two racing pumps MAY both publish the same member before
+// either ZREMs, producing a DUPLICATE delivery. That is acceptable: the queue is
+// at-least-once (never exactly-once) and every Handler is required to be
+// idempotent. We therefore assert the job is delivered AT LEAST once and that
+// both the ZSET and the live Stream fully drain — NOT that delivery happened
+// exactly once.
+func TestDelayPump_ConcurrentAtLeastOnce(t *testing.T) {
 	c, _ := newMiniredis(t)
 	ctx := context.Background()
 
@@ -268,8 +275,8 @@ func TestDelayPump_ConcurrentExactlyOnce(t *testing.T) {
 	consCancel := startConsumer(cons)
 	defer consCancel()
 
-	// Both pumps see "now >= RunAt" → both list the member, but ZREM-claim grants
-	// ownership to exactly one publisher per member.
+	// Both pumps see "now >= RunAt" → both list the member. With publish-first
+	// ordering at least one publishes; a second publish (duplicate) is allowed.
 	nowFn := func() time.Time { return runAt.Add(1 * time.Second) }
 	p1 := NewDelayPump(c, cfg, WithPumpNow(nowFn), WithPumpInterval(5*time.Millisecond), WithPumpBatch(8))
 	p2 := NewDelayPump(c, cfg, WithPumpNow(nowFn), WithPumpInterval(5*time.Millisecond), WithPumpBatch(8))
@@ -278,16 +285,108 @@ func TestDelayPump_ConcurrentExactlyOnce(t *testing.T) {
 	defer c1()
 	defer c2()
 
-	// Wait for first delivery.
+	// Wait for at least one delivery (the job is never lost).
 	require.Eventually(t, func() bool { return atomic.LoadInt64(&delivered) >= 1 },
-		2*time.Second, 2*time.Millisecond, "job was never delivered")
+		2*time.Second, 2*time.Millisecond, "job was never delivered (lost)")
 
-	// Let BOTH pumps keep sweeping so a missing claim guard would surface as a
-	// second delivery. With ZREM-claim the counter stays at 1.
+	// Let BOTH pumps keep sweeping. Delivery count may be 1 or 2 (duplicate is
+	// acceptable under at-least-once); it must never be 0 and the job must never
+	// be lost.
 	time.Sleep(150 * time.Millisecond)
-	require.Equal(t, int64(1), atomic.LoadInt64(&delivered),
-		"due job delivered more than once across concurrent pumps (ZREM-claim broken)")
-	require.Equal(t, int64(0), zsetLen(t, c, zset), "zset must be drained after exactly-once delivery")
+	require.GreaterOrEqual(t, atomic.LoadInt64(&delivered), int64(1),
+		"due job was lost across concurrent pumps")
+	require.Equal(t, int64(0), zsetLen(t, c, zset), "zset must be drained after delivery")
+	waitXLen(t, c, cfg.Stream, 0)
+}
+
+// xaddFailer wraps a redis.Cmdable and fails the first `fail` XAdd calls with a
+// synthetic error, then delegates to the real client. Used to prove the pump's
+// publish-first ordering: when XADD fails the member must stay in the ZSET (NOT
+// be lost), and once XADD starts succeeding the job is delivered. Embedding
+// redis.Cmdable supplies every other method unchanged.
+type xaddFailer struct {
+	redis.Cmdable
+	mu    sync.Mutex
+	fail  int // remaining XAdd calls to fail
+	calls int
+}
+
+func (f *xaddFailer) XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd {
+	f.mu.Lock()
+	f.calls++
+	shouldFail := f.fail > 0
+	if shouldFail {
+		f.fail--
+	}
+	f.mu.Unlock()
+	if shouldFail {
+		cmd := redis.NewStringCmd(ctx, "xadd")
+		cmd.SetErr(errors.New("synthetic xadd failure"))
+		return cmd
+	}
+	return f.Cmdable.XAdd(ctx, a)
+}
+
+// TestDelayPump_XAddFailureNotLost: the publish-first ordering must NEVER lose a
+// job when the live-Stream XADD fails. While XAdd is failing the member stays in
+// the ZSET (retried each sweep); once XAdd succeeds the job is delivered and the
+// ZSET drains. This is the exact crash window the old claim(ZREM)-then-publish
+// order could not survive (it ZREM'd the member, then a failing XADD lost it).
+func TestDelayPump_XAddFailureNotLost(t *testing.T) {
+	c, mr := newMiniredis(t)
+	_ = mr
+	ctx := context.Background()
+
+	cfg := config.JobQueueConfig{
+		Stream:   "xaddfail-jobs",
+		Group:    "xaddfail-grp",
+		Consumer: "c1",
+		Block:    20 * time.Millisecond,
+		MaxLen:   1000,
+	}
+	zset := delayZsetName(cfg.Stream)
+	runAt := time.Now().Add(time.Hour).UTC()
+
+	prod := NewProducer(c, cfg)
+	ensureGroup(t, c, cfg.Stream, cfg.Group)
+	require.NoError(t, prod.Enqueue(ctx, Job{
+		Type:     JobReachDueSend,
+		Payload:  []byte("must-not-be-lost"),
+		TenantID: 22,
+		RunAt:    runAt,
+	}))
+	require.Len(t, zsetMembers(t, c, zset), 1, "precondition: parked in zset")
+
+	// Fail the first 3 XAdd attempts; the pump sweeps every 5ms so it retries.
+	failer := &xaddFailer{Cmdable: c, fail: 3}
+
+	var delivered int64
+	cons := NewConsumer(c, cfg, HandlerFunc(func(_ context.Context, j Job) error {
+		atomic.AddInt64(&delivered, 1)
+		return nil
+	}), WithCount(1))
+	consCancel := startConsumer(cons)
+	defer consCancel()
+
+	pump := NewDelayPump(failer, cfg,
+		WithPumpNow(func() time.Time { return runAt.Add(1 * time.Second) }),
+		WithPumpInterval(5*time.Millisecond),
+	)
+	pumpCancel := startPump(pump)
+	defer pumpCancel()
+
+	// Despite repeated XADD failures the job must eventually be delivered (it is
+	// never lost) and the ZSET must drain.
+	require.Eventually(t, func() bool { return atomic.LoadInt64(&delivered) >= 1 },
+		3*time.Second, 5*time.Millisecond, "job was lost after XADD failures")
+	require.Eventually(t, func() bool { return zsetLen(t, c, zset) == 0 },
+		2*time.Second, 5*time.Millisecond, "zset not drained after delivery")
+
+	failer.mu.Lock()
+	calls := failer.calls
+	failer.mu.Unlock()
+	require.GreaterOrEqual(t, calls, 4, "expected >=3 failed XADDs then a success")
+	waitXLen(t, c, cfg.Stream, 0)
 }
 
 // TestNewNonce_Unique: nonces must be unique across many calls (guards the ZSET

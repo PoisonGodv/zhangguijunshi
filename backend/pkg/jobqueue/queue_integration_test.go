@@ -14,7 +14,10 @@ package jobqueue_test
 //
 // It proves the delay lane works against real Redis (not just miniredis):
 // a future-RunAt job sits in the ZSET (NOT the Stream) until due, then the
-// DelayPump hands it to the Consumer exactly once, at/after RunAt.
+// DelayPump hands it to the Consumer at/after RunAt. This test runs a SINGLE
+// pump, so the publish(XADD)-then-claim(ZREM) ordering delivers exactly once
+// (duplicates only arise when sibling pumps race; see the miniredis
+// TestDelayPump_ConcurrentAtLeastOnce).
 
 import (
 	"context"

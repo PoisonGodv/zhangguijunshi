@@ -345,3 +345,210 @@ func setConsumer(base config.JobQueueConfig, consumer string) config.JobQueueCon
 	out.Consumer = consumer
 	return out
 }
+
+// TestConsumer_GroupStartZeroReadsPreGroupMessages guards fix (2): the consumer
+// group is created at "0" (not "$"), so a message XADDed BEFORE the group exists
+// — e.g. an api producer enqueued while no worker was up — is still delivered.
+// With the old "$" start this message would be silently dropped forever.
+func TestConsumer_GroupStartZeroReadsPreGroupMessages(t *testing.T) {
+	c, _ := newMiniredis(t)
+	ctx := context.Background()
+
+	cfg := config.JobQueueConfig{
+		Stream:   "pre-jobs",
+		Group:    "pre-grp",
+		Consumer: "c1",
+		Block:    20 * time.Millisecond,
+		MaxLen:   1000,
+	}
+	// Enqueue BEFORE any group exists (the stream is created by this XADD).
+	prod := NewProducer(c, cfg)
+	require.NoError(t, prod.Enqueue(ctx, Job{
+		Type:     JobReachDueSend,
+		TenantID: 3,
+		Payload:  []byte("enqueued-before-group"),
+	}))
+	// Precondition: no group yet, message sitting on the stream.
+	n, err := c.XLen(ctx, cfg.Stream).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n)
+
+	got := make(chan Job, 1)
+	cons := NewConsumer(c, cfg, HandlerFunc(func(_ context.Context, j Job) error {
+		got <- j
+		return nil
+	}), WithCount(1))
+	cancel := startConsumer(cons) // Run creates the group at "0"
+	defer cancel()
+
+	select {
+	case j := <-got:
+		require.Equal(t, "enqueued-before-group", string(j.Payload))
+		require.Equal(t, int64(3), j.TenantID)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: pre-group message was dropped (group start not \"0\"?)")
+	}
+	waitXLen(t, c, cfg.Stream, 0)
+}
+
+// TestConsumer_ReclaimsOrphanPending guards fix (1): a message stranded in a
+// DEAD consumer's pending list (read via XREADGROUP but never ACKed — e.g. the
+// consumer crashed mid-Handle) is re-homed onto a surviving sibling via
+// XAUTOCLAIM and delivered. No same-named restart is required.
+func TestConsumer_ReclaimsOrphanPending(t *testing.T) {
+	c, _ := newMiniredis(t)
+	ctx := context.Background()
+
+	const (
+		stream = "orphan-jobs"
+		group  = "orphan-grp"
+	)
+	cfg := config.JobQueueConfig{Stream: stream, Group: group, Consumer: "survivor", Block: 20 * time.Millisecond, MaxLen: 1000}
+
+	// Group at "0" (as Run would), then enqueue one job.
+	require.NoError(t, c.XGroupCreateMkStream(ctx, stream, group, "0").Err())
+	prod := NewProducer(c, cfg)
+	require.NoError(t, prod.Enqueue(ctx, Job{Type: JobReachDueSend, TenantID: 5, Payload: []byte("orphan")}))
+
+	// Simulate a consumer "dead" that read the message (XREADGROUP ">") but
+	// crashed before ACKing: the entry is now pending under "dead" and no live
+	// consumer's "0" read will ever touch it.
+	res, err := c.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: group, Consumer: "dead", Streams: []string{stream, ">"}, Count: 1,
+	}).Result()
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Len(t, res[0].Messages, 1, "precondition: dead consumer read the message")
+
+	// A surviving consumer with a tiny MinIdle + ClaimInterval must reclaim the
+	// orphan via XAUTOCLAIM and deliver it through the normal handler path.
+	got := make(chan Job, 1)
+	cons := NewConsumer(c, cfg, HandlerFunc(func(_ context.Context, j Job) error {
+		got <- j
+		return nil
+	}), WithCount(1), WithMinIdle(1*time.Millisecond), WithClaimInterval(5*time.Millisecond))
+	cancel := startConsumer(cons)
+	defer cancel()
+
+	select {
+	case j := <-got:
+		require.Equal(t, "orphan", string(j.Payload))
+		require.Equal(t, int64(5), j.TenantID)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: orphan pending entry was never reclaimed (no XAUTOCLAIM?)")
+	}
+	waitXLen(t, c, stream, 0)
+}
+
+// TestConsumer_PoisonGoesToDLQ guards the poison-pill ceiling of fix (1): an
+// entry whose delivery count exceeds MaxDeliveries is parked on the
+// <stream>:dlq dead-letter stream and ACKed away instead of being reclaimed /
+// redelivered forever. We drive the count up with a handler that always fails;
+// the blocking ">" read creates idle windows that let the XAUTOCLAIM sweep
+// reclaim the entry, observe its delivery count over the ceiling, and DLQ it.
+func TestConsumer_PoisonGoesToDLQ(t *testing.T) {
+	c, _ := newMiniredis(t)
+	ctx := context.Background()
+
+	cfg := config.JobQueueConfig{
+		Stream:   "poison-jobs",
+		Group:    "poison-grp",
+		Consumer: "c1",
+		Block:    20 * time.Millisecond,
+		MaxLen:   1000,
+	}
+	prod := NewProducer(c, cfg)
+	ensureGroup(t, c, cfg.Stream, cfg.Group)
+	require.NoError(t, prod.Enqueue(ctx, Job{Type: JobReachDueSend, TenantID: 6, Payload: []byte("poison")}))
+
+	var calls int64
+	cons := NewConsumer(c, cfg, HandlerFunc(func(_ context.Context, j Job) error {
+		atomic.AddInt64(&calls, 1)
+		return errors.New("always fails — poison")
+	}),
+		WithCount(1),
+		WithMinIdle(1*time.Millisecond),       // reclaim during the ">" block idle window
+		WithClaimInterval(1*time.Millisecond), // sweep every loop
+		WithMaxDeliveries(2),                  // low ceiling so the test is fast
+	)
+	cancel := startConsumer(cons)
+	defer cancel()
+
+	dlq := dlqStreamName(cfg.Stream)
+	// The poison entry must land on the DLQ stream...
+	require.Eventually(t, func() bool {
+		n, err := c.XLen(ctx, dlq).Result()
+		require.NoError(t, err)
+		return n == 1
+	}, 3*time.Second, 5*time.Millisecond, "poison entry never reached the DLQ")
+
+	// ...and leave the live stream (ACKed + XDel'ed) so it stops blocking the PEL.
+	waitXLen(t, c, cfg.Stream, 0)
+
+	// The DLQ entry preserves the raw fields + the original stream id.
+	msgs, err := c.XRange(ctx, dlq, "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Equal(t, JobReachDueSend, msgs[0].Values[fieldType])
+	require.Equal(t, "poison", msgs[0].Values[fieldPayload])
+	require.NotEmpty(t, msgs[0].Values["orig_id"], "dlq entry must carry the original stream id")
+}
+
+// TestConsumer_NoGroupRecovery guards fix (4): if the consumer group is destroyed
+// at runtime (operator XGROUP DESTROY, or the stream trimmed away), the running
+// consumer must NOT just log + back off forever — it rebuilds the group at "0"
+// and keeps draining. We destroy the group mid-run, enqueue a fresh message, and
+// assert it is still delivered.
+func TestConsumer_NoGroupRecovery(t *testing.T) {
+	c, _ := newMiniredis(t)
+	ctx := context.Background()
+
+	cfg := config.JobQueueConfig{
+		Stream:   "nogroup-jobs",
+		Group:    "nogroup-grp",
+		Consumer: "c1",
+		Block:    20 * time.Millisecond,
+		MaxLen:   1000,
+	}
+	prod := NewProducer(c, cfg)
+
+	delivered := make(chan string, 4)
+	cons := NewConsumer(c, cfg, HandlerFunc(func(_ context.Context, j Job) error {
+		delivered <- string(j.Payload)
+		return nil
+	}), WithCount(1))
+	cancel := startConsumer(cons) // creates the group at "0"
+	defer cancel()
+
+	// First message proves the consumer is up and draining.
+	require.NoError(t, prod.Enqueue(ctx, Job{Type: JobReachDueSend, TenantID: 1, Payload: []byte("first")}))
+	select {
+	case p := <-delivered:
+		require.Equal(t, "first", p)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: first message not delivered")
+	}
+
+	// Destroy the group out from under the running consumer.
+	require.NoError(t, c.XGroupDestroy(ctx, cfg.Stream, cfg.Group).Err())
+
+	// Enqueue a second message. The consumer's next read hits NOGROUP, rebuilds
+	// the group at "0", and delivers it — it must not wedge on log+backoff.
+	require.NoError(t, prod.Enqueue(ctx, Job{Type: JobReachDueSend, TenantID: 1, Payload: []byte("second")}))
+	select {
+	case p := <-delivered:
+		require.Equal(t, "second", p)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: consumer did not recover from NOGROUP (second message lost)")
+	}
+}
+
+// TestIsNoGroup: the NOGROUP guard must match both real-Redis and miniredis
+// wording ("NOGROUP No such consumer group '...' for key name '...'") so the
+// runtime-recovery branch triggers, while BUSYGROUP / nil do not.
+func TestIsNoGroup(t *testing.T) {
+	require.True(t, isNoGroup(errors.New("NOGROUP No such consumer group 'g' for key name 's'")))
+	require.True(t, isNoGroup(errors.New("nogroup something")))
+	require.False(t, isNoGroup(errors.New("BUSYGROUP Consumer Group name already exists")))
+	require.False(t, isNoGroup(nil))
+}
