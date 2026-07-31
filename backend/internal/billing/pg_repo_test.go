@@ -9,6 +9,7 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -49,6 +50,10 @@ func TestPGOrderRepo_CreateAndGet(t *testing.T) {
 		Items: []OrderItem{{ProductID: 1, NameSnapshot: "可乐", Unit: "瓶", Qty: 2, PriceCents: 300, CostCents: 200}},
 	}
 
+	// Create runs inside a transaction (pgxmock satisfies txBeginner): the order
+	// INSERT and the item INSERT are wrapped in Begin/Commit so a failure on any
+	// item rolls back the half-written order.
+	mock.ExpectBegin()
 	// INSERT order RETURNING id, created_at, updated_at — args mirror Create.
 	mock.ExpectQuery(sqlOrderCreate).
 		WithArgs(int64(100), int64(10), nullInt64(7), "ZG1", "in_store", orderStatusPaid,
@@ -59,6 +64,7 @@ func TestPGOrderRepo_CreateAndGet(t *testing.T) {
 	mock.ExpectExec(sqlOrderItemCreate).
 		WithArgs(int64(100), int64(42), int64(1), "可乐", "瓶", int64(2), int64(300), int64(200)).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
 
 	created, err := repo.Create(context.Background(), in)
 	require.NoError(t, err)
@@ -85,6 +91,74 @@ func TestPGOrderRepo_CreateAndGet(t *testing.T) {
 	require.NotNil(t, got.PaidAt)
 	require.Len(t, got.Items, 1)
 	require.Equal(t, "可乐", got.Items[0].NameSnapshot)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGOrderRepo_Create_ItemFailureRollback is the load-bearing atomicity case
+// for Create: the order INSERT succeeds but a later item INSERT fails, so the
+// whole transaction must Rollback — no half-written order may be committed.
+func TestPGOrderRepo_Create_ItemFailureRollback(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGOrderRepo(mock)
+
+	in := &Order{
+		TenantID: 100, StoreID: 10, MemberID: 7, OrderNo: "ZG2", Channel: "in_store",
+		Status: orderStatusPaid, TotalCents: 800, PaidCents: 800,
+		PaymentMethod: "cash", PaidAt: &fixedNow,
+		CreatedAt: fixedNow, UpdatedAt: fixedNow,
+		Items: []OrderItem{
+			{ProductID: 1, NameSnapshot: "可乐", Unit: "瓶", Qty: 2, PriceCents: 300, CostCents: 200},
+			{ProductID: 2, NameSnapshot: "薯片", Unit: "包", Qty: 1, PriceCents: 200, CostCents: 100},
+		},
+	}
+
+	mock.ExpectBegin()
+	// Order INSERT succeeds, allocating id 43.
+	mock.ExpectQuery(sqlOrderCreate).
+		WithArgs(int64(100), int64(10), nullInt64(7), "ZG2", "in_store", orderStatusPaid,
+			int64(800), int64(800), int64(0), nullStr("cash"), nullInt64(0),
+			nullTimePtr(&fixedNow), nullStr(""), fixedNow, fixedNow).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "created_at", "updated_at"}).AddRow(int64(43), fixedNow, fixedNow))
+	// First item INSERT succeeds.
+	mock.ExpectExec(sqlOrderItemCreate).
+		WithArgs(int64(100), int64(43), int64(1), "可乐", "瓶", int64(2), int64(300), int64(200)).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	// Second item INSERT fails -> the tx must roll back (no Commit).
+	mock.ExpectExec(sqlOrderItemCreate).
+		WithArgs(int64(100), int64(43), int64(2), "薯片", "包", int64(1), int64(200), int64(100)).
+		WillReturnError(errors.New("boom: item insert failed"))
+	mock.ExpectRollback()
+
+	_, err := repo.Create(context.Background(), in)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "order item create")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGOrderRepo_Create_OrderInsertFailureRollback covers the order INSERT
+// itself failing inside the transaction: Begin then Rollback, no item INSERTs.
+func TestPGOrderRepo_Create_OrderInsertFailureRollback(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGOrderRepo(mock)
+
+	in := &Order{
+		TenantID: 100, StoreID: 10, OrderNo: "ZG3", Channel: "in_store",
+		Status: orderStatusPaid, TotalCents: 300, PaidCents: 300,
+		CreatedAt: fixedNow, UpdatedAt: fixedNow,
+		Items: []OrderItem{{ProductID: 1, NameSnapshot: "可乐", Unit: "瓶", Qty: 1, PriceCents: 300, CostCents: 200}},
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(sqlOrderCreate).
+		WithArgs(int64(100), int64(10), nullInt64(0), "ZG3", "in_store", orderStatusPaid,
+			int64(300), int64(300), int64(0), nullStr(""), nullInt64(0),
+			nullTimePtr(nil), nullStr(""), fixedNow, fixedNow).
+		WillReturnError(errors.New("boom: order insert failed"))
+	mock.ExpectRollback()
+
+	_, err := repo.Create(context.Background(), in)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "order create")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

@@ -9,9 +9,12 @@ package billing
 // billing.ErrNotFound. Tenant isolation lives in every statement's
 // WHERE tenant_id = $N (ARCH-01).
 //
-// Cross-table writes (Create) use payment's plain QueryRow+Exec multi-statement
-// style: INSERT the order with RETURNING id/timestamps, then loop-insert every
-// OrderItem carrying the allocated order id. Multi-row reads (ListByDate /
+// Cross-table writes (Create) wrap the order INSERT (RETURNING id/timestamps)
+// and the loop-inserted OrderItems in a single transaction (txBeginner
+// type-assert over the pool — both *pgxpool.Pool and pgxmock satisfy it) so a
+// failure on any item INSERT rolls back the half-written order, leaving no
+// orphaned row. A pool lacking BeginTx degrades to the legacy non-transactional
+// two-step path. Multi-row reads (ListByDate /
 // ListByMember) query orders then load each order's items (N+1 over the
 // order_items index), the same SELECT-then-SELECT shape the contract endorses
 // for GetByID. Aggregate reads (OrderTotalByMembers / RepurchaseMembers) scan a
@@ -52,6 +55,14 @@ type queryer interface {
 // rowScanner is the common Scan surface of pgx.Row and pgx.Rows.
 type rowScanner interface {
 	Scan(dest ...any) error
+}
+
+// txBeginner is the optional transaction capability used by Create. Both
+// *pgxpool.Pool and pgxmock.PgxPoolIface satisfy it; if a pool lacks it, Create
+// degrades to the legacy non-transactional two-step path (order INSERT then
+// item INSERTs) rather than failing.
+type txBeginner interface {
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
 // SQL for orders (migration 000003). The order column list is shared by every
@@ -203,13 +214,64 @@ func (r *PGOrderRepo) loadItems(ctx context.Context, tenantID, orderID int64) ([
 
 // Create persists the order together with its Items and returns the persisted
 // record. Cross-table write: INSERT order RETURNING id/timestamps, then loop
-// INSERT each item carrying the allocated order id (payment's plain
-// QueryRow+Exec style — no transaction at this layer; the main thread may wrap
-// the service call if it needs atomicity).
+// INSERT each item carrying the allocated order id. When the pool supports
+// transactions (txBeginner — both *pgxpool.Pool and pgxmock do) the order and
+// all its items are written inside a single transaction so a failure on any
+// item INSERT rolls back the half-written order, leaving no orphaned row. A
+// pool lacking BeginTx degrades to the legacy non-transactional two-step path.
 func (r *PGOrderRepo) Create(ctx context.Context, o *Order) (*Order, error) {
 	if r == nil || r.pool == nil || o == nil {
 		return nil, ErrNotFound
 	}
+	if beginner, ok := r.pool.(txBeginner); ok {
+		return r.createAtomic(ctx, beginner, o)
+	}
+	// Degraded path: pool without BeginTx (misconfigured). Fall back to the
+	// legacy plain QueryRow+Exec two-step write.
+	return r.createPlain(ctx, o)
+}
+
+// createAtomic writes the order and all its items inside one transaction. Any
+// error (order INSERT or any item INSERT) triggers a Rollback so no partial
+// order is ever observable; on success everything is committed atomically.
+func (r *PGOrderRepo) createAtomic(ctx context.Context, beginner txBeginner, o *Order) (*Order, error) {
+	tx, err := beginner.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("billing: pg order create begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err := tx.QueryRow(ctx, sqlOrderCreate,
+		o.TenantID, o.StoreID, nullInt64(o.MemberID), o.OrderNo, o.Channel, o.Status,
+		o.TotalCents, o.PaidCents, o.DiscountCents, nullStr(o.PaymentMethod), nullInt64(o.OperatorID),
+		nullTimePtr(o.PaidAt), nullStr(o.PaymentRef), o.CreatedAt, o.UpdatedAt,
+	).Scan(&o.ID, &o.CreatedAt, &o.UpdatedAt); err != nil {
+		return nil, fmt.Errorf("billing: pg order create: %w", err)
+	}
+	for _, it := range o.Items {
+		if _, err := tx.Exec(ctx, sqlOrderItemCreate,
+			o.TenantID, o.ID, it.ProductID, it.NameSnapshot, it.Unit, it.Qty, it.PriceCents, it.CostCents,
+		); err != nil {
+			return nil, fmt.Errorf("billing: pg order item create: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("billing: pg order create commit: %w", err)
+	}
+	committed = true
+	return cloneOrder(o), nil
+}
+
+// createPlain is the legacy non-transactional fallback used only when the pool
+// lacks BeginTx (a misconfigured pool). It INSERTs the order then loop-INSERTs
+// the items with no atomicity guarantee.
+func (r *PGOrderRepo) createPlain(ctx context.Context, o *Order) (*Order, error) {
 	if err := r.pool.QueryRow(ctx, sqlOrderCreate,
 		o.TenantID, o.StoreID, nullInt64(o.MemberID), o.OrderNo, o.Channel, o.Status,
 		o.TotalCents, o.PaidCents, o.DiscountCents, nullStr(o.PaymentMethod), nullInt64(o.OperatorID),

@@ -310,6 +310,70 @@ func TestDailySummary_DateFilterAndTenantIsolation(t *testing.T) {
 	_ = repo
 }
 
+// TestDailySummary_PendingOrderExcluded is the regression test for the bug
+// where DailySummary counted pending (unpaid) orders into gross/net/cost/profit.
+// A pending order must contribute NOTHING until it is promoted to paid via
+// MarkOrderPaid; only then does it count as one recognised sale. This mirrors
+// the status='paid' filter already applied by OrderTotalByMembers /
+// RepurchaseMembers.
+func TestDailySummary_PendingOrderExcluded(t *testing.T) {
+	pricer := &fakePricer{byID: map[int64]*PricedProduct{
+		1: activeProduct(1, 100, 10, "可乐", "瓶", 300, 200),
+	}}
+	svc, _ := newService(pricer)
+	ctx := ctxFor(100, 10, 7)
+
+	// A pending (awaiting-payment) order for 2 可乐: total 600, cost 400. It must
+	// NOT be recognised as revenue yet.
+	pending, err := svc.CreatePendingOrder(ctx, CreateOrderInput{StoreID: 10, Items: []CreateOrderItem{{ProductID: 1, Qty: 2}}})
+	if err != nil {
+		t.Fatalf("CreatePendingOrder: %v", err)
+	}
+	if pending.Status != orderStatusPending {
+		t.Fatalf("pending.Status = %q, want pending", pending.Status)
+	}
+
+	sum, err := svc.DailySummary(ctx, 10, fixedNow)
+	if err != nil {
+		t.Fatalf("DailySummary (pending): %v", err)
+	}
+	if sum.OrderCount != 0 {
+		t.Errorf("OrderCount = %d, want 0 (pending order must not count)", sum.OrderCount)
+	}
+	if sum.GrossCents != 0 || sum.NetCents != 0 || sum.CostCents != 0 || sum.ProfitCents != 0 {
+		t.Errorf("gross/net/cost/profit = %d/%d/%d/%d, want all 0 while pending",
+			sum.GrossCents, sum.NetCents, sum.CostCents, sum.ProfitCents)
+	}
+	if len(sum.TopProducts) != 0 {
+		t.Errorf("TopProducts len = %d, want 0 while pending", len(sum.TopProducts))
+	}
+
+	// Promote to paid: now the order counts as exactly one recognised sale.
+	if _, err := svc.MarkOrderPaid(ctx, pending.ID, "wxpay-OTN-1", paidAt); err != nil {
+		t.Fatalf("MarkOrderPaid: %v", err)
+	}
+	sum, err = svc.DailySummary(ctx, 10, fixedNow)
+	if err != nil {
+		t.Fatalf("DailySummary (paid): %v", err)
+	}
+	if sum.OrderCount != 1 {
+		t.Errorf("OrderCount = %d, want 1 after paid", sum.OrderCount)
+	}
+	// total = 2*300 = 600; cost = 2*200 = 400; profit = 600-400 = 200.
+	if sum.GrossCents != 600 || sum.NetCents != 600 {
+		t.Errorf("gross/net = %d/%d, want 600/600", sum.GrossCents, sum.NetCents)
+	}
+	if sum.CostCents != 400 {
+		t.Errorf("CostCents = %d, want 400", sum.CostCents)
+	}
+	if sum.ProfitCents != 200 {
+		t.Errorf("ProfitCents = %d, want 200", sum.ProfitCents)
+	}
+	if len(sum.TopProducts) != 1 || sum.TopProducts[0].ProductID != 1 || sum.TopProducts[0].Qty != 2 {
+		t.Errorf("TopProducts = %+v, want product 1 qty 2", sum.TopProducts)
+	}
+}
+
 func TestMemoryOrderRepo_DefensiveCopy(t *testing.T) {
 	repo := NewMemoryOrderRepo()
 	in := &Order{

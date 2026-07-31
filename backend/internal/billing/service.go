@@ -431,6 +431,15 @@ func (s *Service) DailySummary(ctx context.Context, storeID int64, day time.Time
 	top := make(map[int64]*agg)
 
 	for _, o := range orders {
+		// Only PAID orders count as revenue/cost. A pending (unpaid) order must
+		// not inflate gross/net/cost/profit — it is not yet a recognised sale.
+		// This mirrors the status='paid' filter in OrderTotalByMembers /
+		// RepurchaseMembers (both the SQL WHERE clause and the memory repo).
+		// ListByDate still returns every order of the day (its contract is
+		// unchanged); the paid filter is applied here at aggregation time.
+		if o.Status != orderStatusPaid {
+			continue
+		}
 		sum.OrderCount++
 		sum.GrossCents += o.TotalCents
 		sum.NetCents += o.PaidCents
