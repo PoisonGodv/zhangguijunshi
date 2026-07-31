@@ -17,8 +17,8 @@ package strategy
 //
 // SaveAdvice (rewrite row + rebuild items) and UpdateItemStatus (state-machine
 // transition) are the two critical sections, each serialised under the repo's
-// single write lock so the in-memory flow has the atomicity the pgx
-// implementation will get from a real transaction.
+// single write lock so the in-memory flow has the same all-or-nothing atomicity
+// the pgx implementation gets from its real BEGIN/COMMIT transaction.
 
 import (
 	"context"

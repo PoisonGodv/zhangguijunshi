@@ -164,9 +164,12 @@ var (
 // isolation); an in-memory implementation covers dev and tests.
 //
 // SaveAdvice is the atomic upsert: it rewrites the strategies row for
-// (tenant, store, forDate) and rebuilds its items in one critical section (a
-// real transaction under pgx). Every method treats a record owned by another
-// tenant as absent (ErrNotFound).
+// (tenant, store, forDate) and rebuilds its items in one critical section.
+// Both implementations are all-or-nothing: the in-memory repo serialises the
+// whole rebuild under its write lock; the pgx repo runs the four statements in
+// a single BEGIN/COMMIT transaction (rolling back on any mid-rebuild failure so
+// no half-rebuilt strategy or lost feedback is persisted). Every method treats
+// a record owned by another tenant as absent (ErrNotFound).
 type StrategyRepo interface {
 	// SaveAdvice atomically upserts the advice for (tenantID, storeID, forDate):
 	// same-day regeneration overwrites the existing row and rebuilds items (old
@@ -185,7 +188,9 @@ type StrategyRepo interface {
 
 	// UpdateItemStatus applies one execution_status transition and stamps
 	// executedAt. Illegal transitions yield ErrParam; absent/cross-tenant items
-	// yield ErrNotFound. Applied under the repo write lock (race-safe).
+	// yield ErrNotFound. The transition is atomic in both implementations: the
+	// in-memory repo applies it under the write lock, and the pgx repo folds the
+	// state machine into a single conditional UPDATE (no read-judge-write race).
 	UpdateItemStatus(ctx context.Context, tenantID, itemID int64, status string, executedAt *time.Time, now time.Time) (*StrategyItem, error)
 
 	// RecordFeedback upserts the boss's feedback for one item. UNIQUE(tenant,

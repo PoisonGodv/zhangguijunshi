@@ -4,14 +4,16 @@ package strategy
 // §12.3.1), mirroring internal/payment/pg_repo_test.go. Same-package so the
 // unexported sql* constants are referenced; QueryMatcherEqual because the SQL
 // text contains regex metacharacters. Column helpers match the scanXxx Scan
-// order exactly. SaveAdvice's upsert+items-rebuild chain (ON CONFLICT preserves
-// id/created_at; old feedback+items discarded; fresh items inserted) and
-// UpdateItemStatus's read-then-conditional-update state machine are the
-// load-bearing cases.
+// order exactly. SaveAdvice's transactional upsert+items-rebuild chain
+// (BEGIN → ON CONFLICT upsert → delete feedback → delete items → insert items →
+// COMMIT; mid-chain failure → ROLLBACK) and UpdateItemStatus's single
+// conditional-UPDATE state machine (0 rows → sqlItemExists disambiguates
+// ErrNotFound vs ErrParam) are the load-bearing cases.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -78,6 +80,8 @@ func TestPGStrategyRepo_SaveAdvice(t *testing.T) {
 	s := newSampleAdvice()
 	itemParams := mustJSON(t, s.Items[0].Params)
 
+	// Whole rebuild runs inside one transaction.
+	mock.ExpectBegin()
 	// (1) upsert strategy row; RETURNING id + preserved created_at.
 	mock.ExpectQuery(sqlStrategyUpsert).
 		WithArgs(int64(1), int64(10), "2026-07-29", []byte(s.Signals), 80, GenRuleOnly, nil, int64(0), StatusGenerated).
@@ -94,6 +98,7 @@ func TestPGStrategyRepo_SaveAdvice(t *testing.T) {
 	mock.ExpectQuery(sqlItemInsert).
 		WithArgs(int64(1), int64(7), 1, "coupon_wake", "wake_dormant", nil, nil, itemParams, "hi", "wake dormant member", nil, true, ItemPending, (*time.Time)(nil)).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(11)))
+	mock.ExpectCommit()
 
 	out, err := repo.SaveAdvice(context.Background(), s)
 	require.NoError(t, err)
@@ -120,6 +125,7 @@ func TestPGStrategyRepo_SaveAdviceOverwrite(t *testing.T) {
 	p1 := mustJSON(t, s.Items[0].Params)
 	p2 := mustJSON(t, s.Items[1].Params)
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(sqlStrategyUpsert).
 		WithArgs(int64(1), int64(10), "2026-07-29", []byte(s.Signals), 80, GenRuleOnly, nil, int64(0), StatusGenerated).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), fixedTime))
@@ -131,6 +137,7 @@ func TestPGStrategyRepo_SaveAdviceOverwrite(t *testing.T) {
 	mock.ExpectQuery(sqlItemInsert).
 		WithArgs(int64(1), int64(7), 2, "group_seckill", "clearance_coupon", nil, nil, p2, "", "", nil, true, ItemPending, (*time.Time)(nil)).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(12)))
+	mock.ExpectCommit()
 
 	out, err := repo.SaveAdvice(context.Background(), s)
 	require.NoError(t, err)
@@ -139,6 +146,42 @@ func TestPGStrategyRepo_SaveAdviceOverwrite(t *testing.T) {
 	require.Len(t, out.Items, 2)
 	require.Equal(t, int64(11), out.Items[0].ID)
 	require.Equal(t, int64(12), out.Items[1].ID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGStrategyRepo_SaveAdviceRollbackOnItemInsertFailure is the regression
+// case for the pre-fix bug: a failure on the 2nd item INSERT must roll the whole
+// rebuild back (no half-rebuilt strategy, no silently-lost old feedback).
+func TestPGStrategyRepo_SaveAdviceRollbackOnItemInsertFailure(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGStrategyRepo(mock)
+	s := newSampleAdvice()
+	s.Items = append(s.Items, StrategyItem{
+		Rank: 2, ActionType: "group_seckill", ReasonType: "clearance_coupon",
+		Params: map[string]any{"discount_permille": int64(700)}, MarginOK: true,
+	})
+	p1 := mustJSON(t, s.Items[0].Params)
+	p2 := mustJSON(t, s.Items[1].Params)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(sqlStrategyUpsert).
+		WithArgs(int64(1), int64(10), "2026-07-29", []byte(s.Signals), 80, GenRuleOnly, nil, int64(0), StatusGenerated).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), fixedTime))
+	mock.ExpectExec(sqlFeedbackDeleteByStrategy).WithArgs(int64(1), int64(1), int64(7)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(sqlItemsDeleteByStrategy).WithArgs(int64(1), int64(7)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	// First item insert succeeds.
+	mock.ExpectQuery(sqlItemInsert).
+		WithArgs(int64(1), int64(7), 1, "coupon_wake", "wake_dormant", nil, nil, p1, "hi", "wake dormant member", nil, true, ItemPending, (*time.Time)(nil)).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(11)))
+	// Second item insert fails → the whole rebuild must roll back.
+	mock.ExpectQuery(sqlItemInsert).
+		WithArgs(int64(1), int64(7), 2, "group_seckill", "clearance_coupon", nil, nil, p2, "", "", nil, true, ItemPending, (*time.Time)(nil)).
+		WillReturnError(errors.New("boom: item insert failed"))
+	mock.ExpectRollback()
+
+	_, err := repo.SaveAdvice(context.Background(), s)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "insert item")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -264,11 +307,8 @@ func TestPGStrategyRepo_GetItemNotFound(t *testing.T) {
 func TestPGStrategyRepo_UpdateItemStatus(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGStrategyRepo(mock)
-	// (1) load current status = pending.
-	mock.ExpectQuery(sqlItemGetStatus).
-		WithArgs(int64(1), int64(11)).
-		WillReturnRows(pgxmock.NewRows([]string{"execution_status"}).AddRow(ItemPending))
-	// (2) legal transition pending→executed; conditional UPDATE returns the row.
+	// Legal transition pending→executed: the single conditional UPDATE matches
+	// (WHERE execution_status='pending' AND $1<>'pending') and RETURNs the row.
 	executedAt := fixedTime
 	mock.ExpectQuery(sqlItemUpdateStatus).
 		WithArgs(ItemExecuted, &executedAt, int64(1), int64(11)).
@@ -285,10 +325,16 @@ func TestPGStrategyRepo_UpdateItemStatus(t *testing.T) {
 func TestPGStrategyRepo_UpdateItemStatusIllegal(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGStrategyRepo(mock)
-	// current = executed; executed→pending is illegal → ErrParam, no UPDATE issued.
-	mock.ExpectQuery(sqlItemGetStatus).
+	// executed→pending is illegal: the conditional UPDATE's WHERE clause matches
+	// nothing (row is 'executed', $1='pending' so the pending-branch is false and
+	// execution_status=$1 is false) → ErrNoRows. sqlItemExists then confirms the
+	// item exists, disambiguating to ErrParam (not ErrNotFound).
+	mock.ExpectQuery(sqlItemUpdateStatus).
+		WithArgs(ItemPending, (*time.Time)(nil), int64(1), int64(11)).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(sqlItemExists).
 		WithArgs(int64(1), int64(11)).
-		WillReturnRows(pgxmock.NewRows([]string{"execution_status"}).AddRow(ItemExecuted))
+		WillReturnRows(pgxmock.NewRows([]string{"?column?"}).AddRow(1))
 	_, err := repo.UpdateItemStatus(context.Background(), 1, 11, ItemPending, nil, fixedTime)
 	require.ErrorIs(t, err, ErrParam)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -297,7 +343,12 @@ func TestPGStrategyRepo_UpdateItemStatusIllegal(t *testing.T) {
 func TestPGStrategyRepo_UpdateItemStatusNotFound(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGStrategyRepo(mock)
-	mock.ExpectQuery(sqlItemGetStatus).
+	// Conditional UPDATE matches nothing and sqlItemExists also misses
+	// (absent/cross-tenant) → ErrNotFound.
+	mock.ExpectQuery(sqlItemUpdateStatus).
+		WithArgs(ItemExecuted, &fixedTime, int64(1), int64(99)).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(sqlItemExists).
 		WithArgs(int64(1), int64(99)).
 		WillReturnError(pgx.ErrNoRows)
 	_, err := repo.UpdateItemStatus(context.Background(), 1, 99, ItemExecuted, &fixedTime, fixedTime)

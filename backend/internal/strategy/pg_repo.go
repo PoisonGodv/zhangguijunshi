@@ -11,21 +11,28 @@ package strategy
 // nullable columns (llm_tier / target / product_id / copy / reason /
 // expected_effect / executed_at) use database/sql Null types.
 //
-// SaveAdvice is the atomic upsert: the strategies row is rewritten in place via
-// INSERT ... ON CONFLICT (tenant_id, store_id, for_date) DO UPDATE (the row keeps
-// its id + original created_at); the old items AND their feedback are then
-// discarded (DELETE feedback by strategy's items, then DELETE items) and fresh
-// items inserted — exactly the "overwrite" semantics of MemoryStrategyRepo. (The
-// feedback delete is required for faithful parity: strategy_feedback has an FK to
-// strategy_items without ON DELETE CASCADE, so orphaned feedback would otherwise
-// block the item delete. strategy_attribution is owned by aiengine.attribution
-// and is left untouched.)
+// SaveAdvice is the all-or-nothing rebuild of one day's advice: the strategies
+// row is rewritten in place via INSERT ... ON CONFLICT (tenant_id, store_id,
+// for_date) DO UPDATE (the row keeps its id + original created_at); the old
+// items AND their feedback are then discarded (DELETE feedback by strategy's
+// items, then DELETE items) and fresh items inserted — exactly the "overwrite"
+// semantics of MemoryStrategyRepo. The four statements run inside ONE real
+// transaction (txBeginner type-assert over the pool): a failure mid-rebuild
+// rolls back so no half-rebuilt strategy and no silently-lost feedback is ever
+// observable. (The feedback delete is required for faithful parity:
+// strategy_feedback has an FK to strategy_items without ON DELETE CASCADE, so
+// orphaned feedback would otherwise block the item delete. strategy_attribution
+// is owned by aiengine.attribution and is left untouched.)
 //
-// UpdateItemStatus is a MarkSuccess-style read-then-conditional-update so the
-// execution_status state machine (isAllowedItemTransition) is enforced race-safe
-// and illegal transitions return ErrParam. RecordFeedback verifies the item is
-// owned by the tenant (cross-tenant → ErrNotFound) before the
-// UNIQUE(tenant, item) ON CONFLICT upsert.
+// UpdateItemStatus folds the execution_status state machine
+// (isAllowedItemTransition) into a single conditional UPDATE, so the
+// read-judge-write is atomic: the WHERE clause only matches when the transition
+// is legal (same-status no-op, or pending→terminal), and a concurrent writer
+// that already moved the row off pending can never be bypassed. RowsAffected==0
+// is then disambiguated by sqlItemExists into ErrNotFound (absent/cross-tenant)
+// vs ErrParam (illegal transition). RecordFeedback verifies the item is owned by
+// the tenant (cross-tenant → ErrNotFound) before the UNIQUE(tenant, item) ON
+// CONFLICT upsert.
 
 import (
 	"context"
@@ -53,6 +60,14 @@ type PGPool interface {
 // lacking Query returns an empty slice rather than failing.
 type queryer interface {
 	Query(ctx context.Context, query string, args ...any) (pgx.Rows, error)
+}
+
+// txBeginner is the optional transaction capability used by SaveAdvice. Both
+// *pgxpool.Pool and pgxmock.PgxPoolIface satisfy it; if a pool lacks it the
+// save degrades to the previous non-transactional two-step logic rather than
+// panicking (mirrors the inventory/membership txBeginner idiom).
+type txBeginner interface {
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
 // rowScanner is the common Scan surface of pgx.Row and pgx.Rows.
@@ -107,10 +122,17 @@ ORDER BY rank`
 	sqlItemGetByID = `SELECT id, tenant_id, strategy_id, rank, action_type, reason_type, target, product_id, params, copy, reason, expected_effect, margin_ok, execution_status, executed_at
 FROM strategy_items
 WHERE tenant_id = $1 AND id = $2`
-	sqlItemGetStatus    = `SELECT execution_status FROM strategy_items WHERE tenant_id = $1 AND id = $2`
-	sqlItemExists       = `SELECT 1 FROM strategy_items WHERE tenant_id = $1 AND id = $2`
+	sqlItemExists = `SELECT 1 FROM strategy_items WHERE tenant_id = $1 AND id = $2`
+	// sqlItemUpdateStatus folds the execution_status state machine
+	// (isAllowedItemTransition) into the WHERE clause so the transition is atomic
+	// — no read-judge-write window a concurrent writer could slip through. The
+	// row matches only when the transition is legal: a same-status no-op
+	// (execution_status = $1) or a pending→terminal move (execution_status =
+	// 'pending' AND $1 <> 'pending'). RowsAffected==0 then means either the item
+	// is absent/cross-tenant (→ ErrNotFound via sqlItemExists) or the transition
+	// was illegal (→ ErrParam).
 	sqlItemUpdateStatus = `UPDATE strategy_items SET execution_status = $1, executed_at = $2
-WHERE tenant_id = $3 AND id = $4
+WHERE tenant_id = $3 AND id = $4 AND (execution_status = $1 OR (execution_status = 'pending' AND $1 <> 'pending'))
 RETURNING id, tenant_id, strategy_id, rank, action_type, reason_type, target, product_id, params, copy, reason, expected_effect, margin_ok, execution_status, executed_at`
 )
 
@@ -258,12 +280,19 @@ func (r *PGStrategyRepo) loadItems(ctx context.Context, tenantID, strategyID int
 	return out, nil
 }
 
-// SaveAdvice atomically upserts the advice for (tenant, store, forDate):
+// SaveAdvice upserts the advice for (tenant, store, forDate) as ONE transaction
+// when the pool supports BeginTx (both *pgxpool.Pool and pgxmock do):
 // (1) upsert the strategies row (ON CONFLICT preserves id + created_at);
 // (2) discard old feedback for this strategy's items;
 // (3) discard old items;
 // (4) insert fresh items, backfilling their IDs onto the input pointer.
-// A deep clone is returned.
+// Every statement runs on the tx; a failure anywhere rolls the whole rebuild
+// back (deferred Rollback unless committed) so no half-rebuilt strategy and no
+// silently-lost feedback is ever persisted. A deep clone is returned.
+//
+// A pool lacking BeginTx degrades to the legacy non-transactional two-step
+// logic (same statements, no rollback protection) so a minimal PGPool still
+// functions.
 func (r *PGStrategyRepo) SaveAdvice(ctx context.Context, s *Strategy) (*Strategy, error) {
 	if r == nil || r.pool == nil || s == nil {
 		return nil, ErrNotFound
@@ -276,54 +305,93 @@ func (r *PGStrategyRepo) SaveAdvice(ctx context.Context, s *Strategy) (*Strategy
 	if s.LLMTier != "" {
 		llmTierArg = s.LLMTier
 	}
-	// (1) upsert strategy row, echo back id + preserved created_at.
-	if err := r.pool.QueryRow(ctx, sqlStrategyUpsert,
-		s.TenantID, s.StoreID, s.ForDate, signals, s.DataQualityScore, s.GeneratedBy,
-		llmTierArg, s.TotalCostMicroCents, s.Status,
-	).Scan(&s.ID, &s.CreatedAt); err != nil {
-		return nil, fmt.Errorf("strategy: pg save advice upsert: %w", err)
+
+	// execer is the narrow write surface shared by the pool and a pgx.Tx so the
+	// same statement sequence runs in both the transactional and degraded paths.
+	type execer interface {
+		QueryRow(ctx context.Context, query string, args ...any) pgx.Row
+		Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error)
 	}
-	// (2) discard old feedback for the strategy's items (mirrors memory; must
-	// precede the item delete because the FK lacks ON DELETE CASCADE).
-	if _, err := r.pool.Exec(ctx, sqlFeedbackDeleteByStrategy, s.TenantID, s.TenantID, s.ID); err != nil {
-		return nil, fmt.Errorf("strategy: pg save advice delete feedback: %w", err)
+
+	run := func(e execer) error {
+		// (1) upsert strategy row, echo back id + preserved created_at.
+		if err := e.QueryRow(ctx, sqlStrategyUpsert,
+			s.TenantID, s.StoreID, s.ForDate, signals, s.DataQualityScore, s.GeneratedBy,
+			llmTierArg, s.TotalCostMicroCents, s.Status,
+		).Scan(&s.ID, &s.CreatedAt); err != nil {
+			return fmt.Errorf("strategy: pg save advice upsert: %w", err)
+		}
+		// (2) discard old feedback for the strategy's items (mirrors memory; must
+		// precede the item delete because the FK lacks ON DELETE CASCADE).
+		if _, err := e.Exec(ctx, sqlFeedbackDeleteByStrategy, s.TenantID, s.TenantID, s.ID); err != nil {
+			return fmt.Errorf("strategy: pg save advice delete feedback: %w", err)
+		}
+		// (3) discard old items.
+		if _, err := e.Exec(ctx, sqlItemsDeleteByStrategy, s.TenantID, s.ID); err != nil {
+			return fmt.Errorf("strategy: pg save advice delete items: %w", err)
+		}
+		// (4) insert fresh items, backfilling ownership + IDs.
+		for i := range s.Items {
+			it := &s.Items[i]
+			it.StrategyID = s.ID
+			it.TenantID = s.TenantID
+			if it.ExecutionStatus == "" {
+				it.ExecutionStatus = ItemPending
+			}
+			targetArg, err := jsonbArg(it.Target)
+			if err != nil {
+				return fmt.Errorf("strategy: pg save advice marshal target: %w", err)
+			}
+			paramsBytes, err := paramsArg(it.Params)
+			if err != nil {
+				return fmt.Errorf("strategy: pg save advice marshal params: %w", err)
+			}
+			expectedArg, err := jsonbArg(it.ExpectedEffect)
+			if err != nil {
+				return fmt.Errorf("strategy: pg save advice marshal expected: %w", err)
+			}
+			var productIDArg any
+			if it.ProductID != 0 {
+				productIDArg = it.ProductID
+			}
+			if err := e.QueryRow(ctx, sqlItemInsert,
+				it.TenantID, it.StrategyID, it.Rank, it.ActionType, it.ReasonType,
+				targetArg, productIDArg, paramsBytes, it.Copy, it.Reason, expectedArg,
+				it.MarginOK, it.ExecutionStatus, it.ExecutedAt,
+			).Scan(&it.ID); err != nil {
+				return fmt.Errorf("strategy: pg save advice insert item: %w", err)
+			}
+		}
+		return nil
 	}
-	// (3) discard old items.
-	if _, err := r.pool.Exec(ctx, sqlItemsDeleteByStrategy, s.TenantID, s.ID); err != nil {
-		return nil, fmt.Errorf("strategy: pg save advice delete items: %w", err)
+
+	beginner, ok := r.pool.(txBeginner)
+	if !ok {
+		// Degraded path: no transaction available; run the statements directly on
+		// the pool (legacy behaviour, no rollback protection).
+		if err := run(r.pool); err != nil {
+			return nil, err
+		}
+		return CloneStrategy(s), nil
 	}
-	// (4) insert fresh items, backfilling ownership + IDs.
-	for i := range s.Items {
-		it := &s.Items[i]
-		it.StrategyID = s.ID
-		it.TenantID = s.TenantID
-		if it.ExecutionStatus == "" {
-			it.ExecutionStatus = ItemPending
-		}
-		targetArg, err := jsonbArg(it.Target)
-		if err != nil {
-			return nil, fmt.Errorf("strategy: pg save advice marshal target: %w", err)
-		}
-		paramsBytes, err := paramsArg(it.Params)
-		if err != nil {
-			return nil, fmt.Errorf("strategy: pg save advice marshal params: %w", err)
-		}
-		expectedArg, err := jsonbArg(it.ExpectedEffect)
-		if err != nil {
-			return nil, fmt.Errorf("strategy: pg save advice marshal expected: %w", err)
-		}
-		var productIDArg any
-		if it.ProductID != 0 {
-			productIDArg = it.ProductID
-		}
-		if err := r.pool.QueryRow(ctx, sqlItemInsert,
-			it.TenantID, it.StrategyID, it.Rank, it.ActionType, it.ReasonType,
-			targetArg, productIDArg, paramsBytes, it.Copy, it.Reason, expectedArg,
-			it.MarginOK, it.ExecutionStatus, it.ExecutedAt,
-		).Scan(&it.ID); err != nil {
-			return nil, fmt.Errorf("strategy: pg save advice insert item: %w", err)
-		}
+
+	tx, err := beginner.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("strategy: pg save advice begin: %w", err)
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := run(tx); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("strategy: pg save advice commit: %w", err)
+	}
+	committed = true
 	return CloneStrategy(s), nil
 }
 
@@ -428,28 +496,32 @@ func (r *PGStrategyRepo) GetItem(ctx context.Context, tenantID, itemID int64) (*
 	return it, nil
 }
 
-// UpdateItemStatus applies one execution_status transition: read current status,
-// enforce the state machine (isAllowedItemTransition → ErrParam on illegal),
-// then conditional UPDATE returning the full row. Absent/cross-tenant items
-// yield ErrNotFound.
+// UpdateItemStatus applies one execution_status transition atomically: the
+// state machine (isAllowedItemTransition) is folded into a single conditional
+// UPDATE whose WHERE clause only matches a legal transition (same-status no-op,
+// or pending→terminal), RETURNING the full row. There is no read-then-write
+// window, so a concurrent writer that already moved the row off pending cannot
+// be bypassed. When the UPDATE returns no row, sqlItemExists disambiguates:
+// absent/cross-tenant → ErrNotFound; the item exists but the transition was
+// illegal → ErrParam.
 func (r *PGStrategyRepo) UpdateItemStatus(ctx context.Context, tenantID, itemID int64, status string, executedAt *time.Time, _ time.Time) (*StrategyItem, error) {
 	if r == nil || r.pool == nil {
 		return nil, ErrNotFound
 	}
-	var current string
-	if err := r.pool.QueryRow(ctx, sqlItemGetStatus, tenantID, itemID).Scan(&current); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, fmt.Errorf("strategy: pg update item status load: %w", err)
-	}
-	if !isAllowedItemTransition(current, status) {
-		return nil, ErrParam
-	}
 	it, err := scanItem(r.pool.QueryRow(ctx, sqlItemUpdateStatus, status, executedAt, tenantID, itemID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
+			// No row matched: either the item is absent/cross-tenant, or it
+			// exists but the requested transition is illegal under the state
+			// machine. sqlItemExists tells the two apart.
+			var one int
+			if err := r.pool.QueryRow(ctx, sqlItemExists, tenantID, itemID).Scan(&one); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return nil, ErrNotFound
+				}
+				return nil, fmt.Errorf("strategy: pg update item status exists check: %w", err)
+			}
+			return nil, ErrParam
 		}
 		return nil, fmt.Errorf("strategy: pg update item status: %w", err)
 	}
