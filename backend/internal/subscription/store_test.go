@@ -177,6 +177,9 @@ func TestPGStore_Upsert_CancelAndInsert(t *testing.T) {
 	mock := newSubMockPool(t)
 	repo := NewPGStore(mock)
 	end := fixedNow.AddDate(0, 1, 0)
+	// Upsert is atomic: cancel + insert run inside one tx (ExpectBegin …
+	// ExpectCommit).
+	mock.ExpectBegin()
 	mock.ExpectExec(sqlSubCancelActive).
 		WithArgs(int64(1)).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -186,6 +189,7 @@ func TestPGStore_Upsert_CancelAndInsert(t *testing.T) {
 		WithArgs(int64(1), PlanPro, fixedNow, pgxmock.AnyArg(), "active", "manual", "", fixedNow, fixedNow).
 		WillReturnRows(pgxmock.NewRows(subCols).
 			AddRow(int64(9), int64(1), PlanPro, fixedNow, end, "active", "manual", "", fixedNow, fixedNow))
+	mock.ExpectCommit()
 	in := &Subscription{
 		TenantID: 1, Plan: PlanPro, PeriodStartedAt: fixedNow, PeriodEndsAt: &end,
 		Status: "active", Source: "manual", CreatedAt: fixedNow, UpdatedAt: fixedNow,
@@ -194,6 +198,59 @@ func TestPGStore_Upsert_CancelAndInsert(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(9), out.ID)
 	require.Equal(t, PlanPro, out.Plan)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGStore_Upsert_InsertFails_Rollback is the load-bearing atomicity case:
+// when the new-row insert fails AFTER the prior active row was cancelled, the
+// whole transaction must roll back so the tenant is never left with zero active
+// rows (the old subscription is preserved, the renewal is not silently
+// dropped). ExpectRollback asserts the rollback actually happens.
+func TestPGStore_Upsert_InsertFails_Rollback(t *testing.T) {
+	mock := newSubMockPool(t)
+	repo := NewPGStore(mock)
+	end := fixedNow.AddDate(0, 1, 0)
+	mock.ExpectBegin()
+	// Cancel of the prior active row succeeds …
+	mock.ExpectExec(sqlSubCancelActive).
+		WithArgs(int64(1)).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	// … but the insert fails (e.g. constraint / connection drop).
+	mock.ExpectQuery(sqlSubInsert).
+		WithArgs(int64(1), PlanPro, fixedNow, pgxmock.AnyArg(), "active", "manual", "", fixedNow, fixedNow).
+		WillReturnError(pgx.ErrNoRows)
+	// The cancel must be undone: tx rolls back, active sub is not lost.
+	mock.ExpectRollback()
+
+	in := &Subscription{
+		TenantID: 1, Plan: PlanPro, PeriodStartedAt: fixedNow, PeriodEndsAt: &end,
+		Status: "active", Source: "manual", CreatedAt: fixedNow, UpdatedAt: fixedNow,
+	}
+	out, err := repo.Upsert(context.Background(), in)
+	require.Error(t, err, "insert failure must surface as an error, not a silent drop")
+	require.Nil(t, out)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGStore_Upsert_CancelFails_Rollback covers the first step failing: the
+// transaction rolls back before any insert is attempted.
+func TestPGStore_Upsert_CancelFails_Rollback(t *testing.T) {
+	mock := newSubMockPool(t)
+	repo := NewPGStore(mock)
+	end := fixedNow.AddDate(0, 1, 0)
+	mock.ExpectBegin()
+	mock.ExpectExec(sqlSubCancelActive).
+		WithArgs(int64(1)).
+		WillReturnError(pgx.ErrTxClosed)
+	mock.ExpectRollback()
+
+	in := &Subscription{
+		TenantID: 1, Plan: PlanPro, PeriodStartedAt: fixedNow, PeriodEndsAt: &end,
+		Status: "active", Source: "manual", CreatedAt: fixedNow, UpdatedAt: fixedNow,
+	}
+	out, err := repo.Upsert(context.Background(), in)
+	require.Error(t, err)
+	require.Nil(t, out)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

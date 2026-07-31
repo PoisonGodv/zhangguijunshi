@@ -155,9 +155,15 @@ func (s *MemoryStore) ExpireDue(_ context.Context, now time.Time) (int, error) {
 // (mirrors attribution.PGPool / bandit.PGRepo, CONTRACT §15.5.7).
 // ListHistory additionally type-asserts the pool to pgQuerier for multi-row
 // reads so the frozen PGPool surface stays minimal.
+//
+// Begin is part of the interface (rather than an optional type-assert) because
+// Upsert MUST be atomic: it cancels the tenant's prior active row and inserts
+// the new one in a single transaction. Both *pgxpool.Pool and
+// pgxmock.PgxPoolIface satisfy Begin, so every production/test pool works.
 type PGPool interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 // pgQuerier is the multi-row read surface both *pgxpool.Pool and
@@ -234,8 +240,11 @@ func (s *PGStore) Get(ctx context.Context, tenantID int64) (*Subscription, error
 }
 
 // Upsert cancels prior active rows then inserts a new active row, returning
-// the persisted record (id/defaults backfilled from RETURNING). A nil pool
-// returns errcode.ErrInternal (writes must not silently drop).
+// the persisted record (id/defaults backfilled from RETURNING). The cancel and
+// insert run in a SINGLE transaction so a renewal can never leave the tenant
+// with zero active rows (cancel committed, insert failed) or silently drop a
+// renewal: any error rolls the whole operation back. A nil pool returns
+// errcode.ErrInternal (writes must not silently drop).
 func (s *PGStore) Upsert(ctx context.Context, sub *Subscription) (*Subscription, error) {
 	if sub == nil {
 		return nil, errcode.ErrParam
@@ -251,18 +260,32 @@ func (s *PGStore) Upsert(ctx context.Context, sub *Subscription) (*Subscription,
 	if plan == "" {
 		plan = PlanFree
 	}
-	if _, err := s.pool.Exec(ctx, sqlSubCancelActive, sub.TenantID); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("subscription: pg upsert begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if _, err := tx.Exec(ctx, sqlSubCancelActive, sub.TenantID); err != nil {
 		return nil, fmt.Errorf("subscription: pg cancel active: %w", err)
 	}
 	var out Subscription
 	if err := scanSubscription(
-		s.pool.QueryRow(ctx, sqlSubInsert,
+		tx.QueryRow(ctx, sqlSubInsert,
 			sub.TenantID, plan, sub.PeriodStartedAt, sub.PeriodEndsAt,
 			status, sub.Source, sub.PaymentRef, sub.CreatedAt, sub.UpdatedAt,
 		), &out,
 	); err != nil {
 		return nil, fmt.Errorf("subscription: pg insert: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("subscription: pg upsert commit: %w", err)
+	}
+	committed = true
 	return &out, nil
 }
 
