@@ -6,6 +6,7 @@ package bootstrap
 
 import (
 	"crypto/ecdsa"
+	"fmt"
 
 	"go.uber.org/zap"
 
@@ -18,6 +19,16 @@ import (
 // key from cfg.JWT.KeyFile when set; otherwise it derives a deterministic dev
 // key (logged loudly) so a dev server still issues verifiable tokens with no
 // configuration.
+//
+// Fail-closed (high-severity authz fix): the DevKey fallback is whitelisted to
+// the dev environment ONLY. Any non-dev env (staging/prod/…) without a mounted
+// key file is a hard error rather than a silent fall back to the publicly known
+// DevSeed-derived key — with that key an attacker could forge arbitrary
+// tenant/admin tokens. BuildInfra wraps the error so the process refuses to
+// boot. A whitelist (only "dev" may use DevKey) is used deliberately instead of
+// a blacklist so a new/typo'd env name fails closed too. Note: an empty
+// cfg.App.Env is treated as dev so existing tests / zero-value configs keep
+// working.
 func buildJWTManager(cfg *config.Config, log *zap.Logger) (*jwt.Manager, error) {
 	var priv *ecdsa.PrivateKey
 	if cfg.JWT.KeyFile != "" {
@@ -28,6 +39,12 @@ func buildJWTManager(cfg *config.Config, log *zap.Logger) (*jwt.Manager, error) 
 		priv = p
 		log.Info("jwt key loaded from file", zap.String("key_file", cfg.JWT.KeyFile))
 	} else {
+		// Fail-closed whitelist: only the dev environment may use the derived
+		// public dev key. staging/prod (or any non-dev env) MUST mount a real
+		// ECDSA P-256 PEM via jwt.key_file (ZG_JWT_KEY_FILE).
+		if cfg.App.Env != "" && cfg.App.Env != "dev" {
+			return nil, fmt.Errorf("jwt: %s env requires jwt.key_file (set ZG_JWT_KEY_FILE to a mounted ECDSA P-256 PEM); refusing to fall back to the public dev key", cfg.App.Env)
+		}
 		p, err := jwt.DevKey(jwt.DevSeed)
 		if err != nil {
 			return nil, err
