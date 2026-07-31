@@ -38,8 +38,13 @@ import (
 // exact-hash cache (internal/aiengine/cache.Cache) is keyed by
 // (tenant, store, date); this L2 is keyed by the EMBEDDING of a signal text,
 // so it can return advice from a different day whose signals were semantically
-// near-identical. All three methods take tenantID explicitly — tenant is NEVER
-// trusted from the strategy payload or the signal text (ARCH-01 / §13.5.1).
+// near-identical. All methods take tenantID AND storeID explicitly — neither is
+// ever trusted from the strategy payload or the signal text (ARCH-01 /
+// §13.5.1). storeID is part of the retrieval key (migration 000022): a
+// multi-store tenant's advice is store-specific (it references that store's
+// products / members), so a near-identical signal on a DIFFERENT store must NOT
+// hit another store's cached draft — doing so would surface one store's advice
+// to another (high-severity cross-store leak).
 //
 // TryHit returns a defensive deep copy of the cached advice on a hit
 // (strategy.CloneStrategy for Memory; a freshly unmarshalled value for
@@ -47,17 +52,17 @@ import (
 // also stamps Metrics.IncHit; on a miss, Metrics.IncMiss.
 type SemanticCache interface {
 	// TryHit probes the cache by the embedding of signalText, filtered to
-	// tenantID + business and entries whose expires_at > now. Returns
+	// tenantID + storeID + business and entries whose expires_at > now. Returns
 	// (advice, true, nil) on a hit; (nil, false, nil) on a miss; a non-nil
 	// error only when embedding or storage genuinely fails (a storage miss
 	// is NOT an error — it just means a cold run).
-	TryHit(ctx context.Context, tenantID int64, business, signalText string) (*strategy.Strategy, bool, error)
+	TryHit(ctx context.Context, tenantID, storeID int64, business, signalText string) (*strategy.Strategy, bool, error)
 
-	// Put stores s (defensive copy) under the embedding of signalText, with
-	// expires_at = now + ttl. A nil s is a no-op. Put must not block the
-	// pipeline on failure — callers swallow its error (a failed write just
-	// means the next run is cold).
-	Put(ctx context.Context, tenantID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error
+	// Put stores s (defensive copy) under the embedding of signalText, keyed by
+	// (tenantID, storeID, business), with expires_at = now + ttl. A nil s is a
+	// no-op. Put must not block the pipeline on failure — callers swallow its
+	// error (a failed write just means the next run is cold).
+	Put(ctx context.Context, tenantID, storeID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error
 
 	// Invalidate expires every entry for tenantID (Memory: drops rows;
 	// PGVector: UPDATE expires_at=now() WHERE tenant_id=$1). Called after the

@@ -36,21 +36,23 @@ type Pool interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-// SQL statements (§7.6.3). $3 in TryHit is a pgvector.Vector; the main thread
+// SQL statements (§7.6.3). $4 in TryHit is a pgvector.Vector; the main thread
 // registers the type on the pool so pgx sends it with the vector OID. The
 // distance threshold 0.15 mirrors the Memory similarity threshold 0.85
-// (distance = 1 - similarity).
+// (distance = 1 - similarity). store_id is part of the retrieval key
+// (migration 000022): a multi-store tenant's near-identical signal on a
+// different store must NOT hit another store's cached draft.
 const (
 	// sqlSemanticHit selects the single closest non-expired advice within the
-	// same tenant + business, cosine-distance < 0.15 (similarity > 0.85).
+	// same tenant + store + business, cosine-distance < 0.15 (similarity > 0.85).
 	sqlSemanticHit = `SELECT advice_json FROM ai_cache
-WHERE tenant_id = $1 AND business = $2 AND expires_at > now() AND embedding <=> $3 < 0.15
-ORDER BY embedding <=> $3 LIMIT 1`
+WHERE tenant_id = $1 AND store_id = $2 AND business = $3 AND expires_at > now() AND embedding <=> $4 < 0.15
+ORDER BY embedding <=> $4 LIMIT 1`
 
 	// sqlSemanticPut inserts a new cache row; hit_count defaults to 0 via the
 	// table DDL.
-	sqlSemanticPut = `INSERT INTO ai_cache (tenant_id, business, key_text, embedding, advice_json, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6)`
+	sqlSemanticPut = `INSERT INTO ai_cache (tenant_id, store_id, business, key_text, embedding, advice_json, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
 	// sqlSemanticInvalidate soft-expires every row for tenantID
 	// (UPDATE expires_at=now() WHERE tenant_id=$1, §7.6.4).
@@ -83,10 +85,10 @@ func NewPGVectorCache(pool Pool, emb gateway.Embedder, opts ...Option) *PGVector
 }
 
 // TryHit embeds signalText and queries ai_cache for the closest non-expired
-// row within (tenantID, business) at cosine distance < 0.15. On a hit the
-// advice_json is unmarshalled into a fresh *strategy.Strategy (already
+// row within (tenantID, storeID, business) at cosine distance < 0.15. On a hit
+// the advice_json is unmarshalled into a fresh *strategy.Strategy (already
 // independent, no extra clone needed). pgx.ErrNoRows is a miss, not an error.
-func (c *PGVectorSemanticCache) TryHit(ctx context.Context, tenantID int64, business, signalText string) (*strategy.Strategy, bool, error) {
+func (c *PGVectorSemanticCache) TryHit(ctx context.Context, tenantID, storeID int64, business, signalText string) (*strategy.Strategy, bool, error) {
 	if c == nil || c.pool == nil || c.embedder == nil {
 		c.recordMiss(tenantID)
 		return nil, false, nil
@@ -98,7 +100,7 @@ func (c *PGVectorSemanticCache) TryHit(ctx context.Context, tenantID int64, busi
 	}
 
 	var raw []byte
-	err = c.pool.QueryRow(ctx, sqlSemanticHit, tenantID, business, pgvector.NewVector(vec)).Scan(&raw)
+	err = c.pool.QueryRow(ctx, sqlSemanticHit, tenantID, storeID, business, pgvector.NewVector(vec)).Scan(&raw)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.metrics.IncMiss(tenantID)
@@ -125,7 +127,7 @@ func (c *PGVectorSemanticCache) TryHit(ctx context.Context, tenantID int64, busi
 // JSON-encoded *strategy.Strategy; expires_at = now + ttl (24h from the
 // pipeline). A nil s is a no-op. Returns the underlying error on failure;
 // callers (the pipeline) swallow it so a failed write just means a cold run.
-func (c *PGVectorSemanticCache) Put(ctx context.Context, tenantID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error {
+func (c *PGVectorSemanticCache) Put(ctx context.Context, tenantID, storeID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error {
 	if c == nil || c.pool == nil || c.embedder == nil || s == nil {
 		return nil
 	}
@@ -138,7 +140,7 @@ func (c *PGVectorSemanticCache) Put(ctx context.Context, tenantID int64, busines
 		return fmt.Errorf("semantic: marshal advice: %w", err)
 	}
 	expiresAt := c.now().Add(ttl)
-	if _, err := c.pool.Exec(ctx, sqlSemanticPut, tenantID, business, signalText, pgvector.NewVector(vec), adviceJSON, expiresAt); err != nil {
+	if _, err := c.pool.Exec(ctx, sqlSemanticPut, tenantID, storeID, business, signalText, pgvector.NewVector(vec), adviceJSON, expiresAt); err != nil {
 		return fmt.Errorf("semantic: pgvector put: %w", err)
 	}
 	return nil

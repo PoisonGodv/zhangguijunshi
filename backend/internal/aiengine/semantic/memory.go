@@ -20,6 +20,7 @@ import (
 // memEntry is one cached advice row in MemorySemanticCache.
 type memEntry struct {
 	tenantID  int64
+	storeID   int64
 	business  string
 	embedding []float32
 	advice    *strategy.Strategy
@@ -52,10 +53,13 @@ func NewMemoryCache(emb gateway.Embedder, opts ...Option) *MemorySemanticCache {
 }
 
 // TryHit probes the cache by the embedding of signalText (§13.3.4). A row
-// matches when tenantID, business, and expiresAt > now all agree AND its
-// cosine similarity with the query embedding exceeds the threshold; among
+// matches when tenantID, storeID, business, and expiresAt > now all agree AND
+// its cosine similarity with the query embedding exceeds the threshold; among
 // matches, the highest-similarity row wins. Returns a defensive copy on hit.
-func (c *MemorySemanticCache) TryHit(ctx context.Context, tenantID int64, business, signalText string) (*strategy.Strategy, bool, error) {
+// storeID is part of the match key (migration 000022): a multi-store tenant's
+// near-identical signal on a different store must NOT hit another store's
+// cached draft (cross-store advice leak).
+func (c *MemorySemanticCache) TryHit(ctx context.Context, tenantID, storeID int64, business, signalText string) (*strategy.Strategy, bool, error) {
 	if c == nil || c.embedder == nil {
 		c.recordMiss(tenantID)
 		return nil, false, nil
@@ -73,7 +77,7 @@ func (c *MemorySemanticCache) TryHit(ctx context.Context, tenantID int64, busine
 	c.mu.RLock()
 	for i := range c.entries {
 		e := &c.entries[i]
-		if e.tenantID != tenantID || e.business != business {
+		if e.tenantID != tenantID || e.storeID != storeID || e.business != business {
 			continue
 		}
 		if !e.expiresAt.After(now) {
@@ -104,7 +108,7 @@ func (c *MemorySemanticCache) TryHit(ctx context.Context, tenantID int64, busine
 // expiresAt = now + ttl. A nil s is a no-op (the pipeline calls Put after a
 // successful generate, so s should always be non-nil; nil means a caller bug
 // we swallow rather than panic on).
-func (c *MemorySemanticCache) Put(ctx context.Context, tenantID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error {
+func (c *MemorySemanticCache) Put(ctx context.Context, tenantID, storeID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error {
 	if c == nil || s == nil || c.embedder == nil {
 		return nil
 	}
@@ -121,6 +125,7 @@ func (c *MemorySemanticCache) Put(ctx context.Context, tenantID int64, business,
 	c.mu.Lock()
 	c.entries = append(c.entries, memEntry{
 		tenantID:  tenantID,
+		storeID:   storeID,
 		business:  business,
 		embedding: emb,
 		advice:    strategy.CloneStrategy(s),

@@ -403,6 +403,33 @@ func TestExecutor_CouponMarginFloor(t *testing.T) {
 	}
 }
 
+// TestExecutor_CouponMissingAudience_Unresolved: a coupon-bearing item that
+// reached exec without a resolved member_id / coupon_id (the pre-enrichment
+// state, aiengine 修复②) must decline with an HONEST blocked(audience_unresolved)
+// — NOT invalid_item, and NOT a fake executed to member 0 / coupon 0.
+func TestExecutor_CouponMissingAudience_Unresolved(t *testing.T) {
+	svc := newSvc()
+	// No member_id / coupon_id in Params — exactly what the pipeline produced
+	// before the enrichment stage existed.
+	items := seedAdvice(t, svc, seedTID, seedSID, item(
+		rule.ActCouponWake, rule.ReasonWakeDormant, 0,
+		map[string]any{"threshold_cents": int64(3000), "off_cents": int64(500)},
+	))
+	coupons := &fakeCoupons{}
+	ex := NewExecutor(svc, margin.Guard{MarginFloorPct: 5},
+		coupons, &fakeSender{}, &fakePricer{}, &fakeGroupbuy{})
+	res, err := ex.Run(tenantCtx(seedTID, seedSID), ExecuteInput{StrategyItemID: items[0].ID})
+	if err != nil {
+		t.Fatalf("Run err: %v", err)
+	}
+	if res.Status != strategy.ItemBlocked || res.Reason != ReasonAudienceUnresolved {
+		t.Fatalf("status=%s reason=%s want blocked/audience_unresolved", res.Status, res.Reason)
+	}
+	if coupons.calls != 0 {
+		t.Fatalf("coupons.Issue called %d, want 0 (no audience to issue to)", coupons.calls)
+	}
+}
+
 // TestExecutor_NoTenant: missing tenant in ctx → error (EnforceTenant gate).
 func TestExecutor_NoTenant(t *testing.T) {
 	svc := newSvc()

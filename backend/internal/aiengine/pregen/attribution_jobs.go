@@ -93,6 +93,17 @@ func WithItemEnumerator(enu StrategyItemEnumerator) Option {
 	}
 }
 
+// WithBanditCreditStore wires the bandit-credit de-duplication store (aiengine
+// 修复③). When set, BanditUpdate credits each executed item exactly once across
+// consecutive ticks (bandit_credited_at marker), while keeping the 72h lookback
+// window's missed-tick resilience. nil preserves the legacy non-deduplicating
+// behaviour (backward-compatible with M3-S2/S3 callers).
+func WithBanditCreditStore(store BanditCreditStore) Option {
+	return func(s *Scheduler) {
+		s.creditStore = store
+	}
+}
+
 // AttributionBackfill computes + records attribution metrics for every active
 // tenant's executed strategy items in the T+24h window (CONTRACT §14.7).
 // Returns (recorded, err): recorded is the count of Measurement rows written;
@@ -220,12 +231,27 @@ func (s *Scheduler) BanditUpdate(ctx context.Context) (int, error) {
 }
 
 // creditTenant runs the bandit credit loop for one tenant.
+//
+// De-duplication (aiengine 修复③): when a BanditCreditStore is wired, the loop
+// enumerates ONLY not-yet-credited executed items (bandit_credited_at IS NULL)
+// and stamps the marker after each successful CreditItem — so a given item is
+// credited exactly once across consecutive 02:00 ticks, while the 72h lookback
+// window still catches up items a missed tick skipped. Without a store (legacy
+// M3-S2/S3 callers) it falls back to the plain StrategyItemEnumerator path.
 func (s *Scheduler) creditTenant(ctx context.Context, tenantID int64, since time.Time) (int, error) {
 	tctx := multitenancy.WithContext(ctx, multitenancy.Context{
 		TenantID: tenantID,
 		Source:   multitenancy.SourceSystem,
 	})
-	items, err := s.itemEnum.ListExecutedSince(tctx, tenantID, since, 500)
+	var (
+		items []ExecutedItem
+		err   error
+	)
+	if s.creditStore != nil {
+		items, err = s.creditStore.ListUncreditedExecuted(tctx, tenantID, since, 500)
+	} else {
+		items, err = s.itemEnum.ListExecutedSince(tctx, tenantID, since, 500)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("enumerate executed items: %w", err)
 	}
@@ -239,6 +265,18 @@ func (s *Scheduler) creditTenant(ctx context.Context, tenantID int64, since time
 				zap.Int64("tenant_id", tenantID),
 				zap.Int64("item_id", ei.Item.ID), zap.Error(cerr))
 			continue
+		}
+		// Mark credited so the next tick's enumeration skips this item (修复③).
+		// Best-effort: a marker-write failure leaves the item eligible for one
+		// bounded re-credit next tick — the same tolerance the 72h window already
+		// affords a missed tick. The accumulate semantics in bandit.Update are
+		// untouched.
+		if s.creditStore != nil {
+			if merr := s.creditStore.MarkCredited(tctx, tenantID, ei.Item.ID, s.now()); merr != nil {
+				s.log.Debug("bandit credited-marker write failed (non-fatal)",
+					zap.Int64("tenant_id", tenantID),
+					zap.Int64("item_id", ei.Item.ID), zap.Error(merr))
+			}
 		}
 		credited++
 	}

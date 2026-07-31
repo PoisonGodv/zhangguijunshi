@@ -117,6 +117,9 @@ type Scheduler struct {
 	attrRepo      attribution.Repo
 	banditLearner *bandit.Learner
 	itemEnum      StrategyItemEnumerator
+	// creditStore de-duplicates bandit crediting across ticks (aiengine 修复③).
+	// nil = legacy non-deduplicating path (backward-compatible with M3-S2/S3).
+	creditStore BanditCreditStore
 
 	batchSize  int
 	workers    int

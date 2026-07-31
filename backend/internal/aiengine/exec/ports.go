@@ -96,13 +96,14 @@ type ExecResult struct {
 // Reason* constants fill ExecResult.Reason. They are the canonical blocked /
 // failed causes surfaced to the boss (CONTRACT §12.3.9 ExecResult.Reason).
 const (
-	ReasonMarginFloor     = "margin_floor"     // margin guard rejected the action pre-execution
-	ReasonConfirmRequired = "confirm_required" // price_adj submitted without boss confirmation
-	ReasonNotExecutable   = "not_executable"   // action real-execution deferred (recharge_promo → M4)
-	ReasonNotConfigured   = "not_configured"   // required anti-corruption port not injected
-	ReasonSendFailed      = "send_failed"      // reach returned a failed task (soft failure)
-	ReasonBlocked         = "blocked"          // generic blocked (no specific reason carried)
-	ReasonInvalidItem     = "invalid_item"     // strategy item missing required params (defensive)
+	ReasonMarginFloor        = "margin_floor"        // margin guard rejected the action pre-execution
+	ReasonConfirmRequired    = "confirm_required"    // price_adj submitted without boss confirmation
+	ReasonNotExecutable      = "not_executable"      // action real-execution deferred (recharge_promo → M4)
+	ReasonNotConfigured      = "not_configured"      // required anti-corruption port not injected
+	ReasonSendFailed         = "send_failed"         // reach returned a failed task (soft failure)
+	ReasonBlocked            = "blocked"             // generic blocked (no specific reason carried)
+	ReasonInvalidItem        = "invalid_item"        // strategy item missing required params (defensive)
+	ReasonAudienceUnresolved = "audience_unresolved" // pipeline could not resolve a member/coupon for a coupon-bearing item (aiengine 修复②)
 )
 
 // Sentinel errors. The handlers surface intrinsic blocks as these sentinels in
@@ -127,4 +128,11 @@ var (
 	// ErrInvalidItem: the strategy item is missing params required for the
 	// action (defensive — a pipeline bug; surfaced as failed).
 	ErrInvalidItem = errors.New("exec: strategy item missing required params")
+	// ErrAudienceUnresolved: a coupon-bearing item (coupon_wake / group_seckill)
+	// reached exec without a resolved member_id / coupon_id. This is the honest
+	// degradation for the pipeline enrichment gap (aiengine 修复②): rather than
+	// issue to member 0 / coupon 0 or masquerade as a malformed item
+	// (invalid_item), exec declines cleanly and tells the boss the audience
+	// could not be resolved. Surfaced as blocked, nil error.
+	ErrAudienceUnresolved = errors.New("exec: audience unresolved (no member/coupon for coupon-bearing item)")
 )

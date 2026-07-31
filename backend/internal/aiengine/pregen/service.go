@@ -63,10 +63,14 @@ func (s *Scheduler) runAndCache(ctx context.Context, tenantID, storeID int64) er
 	// the signal text from the Strategy.Signals snapshot so pre-gen's L2 write
 	// key matches the pipeline's L2 read key (semantic.BuildSignalText). A
 	// missing/unparseable snapshot yields ("unknown","") which the semantic
-	// cache treats as a guaranteed miss — safe but pessimistic.
+	// cache treats as a guaranteed miss — safe but pessimistic. storeID is part
+	// of the L2 key (migration 000022): we use the pipeline output's StoreID
+	// (strat.StoreID), which for a correctly-resolved run equals the injected
+	// storeID — mirroring the L1 key choice above so pre-gen's write key matches
+	// the pipeline's read key exactly.
 	if s.sem != nil {
 		business, signalText := s.deriveSemanticKey(strat.Signals)
-		if perr := s.sem.Put(pctx, strat.TenantID, business, signalText, strat, semanticCacheTTL); perr != nil {
+		if perr := s.sem.Put(pctx, strat.TenantID, strat.StoreID, business, signalText, strat, semanticCacheTTL); perr != nil {
 			s.log.Debug("pregen semantic Put failed (non-fatal)",
 				zap.Int64("tenant_id", tenantID), zap.Error(perr))
 		}

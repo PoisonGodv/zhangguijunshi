@@ -245,3 +245,66 @@ func TestEncode_CrossTenantIsolation(t *testing.T) {
 }
 
 func runeLen(s string) int { return len([]rune(s)) }
+
+// TestEncode_LiftsCostPriceOntoParams (aiengine 修复②): for a product-bound
+// item, Encode must write the RoutedItem's cost_cents / price_cents into Params
+// so the executor's third margin defense-in-depth check has a real view to
+// validate. Without this, marginOkForCoupon always saw an empty view and
+// silently deferred — the margin recheck never actually ran.
+func TestEncode_LiftsCostPriceOntoParams(t *testing.T) {
+	repo := strategy.NewMemoryStrategyRepo()
+	svc := strategy.New(repo, strategy.WithNowFunc(func() time.Time { return time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC) }))
+	enc := NewEncoder(svc)
+
+	advice, err := enc.Encode(ctxWith(7001, 7100), 7001, 7100, top3Items(), sampleBundle(), "")
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	params := advice.Strategy.Items[0].Params
+	if got := numParam(params, "cost_cents"); got != 1200 {
+		t.Errorf("cost_cents = %d, want 1200 (lifted from Routed.CostCents)", got)
+	}
+	if got := numParam(params, "price_cents"); got != 2580 {
+		t.Errorf("price_cents = %d, want 2580 (lifted from Routed.PriceCents)", got)
+	}
+}
+
+// TestEncode_NonProductItemNoCostPrice: a full-reduction (non-product) action
+// carries CostCents/PriceCents == 0, so Encode must NOT inject cost/price keys
+// (its margin pass stays trivially satisfied).
+func TestEncode_NonProductItemNoCostPrice(t *testing.T) {
+	repo := strategy.NewMemoryStrategyRepo()
+	svc := strategy.New(repo, strategy.WithNowFunc(func() time.Time { return time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC) }))
+	enc := NewEncoder(svc)
+
+	items := []*agent.EnhancedItem{{
+		Routed:   rule.RoutedItem{ActionType: rule.ActCouponWake, ReasonType: rule.ReasonWakeDormant, Target: "member_segment"},
+		Copy:     "沉睡唤醒券",
+		Params:   map[string]any{"threshold_cents": int64(3000), "off_cents": int64(500)},
+		MarginOK: true,
+	}}
+	advice, err := enc.Encode(ctxWith(7001, 7100), 7001, 7100, items, sampleBundle(), "")
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	params := advice.Strategy.Items[0].Params
+	if _, ok := params["cost_cents"]; ok {
+		t.Errorf("non-product item must not get cost_cents: %+v", params)
+	}
+	if _, ok := params["price_cents"]; ok {
+		t.Errorf("non-product item must not get price_cents: %+v", params)
+	}
+}
+
+func numParam(m map[string]any, key string) int64 {
+	switch x := m[key].(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case float64:
+		return int64(x)
+	default:
+		return 0
+	}
+}

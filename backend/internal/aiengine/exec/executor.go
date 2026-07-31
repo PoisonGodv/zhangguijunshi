@@ -162,7 +162,11 @@ func (e *Executor) execGroupSeckill(ctx context.Context, item *strategy.Strategy
 	memberID := paramInt64(item.Params, "member_id")
 	couponID := paramInt64(item.Params, "coupon_id")
 	if memberID == 0 || couponID == 0 {
-		return nil, ErrInvalidItem
+		// aiengine 修复②: a coupon-bearing item that reached exec without a
+		// resolved member/coupon is an honest audience-resolution gap, not a
+		// malformed item — surface blocked(audience_unresolved) so the boss gets
+		// actionable feedback instead of the misleading invalid_item.
+		return nil, ErrAudienceUnresolved
 	}
 	ref, err := e.coupons.Issue(ctx, memberID, couponID, item.StrategyID, e.expireAt(item.Params))
 	if err != nil {
@@ -189,7 +193,8 @@ func (e *Executor) execCouponWake(ctx context.Context, item *strategy.StrategyIt
 	memberID := paramInt64(item.Params, "member_id")
 	couponID := paramInt64(item.Params, "coupon_id")
 	if memberID == 0 || couponID == 0 {
-		return nil, ErrInvalidItem
+		// aiengine 修复②: see execGroupSeckill — honest audience_unresolved.
+		return nil, ErrAudienceUnresolved
 	}
 	ref, err := e.coupons.Issue(ctx, memberID, couponID, item.StrategyID, e.expireAt(item.Params))
 	if err != nil {
@@ -319,6 +324,8 @@ func blockedReason(err error) (string, bool) {
 		return ReasonNotConfigured, true
 	case errors.Is(err, ErrInvalidItem):
 		return ReasonInvalidItem, true
+	case errors.Is(err, ErrAudienceUnresolved):
+		return ReasonAudienceUnresolved, true
 	}
 	return "", false
 }

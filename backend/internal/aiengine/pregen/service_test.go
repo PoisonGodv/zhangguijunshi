@@ -128,7 +128,7 @@ func (f *fakeCache) Put(ctx context.Context, tenantID, storeID int64, date strin
 func (f *fakeCache) count() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.puts) }
 
 type semPutRec struct {
-	tenantID             int64
+	tenantID, storeID    int64
 	business, signalText string
 	ttl                  time.Duration
 }
@@ -138,14 +138,14 @@ type fakeSemantic struct {
 	puts []semPutRec
 }
 
-func (f *fakeSemantic) TryHit(ctx context.Context, tenantID int64, business, signalText string) (*strategy.Strategy, bool, error) {
+func (f *fakeSemantic) TryHit(ctx context.Context, tenantID, storeID int64, business, signalText string) (*strategy.Strategy, bool, error) {
 	return nil, false, nil
 }
 
-func (f *fakeSemantic) Put(ctx context.Context, tenantID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error {
+func (f *fakeSemantic) Put(ctx context.Context, tenantID, storeID int64, business, signalText string, s *strategy.Strategy, ttl time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.puts = append(f.puts, semPutRec{tenantID, business, signalText, ttl})
+	f.puts = append(f.puts, semPutRec{tenantID, storeID, business, signalText, ttl})
 	return nil
 }
 

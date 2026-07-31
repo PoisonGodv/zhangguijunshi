@@ -45,7 +45,7 @@ func (s *Service) Encode(ctx context.Context, tenantID, storeID int64, top3 []*a
 			ReasonType:      ei.Routed.ReasonType,
 			Target:          targetMap(ei.Routed),
 			ProductID:       ei.Routed.ProductID,
-			Params:          cloneParams(ei.Params),
+			Params:          encodeParams(ei),
 			Copy:            s.safeCopy(ei.Copy, ei.Routed.ActionType),
 			Reason:          ei.Routed.Reason,
 			ExpectedEffect:  effectMap(ei.ExpectedEffect),
@@ -165,6 +165,33 @@ func cloneParams(params map[string]any) map[string]any {
 	out := make(map[string]any, len(params))
 	for k, v := range params {
 		out[k] = v
+	}
+	return out
+}
+
+// encodeParams builds the persisted Params for one EnhancedItem: a shallow copy
+// of the agent's params plus the structured cost/price view lifted from the
+// RoutedItem (aiengine 修复②). Writing cost_cents / price_cents here is what
+// makes the executor's THIRD margin defense-in-depth check
+// (exec.marginOkForCoupon) real: previously the pipeline never carried the
+// product's cost/price onto the item, so the guard always saw an empty view and
+// deferred to marketing.Issue — a silent no-op. We only fill the keys when the
+// RoutedItem actually binds a product (CostCents/PriceCents > 0) and never
+// overwrite a value the agent already set, so full-reduction (non-product)
+// actions keep their trivial margin pass and LLM-supplied views are respected.
+func encodeParams(ei *agent.EnhancedItem) map[string]any {
+	out := cloneParams(ei.Params)
+	if ei.Routed.CostCents <= 0 && ei.Routed.PriceCents <= 0 {
+		return out
+	}
+	if out == nil {
+		out = make(map[string]any, 2)
+	}
+	if _, ok := out["cost_cents"]; !ok && ei.Routed.CostCents > 0 {
+		out["cost_cents"] = ei.Routed.CostCents
+	}
+	if _, ok := out["price_cents"]; !ok && ei.Routed.PriceCents > 0 {
+		out["price_cents"] = ei.Routed.PriceCents
 	}
 	return out
 }

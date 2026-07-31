@@ -46,6 +46,10 @@ type Pipeline struct {
 	// boost. Both nil-safe (backward-compatible with M3-S1/S2 callers).
 	pb     *playbook.Store
 	bandit *bandit.Learner
+	// enrich resolves member_id / coupon_id onto coupon-bearing items before
+	// encode (aiengine 修复②). nil disables enrichment — exec then degrades
+	// those items to blocked(audience_unresolved) instead of invalid_item.
+	enricher Enricher
 }
 
 // Option configures a Pipeline.
@@ -114,6 +118,18 @@ func WithPlaybookStore(s *playbook.Store) Option {
 func WithBanditLearner(l *bandit.Learner) Option {
 	return func(p *Pipeline) {
 		p.bandit = l
+	}
+}
+
+// WithEnricher injects the audience-resolution + coupon-template enrichment
+// stage (aiengine 修复②). When wired, coupon-bearing items (coupon_wake /
+// group_seckill) get a concrete member_id / coupon_id written into Params
+// before encode, so one-click execute can actually issue + reach instead of
+// blocking invalid_item. nil disables enrichment (backward-compatible); exec
+// then returns an honest blocked(audience_unresolved) for those items.
+func WithEnricher(e Enricher) Option {
+	return func(p *Pipeline) {
+		p.enricher = e
 	}
 }
 
@@ -194,9 +210,11 @@ func (p *Pipeline) Run(ctx context.Context) (*output.Advice, error) {
 	// ①b) L2 semantic cache short-circuit (needs the bundle to build signalText).
 	// Fires only when L1 missed and a semantic cache is wired; a hit returns the
 	// cached strategy with Degrade="semantic_hit" without re-running the pipeline.
+	// storeID is part of the L2 key (migration 000022): a multi-store tenant's
+	// near-identical signal on another store must NOT hit that store's draft.
 	if p.sem != nil {
 		signalText := semantic.BuildSignalText(bundle)
-		if strat, ok, _ := p.sem.TryHit(ctx, tenantID, bundle.BusinessType, signalText); ok && strat != nil {
+		if strat, ok, _ := p.sem.TryHit(ctx, tenantID, storeID, bundle.BusinessType, signalText); ok && strat != nil {
 			log.Debug("pipeline semantic cache hit", zap.String("degrade", "semantic_hit"))
 			return &output.Advice{Strategy: strat, Degrade: "semantic_hit"}, nil
 		}
@@ -233,6 +251,14 @@ func (p *Pipeline) Run(ctx context.Context) (*output.Advice, error) {
 	enhanced := p.stage.EnhanceOrSkip(ctx, tenantID, routed, &degrade)
 	log.Debug("enhance done", zap.Int("items", len(enhanced.Items)), zap.String("degrade", degrade))
 
+	// ③b) Enrich (aiengine 修复②): resolve member_id / coupon_id onto coupon-
+	// bearing items so one-click execute can issue + reach. Runs before converge
+	// so the enriched Params flow into the persisted items. nil-safe: a nil
+	// enricher leaves Params untouched (exec degrades to audience_unresolved).
+	if p.enricher != nil && enhanced != nil {
+		p.enricher.Enrich(ctx, tenantID, storeID, itemPtrs(enhanced.Items))
+	}
+
 	// ④ Converge Top3.
 	top3 := p.conv.PickTop3(ctx, enhanced)
 
@@ -247,7 +273,7 @@ func (p *Pipeline) Run(ctx context.Context) (*output.Advice, error) {
 	}
 	if p.sem != nil && advice != nil && advice.Strategy != nil {
 		signalText := semantic.BuildSignalText(bundle)
-		_ = p.sem.Put(ctx, tenantID, bundle.BusinessType, signalText, advice.Strategy, 24*time.Hour)
+		_ = p.sem.Put(ctx, tenantID, storeID, bundle.BusinessType, signalText, advice.Strategy, 24*time.Hour)
 	}
 	return advice, nil
 }
@@ -369,6 +395,20 @@ func coldReasonFor(actionType string) string {
 	default:
 		return "节日满减"
 	}
+}
+
+// itemPtrs returns pointers into items so the enricher can mutate each
+// EnhancedItem's Params in place (the same backing array converge.PickTop3 later
+// reads, so the enriched member_id / coupon_id flow into the persisted items).
+func itemPtrs(items []agent.EnhancedItem) []*agent.EnhancedItem {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]*agent.EnhancedItem, len(items))
+	for i := range items {
+		out[i] = &items[i]
+	}
+	return out
 }
 
 // applyBanditBoost re-ranks routed items by the bandit arm weight (Q value) for

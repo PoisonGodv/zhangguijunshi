@@ -302,10 +302,10 @@ func TestMemorySemanticCache_SameSignalTextHit(t *testing.T) {
 	s := sampleStrategy(1)
 	sig := "fruit|weather=rain|days_to_expiry=2|sleep_30=18|holiday=none"
 
-	if err := c.Put(testCtx(), 5001, "fruit", sig, s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", sig, s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", sig)
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", sig)
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
@@ -331,10 +331,10 @@ func TestMemorySemanticCache_SimilarSignalTextHit(t *testing.T) {
 	put := "fruit|weather=rain|days_to_expiry=2|sleep_30=18|holiday=none"
 	qry := "fruit|weather=rain|days_to_expiry=1|sleep_30=20|holiday=none" // different dims
 
-	if err := c.Put(testCtx(), 5001, "fruit", put, s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", put, s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", qry)
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", qry)
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
@@ -353,10 +353,10 @@ func TestMemorySemanticCache_DissimilarMiss(t *testing.T) {
 	c := NewMemoryCache(emb)
 	s := sampleStrategy(3)
 
-	if err := c.Put(testCtx(), 5001, "fruit", "fruit|weather=rain", s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "fruit|weather=rain", s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", "fruit|weather=hot")
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "fruit|weather=hot")
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
@@ -372,12 +372,12 @@ func TestMemorySemanticCache_TTLExpired(t *testing.T) {
 	c := NewMemoryCache(emb, WithClock(clock.now))
 	s := sampleStrategy(4)
 
-	if err := c.Put(testCtx(), 5001, "fruit", "sig", s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "sig", s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	// Advance past TTL.
 	clock.advance(25 * time.Hour)
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", "sig")
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "sig")
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
@@ -393,11 +393,11 @@ func TestMemorySemanticCache_TTLJustBeforeExpiryHits(t *testing.T) {
 	c := NewMemoryCache(emb, WithClock(clock.now))
 	s := sampleStrategy(5)
 
-	if err := c.Put(testCtx(), 5001, "fruit", "sig", s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "sig", s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	clock.advance(23 * time.Hour) // still within TTL
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", "sig")
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "sig")
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
@@ -414,13 +414,13 @@ func TestMemorySemanticCache_Invalidate(t *testing.T) {
 	c := NewMemoryCache(emb)
 	s := sampleStrategy(6)
 
-	if err := c.Put(testCtx(), 5001, "fruit", "sig", s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "sig", s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := c.Invalidate(testCtx(), 5001); err != nil {
 		t.Fatalf("Invalidate: %v", err)
 	}
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", "sig")
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "sig")
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
@@ -433,19 +433,19 @@ func TestMemorySemanticCache_InvalidateOnlyTargetTenant(t *testing.T) {
 	emb := constantEmbedder{dim: gateway.EmbedDim}
 	c := NewMemoryCache(emb)
 
-	if err := c.Put(testCtx(), 5001, "fruit", "sig", sampleStrategy(7), 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "sig", sampleStrategy(7), 24*time.Hour); err != nil {
 		t.Fatalf("Put 5001: %v", err)
 	}
-	if err := c.Put(testCtx(), 5002, "fruit", "sig", sampleStrategy(8), 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5002, 7001, "fruit", "sig", sampleStrategy(8), 24*time.Hour); err != nil {
 		t.Fatalf("Put 5002: %v", err)
 	}
 	if err := c.Invalidate(testCtx(), 5001); err != nil {
 		t.Fatalf("Invalidate: %v", err)
 	}
-	if _, ok, err := c.TryHit(testCtx(), 5001, "fruit", "sig"); err != nil || ok {
+	if _, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "sig"); err != nil || ok {
 		t.Fatalf("tenant 5001 should be invalidated; ok=%v err=%v", ok, err)
 	}
-	if got, ok, err := c.TryHit(testCtx(), 5002, "fruit", "sig"); err != nil || !ok {
+	if got, ok, err := c.TryHit(testCtx(), 5002, 7001, "fruit", "sig"); err != nil || !ok {
 		t.Fatalf("tenant 5002 must survive targeted invalidate; ok=%v err=%v", ok, err)
 	} else if got.ID != 8 {
 		t.Fatalf("tenant 5002 got ID=%d, want 8", got.ID)
@@ -457,10 +457,10 @@ func TestMemorySemanticCache_CrossTenantMiss(t *testing.T) {
 	c := NewMemoryCache(emb)
 	s := sampleStrategy(9)
 
-	if err := c.Put(testCtx(), 5001, "fruit", "sig", s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "sig", s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	got, ok, err := c.TryHit(testCtx(), 5002, "fruit", "sig") // same text, different tenant
+	got, ok, err := c.TryHit(testCtx(), 5002, 7001, "fruit", "sig") // same text, different tenant
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
@@ -474,15 +474,47 @@ func TestMemorySemanticCache_CrossBusinessMiss(t *testing.T) {
 	c := NewMemoryCache(emb)
 	s := sampleStrategy(10)
 
-	if err := c.Put(testCtx(), 5001, "fruit", "sig", s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "sig", s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	got, ok, err := c.TryHit(testCtx(), 5001, "fresh", "sig") // same tenant+text, different business
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fresh", "sig") // same tenant+store+text, different business
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
 	if ok {
 		t.Fatalf("cross-business must miss (§7.6.4 same-business filter), got %+v", got)
+	}
+}
+
+// TestMemorySemanticCache_CrossStoreMiss is the regression test for the
+// high-severity cross-store leak (aiengine 修复①): a multi-store tenant's
+// near-identical signal on store B must NOT hit store A's cached draft. The
+// constantEmbedder forces cosine 1.0 so ONLY the (tenant, store, business)
+// filter can prevent the hit — proving store_id is in the retrieval key.
+func TestMemorySemanticCache_CrossStoreMiss(t *testing.T) {
+	emb := constantEmbedder{dim: gateway.EmbedDim}
+	c := NewMemoryCache(emb)
+	s := sampleStrategy(12)
+
+	// Store 7001 writes a draft under signal "sig".
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "sig", s, 24*time.Hour); err != nil {
+		t.Fatalf("Put store 7001: %v", err)
+	}
+	// Same tenant, SAME signal text + embedding, but store 7002 → must miss.
+	got, ok, err := c.TryHit(testCtx(), 5001, 7002, "fruit", "sig")
+	if err != nil {
+		t.Fatalf("TryHit err: %v", err)
+	}
+	if ok {
+		t.Fatalf("cross-store must miss (migration 000022 store isolation), got %+v", got)
+	}
+	// The owning store still hits (sanity: we did not over-restrict).
+	got2, ok2, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "sig")
+	if err != nil || !ok2 {
+		t.Fatalf("owning store must still hit; ok=%v err=%v", ok2, err)
+	}
+	if got2.ID != s.ID {
+		t.Fatalf("owning store got ID=%d, want %d", got2.ID, s.ID)
 	}
 }
 
@@ -492,10 +524,10 @@ func TestMemorySemanticCache_DefensiveCopy(t *testing.T) {
 	s := sampleStrategy(11)
 	sig := "fruit|weather=rain"
 
-	if err := c.Put(testCtx(), 5001, "fruit", sig, s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", sig, s, 24*time.Hour); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", sig)
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", sig)
 	if err != nil || !ok {
 		t.Fatalf("TryHit: ok=%v err=%v", ok, err)
 	}
@@ -506,7 +538,7 @@ func TestMemorySemanticCache_DefensiveCopy(t *testing.T) {
 	got.Items[0].Params = map[string]any{"injected": true}
 	got.Signals = json.RawMessage(`{"injected":true}`)
 
-	got2, ok, err := c.TryHit(testCtx(), 5001, "fruit", sig)
+	got2, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", sig)
 	if err != nil || !ok {
 		t.Fatalf("second TryHit: ok=%v err=%v", ok, err)
 	}
@@ -521,17 +553,17 @@ func TestMemorySemanticCache_DefensiveCopy(t *testing.T) {
 func TestMemorySemanticCache_PutNilStrategy(t *testing.T) {
 	emb := constantEmbedder{dim: gateway.EmbedDim}
 	c := NewMemoryCache(emb)
-	if err := c.Put(testCtx(), 5001, "fruit", "sig", nil, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "sig", nil, 24*time.Hour); err != nil {
 		t.Fatalf("Put(nil) should be a no-op, got err: %v", err)
 	}
-	if _, ok, err := c.TryHit(testCtx(), 5001, "fruit", "sig"); err != nil || ok {
+	if _, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "sig"); err != nil || ok {
 		t.Fatalf("after Put(nil): ok=%v err=%v", ok, err)
 	}
 }
 
 func TestMemorySemanticCache_NilEmbedder(t *testing.T) {
 	c := NewMemoryCache(nil)
-	if _, ok, err := c.TryHit(testCtx(), 1, "fruit", "sig"); err != nil || ok {
+	if _, ok, err := c.TryHit(testCtx(), 1, 0, "fruit", "sig"); err != nil || ok {
 		t.Fatalf("nil embedder TryHit: ok=%v err=%v", ok, err)
 	}
 }
@@ -544,8 +576,8 @@ func TestMemorySemanticCache_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_ = c.Put(testCtx(), int64(i%5), "fruit", fmt.Sprintf("sig%d", i%3), sampleStrategy(int64(i)), 24*time.Hour)
-			_, _, _ = c.TryHit(testCtx(), int64(i%5), "fruit", "sig0")
+			_ = c.Put(testCtx(), int64(i%5), int64(i%7), "fruit", fmt.Sprintf("sig%d", i%3), sampleStrategy(int64(i)), 24*time.Hour)
+			_, _, _ = c.TryHit(testCtx(), int64(i%5), int64(i%7), "fruit", "sig0")
 			_ = c.Invalidate(testCtx(), int64(i%5))
 		}(i)
 	}
@@ -565,7 +597,7 @@ func TestPGVectorSemanticCache_TryHit(t *testing.T) {
 	m := NewMetrics()
 	c := NewPGVectorCache(pool, emb, WithMetrics(m))
 
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", "fruit|weather=rain")
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "fruit|weather=rain")
 	if err != nil {
 		t.Fatalf("TryHit err: %v", err)
 	}
@@ -587,18 +619,21 @@ func TestPGVectorSemanticCache_TryHit(t *testing.T) {
 	if call.sql != sqlSemanticHit {
 		t.Fatalf("SQL mismatch:\ngot:  %s\nwant: %s", call.sql, sqlSemanticHit)
 	}
-	if len(call.args) != 3 {
-		t.Fatalf("want 3 args, got %d", len(call.args))
+	if len(call.args) != 4 {
+		t.Fatalf("want 4 args, got %d", len(call.args))
 	}
 	if tid, ok := call.args[0].(int64); !ok || tid != 5001 {
 		t.Fatalf("arg[0] (tenantID) = %v, want int64(5001)", call.args[0])
 	}
-	if biz, ok := call.args[1].(string); !ok || biz != "fruit" {
-		t.Fatalf("arg[1] (business) = %v, want \"fruit\"", call.args[1])
+	if sid, ok := call.args[1].(int64); !ok || sid != 7001 {
+		t.Fatalf("arg[1] (storeID) = %v, want int64(7001)", call.args[1])
 	}
-	vec, ok := call.args[2].(pgvector.Vector)
+	if biz, ok := call.args[2].(string); !ok || biz != "fruit" {
+		t.Fatalf("arg[2] (business) = %v, want \"fruit\"", call.args[2])
+	}
+	vec, ok := call.args[3].(pgvector.Vector)
 	if !ok {
-		t.Fatalf("arg[2] type = %T, want pgvector.Vector", call.args[2])
+		t.Fatalf("arg[3] type = %T, want pgvector.Vector", call.args[3])
 	}
 	if len(vec.Slice()) != gateway.EmbedDim {
 		t.Fatalf("embedding dim = %d, want %d", len(vec.Slice()), gateway.EmbedDim)
@@ -612,7 +647,7 @@ func TestPGVectorSemanticCache_TryHitNoRows(t *testing.T) {
 	pool := newFakePool(&fakeRow{err: pgx.ErrNoRows})
 	c := NewPGVectorCache(pool, constantEmbedder{dim: gateway.EmbedDim})
 
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", "fruit|weather=rain")
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "fruit|weather=rain")
 	if err != nil {
 		t.Fatalf("ErrNoRows must surface as miss not error: %v", err)
 	}
@@ -625,7 +660,7 @@ func TestPGVectorSemanticCache_TryHitQueryError(t *testing.T) {
 	pool := newFakePool(&fakeRow{err: errors.New("connection lost")})
 	c := NewPGVectorCache(pool, constantEmbedder{dim: gateway.EmbedDim})
 
-	got, ok, err := c.TryHit(testCtx(), 5001, "fruit", "fruit|weather=rain")
+	got, ok, err := c.TryHit(testCtx(), 5001, 7001, "fruit", "fruit|weather=rain")
 	if err == nil {
 		t.Fatal("expected error from Scan failure")
 	}
@@ -640,7 +675,7 @@ func TestPGVectorSemanticCache_Put(t *testing.T) {
 	c := NewPGVectorCache(pool, emb)
 	s := sampleStrategy(21)
 
-	if err := c.Put(testCtx(), 5001, "fruit", "fruit|weather=rain", s, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 5001, 7001, "fruit", "fruit|weather=rain", s, 24*time.Hour); err != nil {
 		t.Fatalf("Put err: %v", err)
 	}
 	if len(pool.calls) != 1 || pool.calls[0].method != "Exec" {
@@ -650,25 +685,28 @@ func TestPGVectorSemanticCache_Put(t *testing.T) {
 	if call.sql != sqlSemanticPut {
 		t.Fatalf("SQL mismatch:\ngot:  %s\nwant: %s", call.sql, sqlSemanticPut)
 	}
-	if len(call.args) != 6 {
-		t.Fatalf("want 6 args, got %d", len(call.args))
+	if len(call.args) != 7 {
+		t.Fatalf("want 7 args, got %d", len(call.args))
 	}
 	if tid, ok := call.args[0].(int64); !ok || tid != 5001 {
 		t.Fatalf("arg[0] (tenantID) = %v, want int64(5001)", call.args[0])
 	}
-	if biz, ok := call.args[1].(string); !ok || biz != "fruit" {
-		t.Fatalf("arg[1] (business) = %v, want \"fruit\"", call.args[1])
+	if sid, ok := call.args[1].(int64); !ok || sid != 7001 {
+		t.Fatalf("arg[1] (storeID) = %v, want int64(7001)", call.args[1])
 	}
-	if kt, ok := call.args[2].(string); !ok || kt != "fruit|weather=rain" {
-		t.Fatalf("arg[2] (key_text) = %v, want signal text", call.args[2])
+	if biz, ok := call.args[2].(string); !ok || biz != "fruit" {
+		t.Fatalf("arg[2] (business) = %v, want \"fruit\"", call.args[2])
 	}
-	if _, ok := call.args[3].(pgvector.Vector); !ok {
-		t.Fatalf("arg[3] type = %T, want pgvector.Vector", call.args[3])
+	if kt, ok := call.args[3].(string); !ok || kt != "fruit|weather=rain" {
+		t.Fatalf("arg[3] (key_text) = %v, want signal text", call.args[3])
 	}
-	// arg[4] is advice JSONB bytes.
-	adviceBytes, ok := call.args[4].([]byte)
+	if _, ok := call.args[4].(pgvector.Vector); !ok {
+		t.Fatalf("arg[4] type = %T, want pgvector.Vector", call.args[4])
+	}
+	// arg[5] is advice JSONB bytes.
+	adviceBytes, ok := call.args[5].([]byte)
 	if !ok {
-		t.Fatalf("arg[4] type = %T, want []byte (advice JSON)", call.args[4])
+		t.Fatalf("arg[5] type = %T, want []byte (advice JSON)", call.args[5])
 	}
 	var check strategy.Strategy
 	if err := json.Unmarshal(adviceBytes, &check); err != nil {
@@ -677,10 +715,10 @@ func TestPGVectorSemanticCache_Put(t *testing.T) {
 	if check.ID != s.ID {
 		t.Fatalf("advice JSON ID=%d, want %d", check.ID, s.ID)
 	}
-	// arg[5] is expires_at, now + ttl.
-	expiresAt, ok := call.args[5].(time.Time)
+	// arg[6] is expires_at, now + ttl.
+	expiresAt, ok := call.args[6].(time.Time)
 	if !ok {
-		t.Fatalf("arg[5] type = %T, want time.Time", call.args[5])
+		t.Fatalf("arg[6] type = %T, want time.Time", call.args[6])
 	}
 	if expiresAt.Before(time.Now()) {
 		t.Fatalf("expires_at %v should be in the future", expiresAt)
@@ -690,7 +728,7 @@ func TestPGVectorSemanticCache_Put(t *testing.T) {
 func TestPGVectorSemanticCache_PutNilStrategy(t *testing.T) {
 	pool := newFakePool(nil)
 	c := NewPGVectorCache(pool, constantEmbedder{dim: gateway.EmbedDim})
-	if err := c.Put(testCtx(), 1, "fruit", "sig", nil, 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 1, 0, "fruit", "sig", nil, 24*time.Hour); err != nil {
 		t.Fatalf("Put(nil) should be no-op, got: %v", err)
 	}
 	if len(pool.calls) != 0 {
@@ -722,10 +760,10 @@ func TestPGVectorSemanticCache_Invalidate(t *testing.T) {
 
 func TestPGVectorSemanticCache_NilPool(t *testing.T) {
 	c := NewPGVectorCache(nil, constantEmbedder{dim: gateway.EmbedDim})
-	if _, ok, err := c.TryHit(testCtx(), 1, "fruit", "sig"); err != nil || ok {
+	if _, ok, err := c.TryHit(testCtx(), 1, 0, "fruit", "sig"); err != nil || ok {
 		t.Fatalf("nil pool TryHit: ok=%v err=%v", ok, err)
 	}
-	if err := c.Put(testCtx(), 1, "fruit", "sig", sampleStrategy(1), 24*time.Hour); err != nil {
+	if err := c.Put(testCtx(), 1, 0, "fruit", "sig", sampleStrategy(1), 24*time.Hour); err != nil {
 		t.Fatalf("nil pool Put: %v", err)
 	}
 	if err := c.Invalidate(testCtx(), 1); err != nil {
