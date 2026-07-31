@@ -51,6 +51,17 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// txBeginner is the optional transaction capability used by JoinAtomic. Both
+// *pgxpool.Pool and pgxmock.PgxPoolIface satisfy it; if a pool lacks it the join
+// call degrades to the pre-existing two-step autocommit logic rather than
+// panicking. groupbuy deliberately does NOT import pkg/db (that would couple a
+// domain package to infra), so the transaction is driven through this local
+// type-assert over the pool — the same idiom as inventory.ConsumeFIFOAtomic and
+// membership.redeemAtomic.
+type txBeginner interface {
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
+}
+
 // SQL for groupbuys (migration 000006 + strategy_id from 000011). product_id is
 // nullable (NULL when the squad binds no product); params is JSONB. Every read /
 // update is scoped by tenant_id. JoinIncr is the atomic critical section: a
@@ -59,6 +70,16 @@ type rowScanner interface {
 // joined value, and the WHERE guard (joined < required_count AND status =
 // 'active') makes a concurrent join that raced the read reject with no rows
 // (mapped to ErrGroupbuyFull, matching memory's "succeeded squad → full").
+//
+// UpdateStatus carries a DB-side `AND status = 'active'` guard so a transition
+// can only land on a still-active squad. The Go-side isAllowedGroupbuyTransition
+// pre-check only ever permits transitions *from* active, so the two agree; the
+// guard closes the TOCTOU window where a concurrent finaliser/cancel flips the
+// squad to a terminal status between the GetByID pre-read and the UPDATE. A
+// guard miss (pre-read succeeded, UPDATE matched no rows) is mapped to
+// ErrGroupbuyClosed — not ErrNotFound — so FinalizeExpired/Cancel silently skip
+// a squad that was already settled, matching the memory repo's under-lock
+// re-validation semantics.
 const (
 	sqlGBCreate = `INSERT INTO groupbuys (tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -69,7 +90,7 @@ WHERE tenant_id = $1 AND id = $2`
 	sqlGBListActiveAll   = `SELECT id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND status = 'active' ORDER BY id`
 	sqlGBListActiveStore = `SELECT id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND store_id = $2 AND status = 'active' ORDER BY id`
 	sqlGBListByStrategy  = `SELECT id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND strategy_id = $2 ORDER BY id`
-	sqlGBUpdateStatus    = `UPDATE groupbuys SET status = $1, updated_at = $2 WHERE tenant_id = $3 AND id = $4 RETURNING id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at`
+	sqlGBUpdateStatus    = `UPDATE groupbuys SET status = $1, updated_at = $2 WHERE tenant_id = $3 AND id = $4 AND status = 'active' RETURNING id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at`
 	sqlGBJoinIncr        = `UPDATE groupbuys SET joined = joined + 1, status = CASE WHEN joined + 1 >= required_count THEN 'success' ELSE status END, updated_at = $1 WHERE tenant_id = $2 AND id = $3 AND joined < required_count AND status = 'active' RETURNING id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at`
 )
 
@@ -254,6 +275,13 @@ func (r *PGGroupbuyRepo) ListByStrategy(ctx context.Context, tenantID, strategyI
 // Go (isAllowedGroupbuyTransition, shared with the memory repo) so a terminal
 // squad cannot be corrupted: an illegal transition yields ErrGroupbuyClosed;
 // absent/foreign yields ErrNotFound. The UPDATE then RETURNING * the new row.
+//
+// The UPDATE carries a DB-side `AND status = 'active'` guard closing the TOCTOU
+// window between the GetByID pre-read and the write: if a concurrent finaliser/
+// cancel flipped the squad to a terminal status in that gap, the UPDATE matches
+// no rows and we return ErrGroupbuyClosed (NOT ErrNotFound) so FinalizeExpired/
+// Cancel silently skip an already-settled squad — matching the memory repo's
+// under-lock re-validation.
 func (r *PGGroupbuyRepo) UpdateStatus(ctx context.Context, tenantID, id int64, status string, now time.Time) (*Groupbuy, error) {
 	if r == nil || r.pool == nil {
 		return nil, ErrNotFound
@@ -271,7 +299,10 @@ func (r *PGGroupbuyRepo) UpdateStatus(ctx context.Context, tenantID, id int64, s
 	g, err := scanGroupbuy(r.pool.QueryRow(ctx, sqlGBUpdateStatus, status, now, tenantID, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
+			// The pre-read saw an active squad and the Go-side check passed, so a
+			// no-row guarded UPDATE means a concurrent writer settled the squad in
+			// the gap. Report closed (silent-skip semantics), not not-found.
+			return nil, ErrGroupbuyClosed
 		}
 		return nil, fmt.Errorf("groupbuy: pg update status: %w", err)
 	}
@@ -281,10 +312,15 @@ func (r *PGGroupbuyRepo) UpdateStatus(ctx context.Context, tenantID, id int64, s
 // JoinAtomic is the atomic critical section (CONTRACT §11.5.4). Sentinel
 // precedence matches the memory repo exactly — already-joined, then full, then
 // closed — via a read of the squad + a read of any existing participant. The
-// two writes are: INSERT participant (UNIQUE constraint → ErrAlreadyJoined as a
-// race-safety net) then a single conditional UPDATE that bumps joined and flips
-// to success on reaching required_count. A guard failure on the UPDATE is a
-// race past the read and maps to ErrGroupbuyFull (joining a succeeded squad).
+// two writes (INSERT participant, then the conditional joined++/success UPDATE)
+// run inside a single transaction when the pool supports BeginTx (both
+// *pgxpool.Pool and pgxmock do), so they are all-or-nothing: if the guarded
+// UPDATE returns no rows (a concurrent join filled the squad past the read) the
+// transaction rolls back and the just-inserted participant row is rolled back
+// too — no orphan participant, no miscounted joined, no permanently-locked
+// member — and the call maps to ErrGroupbuyFull. A pool lacking BeginTx degrades
+// to the legacy two-step autocommit path (UNIQUE constraint + guarded UPDATE
+// remain the race-safety nets there).
 func (r *PGGroupbuyRepo) JoinAtomic(ctx context.Context, tenantID, groupbuyID, memberID int64, now time.Time) (*Participant, *Groupbuy, error) {
 	if r == nil || r.pool == nil {
 		return nil, nil, ErrNotFound
@@ -312,9 +348,37 @@ func (r *PGGroupbuyRepo) JoinAtomic(ctx context.Context, tenantID, groupbuyID, m
 	if current.Status != StatusActive {
 		return nil, nil, ErrGroupbuyClosed
 	}
+	// 5+6. The two writes. Prefer a real transaction so the participant INSERT
+	// and the joined++ UPDATE commit or roll back together.
+	if beginner, ok := r.pool.(txBeginner); ok {
+		return r.joinAtomicTx(ctx, beginner, tenantID, groupbuyID, memberID, now)
+	}
+	// Degrade: pool lacks BeginTx → legacy two-step autocommit.
+	return r.joinAtomicTwoStep(ctx, tenantID, groupbuyID, memberID, now)
+}
+
+// joinAtomicTx runs JoinAtomic steps 5 (INSERT participant) and 6 (conditional
+// joined++/success UPDATE) inside one transaction. A UNIQUE violation on the
+// INSERT (concurrent join raced step 2) → ErrAlreadyJoined; a no-row guarded
+// UPDATE (concurrent join filled the squad past the step-1 read) →
+// ErrGroupbuyFull with the deferred Rollback rolling back the inserted
+// participant so no orphan row survives. On success the transaction commits and
+// both the participant and the updated squad are returned.
+func (r *PGGroupbuyRepo) joinAtomicTx(ctx context.Context, beginner txBeginner, tenantID, groupbuyID, memberID int64, now time.Time) (*Participant, *Groupbuy, error) {
+	tx, err := beginner.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("groupbuy: pg join begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
 	// 5. Insert the participant (UNIQUE(tenant_id, groupbuy_id, member_id) →
 	// ErrAlreadyJoined if a concurrent join raced step 2).
-	p, err := scanParticipant(r.pool.QueryRow(ctx, sqlPartInsert, tenantID, groupbuyID, memberID, PStatusJoined, now))
+	p, err := scanParticipant(tx.QueryRow(ctx, sqlPartInsert, tenantID, groupbuyID, memberID, PStatusJoined, now))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return nil, nil, ErrAlreadyJoined
@@ -322,7 +386,37 @@ func (r *PGGroupbuyRepo) JoinAtomic(ctx context.Context, tenantID, groupbuyID, m
 		return nil, nil, fmt.Errorf("groupbuy: pg join insert participant: %w", err)
 	}
 	// 6. Atomic joined++ and maybe success. The WHERE guard makes a race that
-	// filled the squad between the read and here return no rows → ErrGroupbuyFull.
+	// filled the squad between the read and here return no rows → ErrGroupbuyFull;
+	// the deferred Rollback rolls back the participant inserted in step 5 (no orphan).
+	g, err := scanGroupbuy(tx.QueryRow(ctx, sqlGBJoinIncr, now, tenantID, groupbuyID))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrGroupbuyFull
+		}
+		return nil, nil, fmt.Errorf("groupbuy: pg join incr: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("groupbuy: pg join commit: %w", err)
+	}
+	committed = true
+	return p, g, nil
+}
+
+// joinAtomicTwoStep is the legacy fallback for a pool that lacks BeginTx: the
+// participant INSERT and the joined++ UPDATE run as two autocommit statements.
+// The UNIQUE constraint and the guarded UPDATE remain the race-safety nets, but
+// a no-row UPDATE here can leave an orphan participant (the very bug the
+// transaction path fixes) — hence this path is only taken when no transaction
+// capability is available.
+func (r *PGGroupbuyRepo) joinAtomicTwoStep(ctx context.Context, tenantID, groupbuyID, memberID int64, now time.Time) (*Participant, *Groupbuy, error) {
+	p, err := scanParticipant(r.pool.QueryRow(ctx, sqlPartInsert, tenantID, groupbuyID, memberID, PStatusJoined, now))
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, nil, ErrAlreadyJoined
+		}
+		return nil, nil, fmt.Errorf("groupbuy: pg join insert participant: %w", err)
+	}
 	g, err := scanGroupbuy(r.pool.QueryRow(ctx, sqlGBJoinIncr, now, tenantID, groupbuyID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -212,6 +212,32 @@ func TestPGGroupbuyRepo_UpdateStatusNotFound(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// TestPGGroupbuyRepo_UpdateStatusGuardMiss reproduces the TOCTOU the DB-side
+// `AND status = 'active'` guard closes: the GetByID pre-read returns an active
+// squad (so the Go-side transition check passes), but a concurrent finaliser
+// flips the squad to a terminal status before the UPDATE, so the guarded UPDATE
+// matches no rows. The repo must report ErrGroupbuyClosed (silent-skip for
+// FinalizeExpired/Cancel), NOT ErrNotFound.
+func TestPGGroupbuyRepo_UpdateStatusGuardMiss(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGGroupbuyRepo(mock)
+	// Pre-read: still active → Go-side check passes.
+	mock.ExpectQuery(sqlGBGetByID).
+		WithArgs(int64(1), int64(42)).
+		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
+			int64(42), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 3, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
+		))
+	// Guarded UPDATE (AND status='active') matches no rows: a concurrent writer
+	// settled the squad in the gap.
+	mock.ExpectQuery(sqlGBUpdateStatus).
+		WithArgs(StatusFailed, fixedTime, int64(1), int64(42)).
+		WillReturnError(pgx.ErrNoRows)
+	_, err := repo.UpdateStatus(context.Background(), 1, 42, StatusFailed, fixedTime)
+	require.ErrorIs(t, err, ErrGroupbuyClosed)
+	require.NotErrorIs(t, err, ErrNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPGGroupbuyRepo_JoinAtomic(t *testing.T) {
 	mock := newMockPool(t)
 	repo := NewPGGroupbuyRepo(mock)
@@ -227,6 +253,8 @@ func TestPGGroupbuyRepo_JoinAtomic(t *testing.T) {
 	mock.ExpectQuery(sqlPartGetByMember).
 		WithArgs(int64(1), int64(42), int64(100)).
 		WillReturnError(pgx.ErrNoRows)
+	// Steps 5+6 run inside one transaction (pgxmock satisfies txBeginner).
+	mock.ExpectBegin()
 	// 3. Insert participant.
 	mock.ExpectQuery(sqlPartInsert).
 		WithArgs(int64(1), int64(42), int64(100), PStatusJoined, fixedTime).
@@ -239,6 +267,7 @@ func TestPGGroupbuyRepo_JoinAtomic(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
 			int64(42), int64(1), int64(10), int64(7), "荔枝拼团", paramsBytes, 3, 1, StatusActive, fixedTime, fixedTime.Add(24*time.Hour), int64(9001), fixedTime, fixedTime,
 		))
+	mock.ExpectCommit()
 	p, g, err := repo.JoinAtomic(context.Background(), 1, 42, 100, fixedTime)
 	require.NoError(t, err)
 	require.Equal(t, int64(500), p.ID)
@@ -259,6 +288,7 @@ func TestPGGroupbuyRepo_JoinAtomicReachesSuccess(t *testing.T) {
 		))
 	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(101)).
 		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectBegin()
 	mock.ExpectQuery(sqlPartInsert).WithArgs(int64(1), int64(42), int64(101), PStatusJoined, fixedTime).
 		WillReturnRows(pgxmock.NewRows(partColumns()).AddRow(int64(501), int64(1), int64(42), int64(101), PStatusJoined, fixedTime))
 	// joined 2→3 reaches required_count → status flips to success.
@@ -266,6 +296,7 @@ func TestPGGroupbuyRepo_JoinAtomicReachesSuccess(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
 			int64(42), int64(1), int64(10), int64(7), "荔枝拼团", paramsBytes, 3, 3, StatusSuccess, fixedTime, fixedTime.Add(24*time.Hour), int64(9001), fixedTime, fixedTime,
 		))
+	mock.ExpectCommit()
 	p, g, err := repo.JoinAtomic(context.Background(), 1, 42, 101, fixedTime)
 	require.NoError(t, err)
 	require.Equal(t, int64(501), p.ID)
@@ -313,14 +344,49 @@ func TestPGGroupbuyRepo_JoinAtomicRaceUniqueViolation(t *testing.T) {
 	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(100)).
 		WillReturnError(pgx.ErrNoRows)
 	// A concurrent insert raced past step 2 → UNIQUE(tenant,groupbuy,member)
-	// violation is mapped to ErrAlreadyJoined.
+	// violation is mapped to ErrAlreadyJoined; the tx rolls back (no orphan).
+	mock.ExpectBegin()
 	mock.ExpectQuery(sqlPartInsert).WithArgs(int64(1), int64(42), int64(100), PStatusJoined, fixedTime).
 		WillReturnError(&pgconn.PgError{Code: "23505"})
+	mock.ExpectRollback()
 	_, _, err := repo.JoinAtomic(context.Background(), 1, 42, 100, fixedTime)
 	require.ErrorIs(t, err, ErrAlreadyJoined)
 	// Sanity: the helper classifies SQLSTATE 23505.
 	require.True(t, isUniqueViolation(&pgconn.PgError{Code: "23505"}))
 	require.False(t, isUniqueViolation(errors.New("other")))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGGroupbuyRepo_JoinAtomicIncrRaceRollback reproduces the orphan-row bug
+// the transaction fix closes: the participant INSERT (step 5) succeeds, but the
+// conditional joined++ UPDATE (step 6) returns no rows because a concurrent join
+// filled the squad between the step-1 read and here. The transaction must roll
+// back (rolling back the inserted participant — no orphan row, no miscounted joined,
+// member not permanently locked) and map to ErrGroupbuyFull.
+func TestPGGroupbuyRepo_JoinAtomicIncrRaceRollback(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGGroupbuyRepo(mock)
+	cur := sampleGroupbuy(2) // read saw joined=2/3 active; a concurrent join fills it
+	paramsBytes, _ := json.Marshal(cur.Params)
+	mock.ExpectQuery(sqlGBGetByID).WithArgs(int64(1), int64(42)).
+		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
+			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
+		))
+	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(100)).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectBegin()
+	// Step 5 INSERT succeeds...
+	mock.ExpectQuery(sqlPartInsert).WithArgs(int64(1), int64(42), int64(100), PStatusJoined, fixedTime).
+		WillReturnRows(pgxmock.NewRows(partColumns()).AddRow(int64(500), int64(1), int64(42), int64(100), PStatusJoined, fixedTime))
+	// ...but step 6 guarded UPDATE matches no rows (squad raced to full/success).
+	mock.ExpectQuery(sqlGBJoinIncr).WithArgs(fixedTime, int64(1), int64(42)).
+		WillReturnError(pgx.ErrNoRows)
+	// The deferred Rollback rolls back the inserted participant → no orphan row.
+	mock.ExpectRollback()
+	p, g, err := repo.JoinAtomic(context.Background(), 1, 42, 100, fixedTime)
+	require.Nil(t, p)
+	require.Nil(t, g)
+	require.ErrorIs(t, err, ErrGroupbuyFull)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
