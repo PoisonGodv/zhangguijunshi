@@ -990,3 +990,208 @@ func TestSend_ScheduledEnqueueError_Propagates(t *testing.T) {
 		t.Errorf("the pre-persisted row should be marked failed, got %d", len(failed))
 	}
 }
+
+// ===========================================================================
+// Delivery-time recheck (CONTRACT §20.3 follow-up — "投递时复检")
+//
+// A deferred send is booked with NO guard checks (the deferred branch persists a
+// pending row + enqueues and returns before any compliance step). The worker
+// later re-drives it through SendFinalize, which MUST re-check unsubscribe +
+// frequency immediately before the sender so a LATE opt-out / freq trip between
+// booking and delivery blocks the message instead of delivering it.
+// ===========================================================================
+
+// TestSendFinalize_LateUnsubscribe_BlocksDelivery: book a deferred send, then the
+// member opts out BEFORE delivery. The worker finalize must block(unsubscribed),
+// flip the SAME pending row (no duplicate), send nothing, and return (task, nil)
+// so the job ACKs.
+func TestSendFinalize_LateUnsubscribe_BlocksDelivery(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	snd := &fakeSender{}
+	freq := &fakeFreq{allowed: true}
+	cf := &fakeCF{passed: true}
+	prod := &fakeScheduledProducer{}
+	s := New(repo, WithSender(snd), WithFreqGate(freq), WithContentFilter(cf), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	future := clock().Add(2 * time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+	pending, err := s.Send(ctxWithTenant(7), in)
+	if err != nil {
+		t.Fatalf("enqueue Send: %v", err)
+	}
+	if pending.Status != StatusPending {
+		t.Fatalf("precondition: pending row, got %+v", pending)
+	}
+
+	// LATE opt-out: after booking, before the worker delivers.
+	if _, err := s.Unsubscribe(ctxWithTenant(7), 42, ChannelWeworkGroup, "迟到退订"); err != nil {
+		t.Fatalf("unsub: %v", err)
+	}
+
+	deliverIn := in
+	deliverIn.ScheduledAt = time.Time{} // worker clears ScheduledAt to force delivery
+	blocked, err := s.SendFinalize(ctxWithTenant(7), deliverIn, pending.ID)
+	if err != nil {
+		t.Fatalf("a blocked delivery returns (task, nil), got err %v", err)
+	}
+	if blocked.ID != pending.ID || blocked.Status != StatusBlocked || blocked.BlockedReason != BlockUnsubscribed {
+		t.Fatalf("expected same row flipped to blocked(unsubscribed), got %+v", blocked)
+	}
+	if len(snd.payloads) != 0 {
+		t.Errorf("late-unsubscribed delivery must NOT send, got %d payloads", len(snd.payloads))
+	}
+	// Exactly one row, flipped in place to blocked (not sent, no duplicate).
+	tasks, _ := repo.ListTasks(ctxWithTenant(7), 7, 0, "")
+	if len(tasks) != 1 || tasks[0].Status != StatusBlocked {
+		t.Errorf("exactly one blocked row expected, got %+v", tasks)
+	}
+}
+
+// TestSendFinalize_LateFreqTrip_BlocksDelivery: the frequency cap is tripped
+// BETWEEN booking and delivery. The worker finalize must block(freq_circuit).
+func TestSendFinalize_LateFreqTrip_BlocksDelivery(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	snd := &fakeSender{}
+	freq := &fakeFreq{allowed: true} // clear at booking (booking checks nothing anyway)
+	cf := &fakeCF{passed: true}
+	prod := &fakeScheduledProducer{}
+	s := New(repo, WithSender(snd), WithFreqGate(freq), WithContentFilter(cf), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	future := clock().Add(2 * time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+	pending, err := s.Send(ctxWithTenant(7), in)
+	if err != nil {
+		t.Fatalf("enqueue Send: %v", err)
+	}
+
+	// LATE freq trip: the channel cap is hit after booking, before delivery.
+	freq.allowed = false
+
+	deliverIn := in
+	deliverIn.ScheduledAt = time.Time{}
+	blocked, err := s.SendFinalize(ctxWithTenant(7), deliverIn, pending.ID)
+	if err != nil {
+		t.Fatalf("a blocked delivery returns (task, nil), got err %v", err)
+	}
+	if blocked.ID != pending.ID || blocked.Status != StatusBlocked || blocked.BlockedReason != BlockFreqCircuit {
+		t.Fatalf("expected same row flipped to blocked(freq_circuit), got %+v", blocked)
+	}
+	if len(snd.payloads) != 0 {
+		t.Errorf("over-frequency delivery must NOT send, got %d payloads", len(snd.payloads))
+	}
+}
+
+// TestSendFinalize_RecheckPasses_SendsNormally: with freq allowed and no opt-out,
+// the delivery-time recheck does NOT over-block — a deferred send still lands as
+// sent (the recheck is a guard, not a new failure mode on the happy path).
+func TestSendFinalize_RecheckPasses_SendsNormally(t *testing.T) {
+	repo := NewMemoryReachRepo()
+	snd := &fakeSender{}
+	freq := &fakeFreq{allowed: true}
+	cf := &fakeCF{passed: true}
+	prod := &fakeScheduledProducer{}
+	s := New(repo, WithSender(snd), WithFreqGate(freq), WithContentFilter(cf), WithScheduledProducer(prod), WithNowFunc(clock))
+
+	future := clock().Add(2 * time.Hour)
+	in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+	pending, err := s.Send(ctxWithTenant(7), in)
+	if err != nil {
+		t.Fatalf("enqueue Send: %v", err)
+	}
+
+	deliverIn := in
+	deliverIn.ScheduledAt = time.Time{}
+	sent, err := s.SendFinalize(ctxWithTenant(7), deliverIn, pending.ID)
+	if err != nil {
+		t.Fatalf("SendFinalize: %v", err)
+	}
+	if sent.ID != pending.ID || sent.Status != StatusSent {
+		t.Fatalf("expected same row flipped to sent, got %+v", sent)
+	}
+	if len(snd.payloads) != 1 {
+		t.Errorf("clean delivery should send exactly 1 payload, got %d", len(snd.payloads))
+	}
+	// The recheck consulted the freq gate exactly once (on the delivery attempt).
+	if freq.calls != 1 {
+		t.Errorf("freq recheck should run once at delivery, got %d calls", freq.calls)
+	}
+}
+
+// errUnsubRepo wraps a ReachRepo and injects an error into IsUnsubscribed when
+// fail is set — used to prove the delivery-time recheck fails CLOSED on an
+// unsubscribe-probe error (strict: compliance over availability).
+type errUnsubRepo struct {
+	ReachRepo
+	fail bool
+}
+
+func (r *errUnsubRepo) IsUnsubscribed(ctx context.Context, tenantID, memberID int64, channel string) (bool, error) {
+	if r.fail {
+		return false, errors.New("unsub probe down")
+	}
+	return r.ReachRepo.IsUnsubscribed(ctx, tenantID, memberID, channel)
+}
+
+// TestSendFinalize_RecheckDegradation covers the two recheck dependencies failing:
+//   - freq gate UNWIRED (nil) ⇒ the recheck skips it and delivery proceeds
+//     (availability: a missing optional gate never stalls a send);
+//   - unsubscribe probe ERROR ⇒ delivery fails with a hard error and sends nothing
+//     (strict: we would rather delay than message a possibly opted-out member).
+func TestSendFinalize_RecheckDegradation(t *testing.T) {
+	// (a) No freq gate wired: the recheck must skip freq and still deliver.
+	t.Run("freq gate absent proceeds", func(t *testing.T) {
+		repo := NewMemoryReachRepo()
+		snd := &fakeSender{}
+		prod := &fakeScheduledProducer{}
+		// NOTE: no WithFreqGate — the optional port is nil.
+		s := New(repo, WithSender(snd), WithScheduledProducer(prod), WithNowFunc(clock))
+
+		future := clock().Add(2 * time.Hour)
+		in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+		pending, err := s.Send(ctxWithTenant(7), in)
+		if err != nil {
+			t.Fatalf("enqueue Send: %v", err)
+		}
+		deliverIn := in
+		deliverIn.ScheduledAt = time.Time{}
+		sent, err := s.SendFinalize(ctxWithTenant(7), deliverIn, pending.ID)
+		if err != nil {
+			t.Fatalf("a nil freq gate must not stall delivery: %v", err)
+		}
+		if sent.Status != StatusSent || len(snd.payloads) != 1 {
+			t.Errorf("nil freq gate should still deliver, got %+v payloads=%d", sent, len(snd.payloads))
+		}
+	})
+
+	// (b) Unsubscribe probe errors: delivery must fail closed (hard error, no send).
+	t.Run("unsub probe error fails closed", func(t *testing.T) {
+		base := NewMemoryReachRepo()
+		repo := &errUnsubRepo{ReachRepo: base, fail: true}
+		snd := &fakeSender{}
+		freq := &fakeFreq{allowed: true}
+		prod := &fakeScheduledProducer{}
+		s := New(repo, WithSender(snd), WithFreqGate(freq), WithScheduledProducer(prod), WithNowFunc(clock))
+
+		future := clock().Add(2 * time.Hour)
+		in := SendInput{StoreID: 1, MemberID: 42, Channel: ChannelWeworkGroup, TemplateCode: TplBirthday, ScheduledAt: future}
+		pending, err := s.Send(ctxWithTenant(7), in)
+		if err != nil {
+			t.Fatalf("enqueue Send: %v", err)
+		}
+		deliverIn := in
+		deliverIn.ScheduledAt = time.Time{}
+		task, err := s.SendFinalize(ctxWithTenant(7), deliverIn, pending.ID)
+		if err == nil {
+			t.Fatalf("an unsubscribe-probe error must surface as a hard error, got task=%+v", task)
+		}
+		if len(snd.payloads) != 0 {
+			t.Errorf("strict recheck must NOT deliver on probe error, got %d payloads", len(snd.payloads))
+		}
+		// The pending row is left untouched (still pending) so the worker redelivers
+		// once the probe recovers — it is neither silently sent nor wrongly blocked.
+		got, _ := base.GetTask(ctxWithTenant(7), 7, pending.ID)
+		if got.Status != StatusPending {
+			t.Errorf("probe error must leave the row pending for redelivery, got %q", got.Status)
+		}
+	})
+}

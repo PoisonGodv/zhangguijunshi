@@ -151,6 +151,111 @@ func TestBuildSignalText_EmptyFields(t *testing.T) {
 	}
 }
 
+// ---- M8-A (§21.3): sales dimension in the semantic key ----
+
+func TestBuildSignalText_WithSales(t *testing.T) {
+	b := &signal.Bundle{
+		BusinessType: "fruit",
+		Weather:      signal.Weather{Condition: "rain"},
+		Members:      signal.MemberStats{Sleep30: 18},
+		Sales: []signal.SalesSig{
+			{ProductID: 9, Trend: signal.TrendDown, SlowMoving: true},
+			{ProductID: 1, Trend: signal.TrendUp, SlowMoving: true},
+			{ProductID: 5, Trend: signal.TrendFlat, SlowMoving: true},
+			{ProductID: 3, Trend: signal.TrendUp, BestSeller: true},
+			{ProductID: 7, Trend: signal.TrendUp},
+		},
+	}
+	got := BuildSignalText(b)
+	// slow set sorted ascending (1,5,9); best set (3); up=3,down=1,flat=1.
+	want := "fruit|weather=rain|days_to_expiry=none|sleep_30=18|holiday=none" +
+		"|sales=slow:1,5,9;best:3;up:3,down:1,flat:1"
+	if got != want {
+		t.Fatalf("BuildSignalText = %q, want %q", got, want)
+	}
+}
+
+func TestBuildSignalText_SalesChangesKey(t *testing.T) {
+	base := &signal.Bundle{
+		BusinessType: "fruit",
+		Weather:      signal.Weather{Condition: "rain"},
+		Members:      signal.MemberStats{Sleep30: 18},
+	}
+	noSales := BuildSignalText(base)
+
+	withSales := &signal.Bundle{
+		BusinessType: "fruit",
+		Weather:      signal.Weather{Condition: "rain"},
+		Members:      signal.MemberStats{Sleep30: 18},
+		Sales: []signal.SalesSig{
+			{ProductID: 1, Trend: signal.TrendUp, SlowMoving: true},
+		},
+	}
+	if got := BuildSignalText(withSales); got == noSales {
+		t.Fatalf("sales signal must change the key; both = %q", got)
+	}
+}
+
+func TestBuildSignalText_NoSalesKeyUnchanged(t *testing.T) {
+	// Backward compatibility: nil and empty Sales must NOT alter the legacy key.
+	legacy := "fruit|weather=rain|days_to_expiry=none|sleep_30=18|holiday=none"
+	for _, sales := range [][]signal.SalesSig{nil, {}} {
+		b := &signal.Bundle{
+			BusinessType: "fruit",
+			Weather:      signal.Weather{Condition: "rain"},
+			Members:      signal.MemberStats{Sleep30: 18},
+			Sales:        sales,
+		}
+		if got := BuildSignalText(b); got != legacy {
+			t.Fatalf("no-sales key changed: got %q, want legacy %q (sales=%v)", got, legacy, sales)
+		}
+	}
+}
+
+func TestBuildSignalText_SalesKeyStable(t *testing.T) {
+	// Same logical sales set in a different slice order must yield the same key
+	// (sets are sorted; trend counts are order-independent).
+	a := []signal.SalesSig{
+		{ProductID: 5, Trend: signal.TrendFlat, SlowMoving: true},
+		{ProductID: 1, Trend: signal.TrendUp, SlowMoving: true},
+		{ProductID: 3, Trend: signal.TrendUp, BestSeller: true},
+	}
+	b := []signal.SalesSig{
+		{ProductID: 3, Trend: signal.TrendUp, BestSeller: true},
+		{ProductID: 1, Trend: signal.TrendUp, SlowMoving: true},
+		{ProductID: 5, Trend: signal.TrendFlat, SlowMoving: true},
+	}
+	ba := &signal.Bundle{BusinessType: "fruit", Sales: a}
+	bb := &signal.Bundle{BusinessType: "fruit", Sales: b}
+	if ka, kb := BuildSignalText(ba), BuildSignalText(bb); ka != kb {
+		t.Fatalf("key not stable across input order: %q vs %q", ka, kb)
+	}
+	// Determinism: identical input → identical key on repeated calls.
+	if k1, k2 := BuildSignalText(ba), BuildSignalText(ba); k1 != k2 {
+		t.Fatalf("key not deterministic: %q vs %q", k1, k2)
+	}
+}
+
+func TestBuildSignalText_SalesJitterDoesNotChangeKey(t *testing.T) {
+	// Exact quantities jitter day-to-day; the key must depend only on the
+	// set/bucket-level summary, so two bundles that differ only in TotalQty /
+	// RecentQty / PriorQty / ActiveDays (same slow/best sets + trend buckets)
+	// collapse onto one key — otherwise the cache would never hit.
+	mk := func(total, recent, prior int64, days int) *signal.Bundle {
+		return &signal.Bundle{
+			BusinessType: "fruit",
+			Sales: []signal.SalesSig{
+				{ProductID: 1, TotalQty: total, RecentQty: recent, PriorQty: prior,
+					ActiveDays: days, Trend: signal.TrendUp, SlowMoving: true},
+				{ProductID: 2, TotalQty: total + 100, Trend: signal.TrendDown, BestSeller: true},
+			},
+		}
+	}
+	if ka, kb := BuildSignalText(mk(3, 2, 1, 4)), BuildSignalText(mk(50, 40, 10, 12)); ka != kb {
+		t.Fatalf("quantity jitter must not change the key: %q vs %q", ka, kb)
+	}
+}
+
 // ---- Metrics tests ----
 
 func TestNewMetrics_IncHitMiss(t *testing.T) {

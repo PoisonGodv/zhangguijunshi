@@ -55,18 +55,20 @@
       </view>
     </block>
 
-    <!-- 附近门店 -->
-    <view class="section-title">附近门店</view>
-    <view class="store-card">
-      <view class="store-row">
-        <view class="store-info">
-          <view class="store-name">{{store.name}}</view>
-          <view class="store-addr">{{store.address}}</view>
-          <view class="store-addr" wx:if="{{store.distance_text}}">{{store.distance_text}}</view>
+    <!-- 附近门店 (真实 GET /v1/wxshop/stores 首店; 空列表隐藏) -->
+    <block wx:if="{{store}}">
+      <view class="section-title">附近门店</view>
+      <view class="store-card">
+        <view class="store-row">
+          <view class="store-info">
+            <view class="store-name">{{store.name}}</view>
+            <view class="store-addr">{{store.address}}</view>
+            <view class="store-addr" wx:if="{{store.distance_text}}">{{store.distance_text}}</view>
+          </view>
+          <button class="store-group-btn" bindtap="onTapStoreGroup">进群</button>
         </view>
-        <button class="store-group-btn" bindtap="onTapStoreGroup">进群</button>
       </view>
-    </view>
+    </block>
 
     <!-- 空状态: 福利和拼团都为空时 -->
     <view wx:if="{{!benefits.length && !groupbuys.length}}" class="empty">

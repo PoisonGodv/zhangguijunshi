@@ -47,6 +47,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/internal/subscription"
+	"github.com/zhangguijunshi/backend/internal/tenant"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/cos"
 	"github.com/zhangguijunshi/backend/pkg/db"
@@ -103,6 +104,10 @@ type Services struct {
 	Payment      *payment.Service
 	Subscription *subscription.Service
 	StoreSvc     *store.Service
+	// PlatformTenant is the platform-ops (运营后台) cross-tenant READ-ONLY
+	// aggregate service (M8-B, CONTRACT §23). Memory-backed in dev (seeded demo
+	// tenants), PG-backed in prod. nil only in the minimal test fixture.
+	PlatformTenant *tenant.Service
 
 	// COS is the object-storage client for boss image uploads. nil when the COS
 	// credentials are absent (dev); the asset handler degrades to a clean error.
@@ -356,6 +361,16 @@ func BuildServices(ctx context.Context, cfg *config.Config, log *zap.Logger, inf
 	}
 	storeSvc := store.New(storeRepo)
 	s.StoreSvc = storeSvc
+
+	// ---- M8-B platform-ops cross-tenant READ-ONLY aggregate (CONTRACT §23). ----
+	// Memory-backed (seeded demo tenants) in dev, PG-backed in prod. Depends only
+	// on the pool — per-tenant counts are correlated subqueries, so no other
+	// domain repo is coupled in.
+	var platformTenantRepo tenant.Repo = tenant.NewMemoryRepo()
+	if database != nil {
+		platformTenantRepo = tenant.NewPGRepo(database.Pool())
+	}
+	s.PlatformTenant = tenant.New(platformTenantRepo)
 
 	// ---- COS object-storage client (boss image uploads; nil when unconfigured).
 	s.COS = buildCOS(cfg.COS)

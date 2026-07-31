@@ -3563,3 +3563,43 @@ services 层：catalog.ts/inventory.ts/membership.ts（A2a）+ billing.ts/market
 - 根因：`Producer.Enqueue` 无脑 XADD，consumer XREADGROUP 立即消费 → 未来 RunAt 的"定时"消息一入队就发。
 - 修法（`pkg/jobqueue/delay.go` + `queue.go`）：未来且非零 RunAt → ZADD 进 `<stream>:delay` ZSET（score=RunAt.UnixNano，member=JSON 字段映射+随机 nonce 防 ZADD 折叠）；零/过去 RunAt 仍走立即 XADD（既有调用方/测试不受影响）。worker 新增 `DelayPump`（`NewDelayPump(client, cfg)`）后台循环：ZRANGEBYSCORE 取 due → **ZREM 抢占**（返回 1 者独占，跨 worker 副本 exactly-once）→ XADD 回 live Stream（复用四字段，parseJob 零改动）；XADD 失败则 now+5s 重入队（at-least-once，不丢）；corrupt member 丢弃（poison-pill 守卫）。nil client → Run no-op（dev 无延迟投递，正确）。
 - worker `cmd/worker/main.go`：consumer + pump 双循环并跑，优雅退出（bounded drain，任一自退则 cancel 另一个）。
+
+## 23. M8 四路收尾（2026-07-31）
+
+4-agent 并行实现（M8-A/B/C/D）+ 主线程集成。`go build ./...` 全绿、`go test -race ./...` 全绿（48 包）、gofmt/vet clean。
+
+### 23.1 semantic 语义键纳入销量维度（§21.3 遗留，修复，M8-A）
+- 根因：`semantic.BuildSignalText` 只用 weather/days_to_expiry/sleep_30/holiday 构造语义键文本，不含 slow_moving/sales → 销量变化可能命中旧语义缓存。
+- 修法（`internal/aiengine/semantic/signal_text.go`）：BuildSignalText 从 `signal.Bundle.Sales`（M7-B collector 填充）提取**集合/分桶级稳定摘要**入键——slow_moving 商品 id 排序集、best_seller 集、趋势 up/down/flat 计数。**刻意不含** TotalQty/RecentQty/PriorQty/ActiveDays 等易抖动精确值（否则语义缓存永远 miss）。空集渲染为 `"none"` 保持维度非空无歧义；未知 Trend 归 flat（default 分支防御未来枚举）。
+- 向后兼容：nil 与空切片 Sales 都**省略 sales 维度**，键与 M8 前逐字节一致——无销量信号的租户不受无谓缓存失效影响。
+- 签名未变（仍 `*signal.Bundle`），三个调用点（pipeline.go:198/249、pregen/service.go:161）零改动。pregen.deriveSemanticKey 从 strategy.Signals 快照 round-trip 出 bundle（SalesSig 带 json tag），写键与读键自动一致。
+- 测试 +5：WithSales 完整键断言 / SalesChangesKey（有/无销量键不同）/ NoSalesKeyUnchanged（nil+空切片键不变）/ SalesKeyStable（乱序同键+确定性）/ SalesJitterDoesNotChangeKey（精确销量抖动不改键）。
+
+### 23.2 平台运营跨租户只读后台 internal/tenant（§20.6 余项，新增，M8-B）
+- 新域 `internal/tenant/`：`Service` + `Repo`（Memory+PG 双实现，pgxmock 测试）。`ListTenants(ctx, PlatformCaller, Filter) (Result, error)` 返回跨租户聚合视图（每租户 id/name/status/plan/created_at + product_count/member_count/order_count/store_count 相关子查询聚合，排除 deleted_at，orders 无软删不过滤；拿不到的维度如 GMV 留待后续）。Filter.Normalize() limit 默认 20/上限 200/offset≥0；Total 独立于页窗。
+- **跨租户是全代码库唯一有意例外**：`PGRepo.ListAllTenants` 是唯一不带 `WHERE tenant_id` 的查询（平台聚合视图本质如此）。隔离上移并双层强制：① `Service.ListTenants` 要求显式 `PlatformCaller.Role == PlatformRole("platform_ops")`，否则 `errcode.ErrForbidden(40301)`；② repo `ensurePlatform(ctx)` 要求 ctx Source==system/admin，否则返回空页（绝不泄漏）。Service 调 repo 前用 `platformCtx()` 把 ctx 重打 Source=system/TenantID=0。方法命名 `ListAllTenants`（区别于各域按租户的 `List*`），绝不复用按租户过滤方法去绕过。若 tenantcheck 静态分析器（pkg/multitenancy/lint.go）将来接入 CI，此函数是受认可例外，ensurePlatform 是其闸门——**不要加 tenant 过滤否则破坏平台视图**。
+- handler `interfaces/http/handler/platform_tenant.go`：`GET /v1/platform/tenants?status=&query=&limit=&offset=` → `{items:[…], total, count}`。handler 不重实现守卫但从 verified claims 构造 PlatformCaller（无 claims→403，非 platform 角色→Service 拒 403，defense in depth）；不信任请求体任何 tenant_id（本就没有）。
+- **接线（主线程）**：bootstrap Services 新增 `PlatformTenant *tenant.Service`（memory↔pg 切换，仅依赖 database.Pool()，dev 无 PG→MemoryRepo 内置 seed 2 演示租户）；router Deps 新增 PlatformTenant + 新 `wirePlatform`（与 wireBoss/wireAdmin 并列）：`/v1/platform` 组挂 `bossAdminAuthMW(deps, jwt.SceneAdmin)` + `middleware.RequireRole(tenant.PlatformRole)`；cmd/api/main.go Deps 填 `PlatformTenant: svc.PlatformTenant`。
+- **dev MockTenant 进不来**：MockTenant 不设 role，RequireRole(platform_ops) 拒；本地联调平台接口须走真 admin 登录（ops/ops12345）拿 platform_ops token。有意安全收敛，非 bug。纯只读，无写/删接口。
+- 测试：tenant 包（ListTenants 分页/角色闸门/ensurePlatform/跨租户隔离）+ pgxmock + handler 测试（正常/无权限映射）。
+
+### 23.3 consumer-mp 剩余业务接通（M8-C）
+- 首页 `pages/index`：「附近门店」卡由硬编码 MOCK_STORE 改为真实 `GET /v1/wxshop/stores`（复用 services/store.listStores），取首店渲染；空列表→store=null，wxml `wx:if` 隐藏整卡。「今日福利」卡 onTapBenefit 由 toast 占位改为跳券详情 `/pages/coupon-detail?id=`。storeName 改 tenantStore 优先否则回填真实首店名。
+- 已确认 services 全部 USE_MOCK=false（auth/member/coupon/order/group-buy/store 均真实接通），对应页面均经既有 request 封装（JWT+401 续期）。
+- 仍占位（后端无对应 C 端接口，未臆造，前端优雅降级/toast）：profile 客服/设置、orders 订单详情（后端只有 GET /orders 列表无 /orders/:id）、balance 储值充值（§16 充值接口未就绪）、join 订阅消息 tmplIds（微信模板 ID 待申请）。
+- type-check：临时 tsconfig（typescript@5.5.4 + miniprogram-api-typings，strict + noUnusedLocals/Parameters，lib ES2018）全量 `tsc --noEmit` EXIT=0，0 错。
+
+### 23.4 reach 投递时复检（§20.3 设计取舍遗留，修复，M8-D）
+- 根因：deferred 分支在预约时只落 pending 行+入队就 return，**未跑任何 guard**；worker 投递（SendFinalize）只记结果不复检 → 预约后到投递前用户退订/触发频次，仍会发给已退订用户。
+- 修法（`internal/reach/service.go`）：SendFinalize 的 sender 之前新增私有 `recheckBeforeSend(ctx, tenantID, in) (reason, error)`，按既有管线顺序**先 freq 后 unsub**，在每一次 attempt（即时 + 定时 worker 投递）都执行。命中则 pending 行原地翻转 blocked（status≠sent，不发 sender），不重复建行，返回 (task,nil) 让 job ACK。
+- 降级取舍（代码注释）：freq 为可选端口，nil（dev/未接）⇒ 复检跳过它，绝不卡死正常投递（可用性优先）；已接 gate 返回 error 视为系统错误向上抛（worker 红投递）。unsub 严格（合规优先）：repo 是必选依赖，IsUnsubscribed 出错 ⇒ hard error、不发送、pending 行保持 pending 待恢复后红投递——宁可延迟也不发给可能已退订用户。
+- 有意不复检：quota（deferred 在消耗 quota 的步骤⑥前就 return，定时 subscribe_msg 的 quota 在投递时唯一一次经过⑥，无双扣）；content filter（渲染 body 的纯函数，预约与投递 body 逐字节相同，重跑无新信号）。
+- **worker 完全零改动**：handleReachDueSend 已调 SendFinalize(tctx, in, payload.TaskID)，复检内聚在 reach.Service 投递路径，租户仍从 ctx 解析。
+- 测试 +4：预约后退订→投递跳过（非 sent）/ 预约后频次超限→跳过 / 正常→照常 sent / 复检依赖缺失降级。
+- 既有语义提醒（非本次引入）：freq gate 是 per-channel 而非 per-member（freqcircuit.Allow(channel)），Allow 内部 Incr——即时计数一次、定时投递时计数一次，均无双计数。§20.3 原文"预约时校验一次"对 deferred 分支并不准确（预约时未跑 guard），本次修复正是把合规复检真正落到投递时。
+
+### 23.5 仍延后
+- C 端缺接口（前端已优雅降级，补了即启用）：`GET /v1/wxshop/orders/:id` 订单详情 / C 端储值充值接口（§16）/ `POST /v1/track/batch` 埋点批量上报。
+- WX V3 真 sub_mch_id 透传 + Apply 字段级 RSA-OAEP。
+- 平台运营聚合维度扩展（GMV/营收等）。
+- 真 PG+Redis 密钥联调跑 migrate。

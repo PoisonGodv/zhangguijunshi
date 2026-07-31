@@ -36,6 +36,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/store"
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/internal/subscription"
+	"github.com/zhangguijunshi/backend/internal/tenant"
 	"github.com/zhangguijunshi/backend/pkg/config"
 	"github.com/zhangguijunshi/backend/pkg/cos"
 	"github.com/zhangguijunshi/backend/pkg/db"
@@ -87,6 +88,9 @@ type Deps struct {
 	Subscription *subscription.Service
 	// FE-MP-02 store domain (C-side 门店列表; nil in the minimal test fixture).
 	StoreSvc *store.Service
+	// M8-B platform-ops cross-tenant READ-ONLY aggregate (CONTRACT §23). nil in
+	// the minimal test fixture → the /v1/platform group is not mounted.
+	PlatformTenant *tenant.Service
 	// COS is the object-storage client for boss image uploads (CONTRACT §19).
 	// nil in dev (unconfigured) → the /assets endpoint reports "COS 未配置".
 	COS *cos.Client
@@ -131,6 +135,7 @@ func New(deps Deps) *gin.Engine {
 	wireWxshop(r, deps)
 	wireBoss(r, deps)
 	wireAdmin(r, deps)
+	wirePlatform(r, deps)
 	return r
 }
 
@@ -333,6 +338,32 @@ func wireAdmin(r *gin.Engine, deps Deps) {
 		// Change password (authed): account id + tenant from JWT ctx, never body.
 		admin.POST("/auth/password", ah.ChangePassword)
 	}
+}
+
+// wirePlatform mounts the platform-ops (运营后台) cross-tenant READ-ONLY BFF
+// (M8-B, CONTRACT §23). It is the ONLY surface allowed to read across tenants.
+//
+// Auth: real JWT + RequireScene(admin) (platform_ops tokens are minted by
+// AdminLogin, scene=admin) via bossAdminAuthMW, THEN RequireRole(platform_ops).
+// The role guard is what makes this surface safe: a normal boss/admin merchant
+// token carries owner/clerk/… roles and is rejected with 403 before reaching
+// the handler. In dev_mock_header mode MockTenant sets no role, so the platform
+// group is effectively closed — local platform debugging must use a real admin
+// login (ops/ops12345) to obtain a platform_ops token. This is intentional
+// security convergence, not a bug.
+//
+// The handler independently re-checks the role via tenant.Service (defense in
+// depth); the cross-tenant scope comes solely from the verified platform role,
+// never from a request-body tenant id (there is none).
+func wirePlatform(r *gin.Engine, deps Deps) {
+	if deps.PlatformTenant == nil {
+		return
+	}
+	h := handler.NewPlatformTenantHandler(deps.PlatformTenant)
+	plat := r.Group("/v1/platform")
+	plat.Use(bossAdminAuthMW(deps, jwt.SceneAdmin))
+	plat.Use(middleware.RequireRole(tenant.PlatformRole))
+	plat.GET("/tenants", h.ListTenants)
 }
 
 // bossAdminAuthMW enforces real JWT + the given surface scene (RequireScene) in

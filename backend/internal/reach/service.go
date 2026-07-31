@@ -57,11 +57,17 @@ func (s *Service) Send(ctx context.Context, in SendInput) (*ReachTask, error) {
 //  2. Render (unknown template code ⇒ ErrTemplateUnknown, a HARD error not a
 //     block; otherwise title + body resolved with sensible defaults)
 //  3. ContentFilter (if wired).Do(body) ⇒ !Passed ⇒ blocked(content_filter)
-//  4. FreqGate (if wired).Allow(channel) ⇒ !allowed ⇒ blocked(freq_circuit)
-//  5. IsUnsubscribed(channel) ⇒ true ⇒ blocked(unsubscribed)
-//  6. channel==subscribe_msg ⇒ ConsumeSubscribe ⇒ ErrSubscribeExhausted ⇒
+//  4. recheckBeforeSend — the DELIVERY-TIME compliance recheck (CONTRACT §20.3
+//     follow-up): FreqGate (if wired).Allow(channel) ⇒ !allowed ⇒
+//     blocked(freq_circuit), then IsUnsubscribed(channel) ⇒ true ⇒
+//     blocked(unsubscribed). It runs on every attempt immediately before the
+//     sender so a deferred send honors a late unsubscribe / a frequency cap
+//     tripped between booking and delivery. See recheckBeforeSend for the
+//     degradation tradeoffs (freq optional ⇒ skipped when unwired; unsub strict
+//     ⇒ an error fails the attempt rather than delivering).
+//  5. channel==subscribe_msg ⇒ ConsumeSubscribe ⇒ ErrSubscribeExhausted ⇒
 //     blocked(subscribe_quota)
-//  7. Sender (if wired).Send ⇒ failure status=failed / success status=sent
+//  6. Sender (if wired).Send ⇒ failure status=failed / success status=sent
 //
 // taskID selects the persistence mode at every terminal point (block / fail /
 // sent):
@@ -165,24 +171,18 @@ func (s *Service) SendFinalize(ctx context.Context, in SendInput, taskID int64) 
 		}
 	}
 
-	// ④ frequency circuit (optional).
-	if s.freq != nil {
-		allowed, _, ferr := s.freq.Allow(ctx, in.Channel)
-		if ferr != nil {
-			return nil, ferr
-		}
-		if !allowed {
-			return s.block(ctx, task, BlockFreqCircuit, taskID)
-		}
-	}
-
-	// ⑤ unsubscribe opt-out.
-	unsub, uerr := s.repo.IsUnsubscribed(ctx, tenantID, in.MemberID, in.Channel)
-	if uerr != nil {
-		return nil, uerr
-	}
-	if unsub {
-		return s.block(ctx, task, BlockUnsubscribed, taskID)
+	// ④+⑤ delivery-time compliance recheck (frequency circuit + unsubscribe
+	// opt-out). This single call IS the "投递时复检" (CONTRACT §20.3 follow-up):
+	// it runs on EVERY send attempt immediately before the sender, so a deferred
+	// send — booked earlier with NO guards (the deferred branch above persists +
+	// enqueues and returns before any check) and delivered later by the worker via
+	// SendFinalize — honors a LATE unsubscribe or a frequency cap tripped between
+	// booking and delivery. The message is blocked (status≠sent), never delivered
+	// to an opted-out member. See recheckBeforeSend for the degradation tradeoffs.
+	if reason, rerr := s.recheckBeforeSend(ctx, tenantID, in); rerr != nil {
+		return nil, rerr
+	} else if reason != "" {
+		return s.block(ctx, task, reason, taskID)
 	}
 
 	// ⑥ subscribe-message one-time quota. TemplateCode is the subscribe template
@@ -215,6 +215,61 @@ func (s *Service) SendFinalize(ctx context.Context, in SendInput, taskID int64) 
 	task.Status = StatusSent
 	task.SentAt = now
 	return s.persist(ctx, task, taskID)
+}
+
+// recheckBeforeSend is the delivery-time compliance recheck (CONTRACT §20.3
+// follow-up — "投递时复检"). It runs the frequency circuit then the unsubscribe
+// opt-out, in that order (matching the pipeline's ④→⑤ order), immediately before
+// the sender. It is invoked on EVERY send attempt — immediate AND deferred — so a
+// deferred send (booked earlier with no guards and delivered later by the worker
+// via SendFinalize) honors a LATE unsubscribe or a frequency cap tripped between
+// booking and delivery instead of messaging an opted-out / over-frequency member.
+//
+// Return contract:
+//
+//	("", nil)     — clear to deliver
+//	(reason, nil) — blocked; reason is BlockFreqCircuit or BlockUnsubscribed
+//	("", err)     — system failure; the caller surfaces it (worker redelivers)
+//
+// Degradation tradeoffs (availability vs compliance):
+//   - Frequency: the FreqGate port is OPTIONAL. nil (dev / unwired) ⇒ the recheck
+//     skips it, so a missing gate never stalls delivery. A wired gate that errors
+//     is a real system failure and is surfaced (identical to the immediate-send
+//     path) — a live gate's error is never silently swallowed.
+//   - Unsubscribe: STRICT. The repo is a mandatory Service dependency, so an
+//     IsUnsubscribed error is surfaced as a hard error (the attempt fails and, on
+//     the worker path, redelivers) rather than delivering to a possibly opted-out
+//     member. Compliance wins over availability: we would rather delay a send than
+//     message someone who opted out.
+//
+// Quota (subscribe_msg) and the content filter are intentionally NOT rechecked:
+//   - Quota is consumed exactly once, at step ⑥. The deferred branch returns
+//     BEFORE step ⑥, so a deferred subscribe_msg send's quota is in fact consumed
+//     at delivery on its first and only pass through ⑥ — there is no earlier
+//     consumption to double-count, and recheckBeforeSend correctly leaves quota
+//     alone. (An immediate send likewise consumes at ⑥ on its single pass.)
+//   - The content filter is a pure function of the rendered body, which is byte
+//     identical at booking and delivery; re-running it adds cost with no new signal.
+func (s *Service) recheckBeforeSend(ctx context.Context, tenantID int64, in SendInput) (string, error) {
+	// Frequency circuit (optional port; nil ⇒ skipped, never stalls delivery).
+	if s.freq != nil {
+		allowed, _, ferr := s.freq.Allow(ctx, in.Channel)
+		if ferr != nil {
+			return "", ferr
+		}
+		if !allowed {
+			return BlockFreqCircuit, nil
+		}
+	}
+	// Unsubscribe opt-out (strict: an error blocks delivery, never a pass).
+	unsub, uerr := s.repo.IsUnsubscribed(ctx, tenantID, in.MemberID, in.Channel)
+	if uerr != nil {
+		return "", uerr
+	}
+	if unsub {
+		return BlockUnsubscribed, nil
+	}
+	return "", nil
 }
 
 // persist writes the finalized task: taskID>0 updates the pre-persisted pending
