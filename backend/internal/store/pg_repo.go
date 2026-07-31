@@ -9,10 +9,14 @@ package store
 // misconfigured main thread degrades to an empty list rather than panicking.
 //
 // Tenant isolation lives in the statement's WHERE tenant_id = $1 (ARCH-01);
-// cross-tenant access is indistinguishable from absence (empty slice). The
-// status column ('active' | 'closed') maps to the Store.Active bool. Nullable
-// text columns (address / phone / group_qr) scan via database/sql NullString
-// so a missing value reads as "".
+// cross-tenant access is indistinguishable from absence (empty slice). The C 端
+// visibility口径 is the stores.active bool column added by migration 000016
+// (NOT the 000001 status text enum): ListStores filters WHERE active = TRUE and
+// projects the real active column into Store.Active. Per 000016 the active bit
+// is deliberately decoupled from status ('active'/'closed', boss/admin口径) — a
+// boss may hide a store from the C 端 via active=FALSE without closing it, so the
+// C 端 list keys off active alone. Nullable text columns (address / phone /
+// group_qr) scan via database/sql NullString so a missing value reads as "".
 
 import (
 	"context"
@@ -46,18 +50,23 @@ type rowScanner interface {
 
 // sqlStoreList selects the C-side subset of a tenant's active stores. Every
 // read carries WHERE tenant_id = $1 (ARCH-01). address / phone / group_qr are
-// nullable (NULL → ""). status='active' maps to Active=true. deleted_at IS
-// NULL skips soft-deleted stores. Ordered by id for deterministic output.
-const sqlStoreList = `SELECT id, tenant_id, COALESCE(address,''), COALESCE(phone,''), COALESCE(group_qr,''), status = 'active', created_at
+// nullable (NULL → ""). The C 端 visibility口径 is the migration-000016 active
+// bool column: WHERE active = TRUE filters out hidden/closed-to-consumers stores
+// (decoupled from the boss/admin status enum), and the projected active column
+// maps directly onto Store.Active (always TRUE here, since inactive rows are
+// filtered — kept in the projection for scan-shape parity with the memory repo).
+// deleted_at IS NULL skips soft-deleted stores. Ordered by id for deterministic
+// output.
+const sqlStoreList = `SELECT id, tenant_id, COALESCE(address,''), COALESCE(phone,''), COALESCE(group_qr,''), active, created_at
 FROM stores
-WHERE tenant_id = $1 AND deleted_at IS NULL
+WHERE tenant_id = $1 AND active = TRUE AND deleted_at IS NULL
 ORDER BY id`
 
 // ===== scan helpers =====
 
 // scanStore decodes one stores row. address / phone / group_qr are nullable
 // (a store may omit any of them); they scan into sql.NullString and flatten to
-// "". The status='active' boolean expression scans directly into Store.Active.
+// "". The migration-000016 active bool column scans directly into Store.Active.
 func scanStore(s rowScanner) (*Store, error) {
 	var st Store
 	var address, phone, groupQR sql.NullString

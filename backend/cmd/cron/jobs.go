@@ -263,17 +263,13 @@ func (j *jobs) dataqualityTenant(tctx context.Context, tenantID int64, day, now 
 			}
 		}
 		tags := dataquality.ComputeTags(view, rule, now)
-		if len(tags) == 0 {
-			continue
-		}
-		tagged++
-		j.log.Info("dataquality: tag (BE-A-09)",
-			zap.Int64("tenant_id", tenantID),
-			zap.Int64("product_id", p.ID),
-			zap.Strings("tags", tags))
-		// Write the tags back onto the product only when the set actually
-		// changed, so an unchanged product is not re-written (and its updated_at
-		// re-stamped) on every sweep.
+		// Write the tags back onto the product whenever the computed set differs
+		// from the stored set — including the transition to EMPTY. The previous
+		// `if len(tags)==0 { continue }` early-return meant a product that lost
+		// all its tags (e.g. margin dropped below threshold) kept its stale tags
+		// forever, because the clearing write-back never happened. tagsEqual
+		// gates the write so an unchanged product (including the steady-state
+		// tagsEqual([],[])==true case) is never re-written / re-stamped.
 		if j.tagWriter != nil && !tagsEqual(p.Tags, tags) {
 			if werr := j.tagWriter.SetProductTags(tctx, tenantID, p.ID, tags); werr != nil {
 				j.log.Warn("dataquality: set product tags failed",
@@ -281,6 +277,13 @@ func (j *jobs) dataqualityTenant(tctx context.Context, tenantID int64, day, now 
 			} else {
 				written++
 			}
+		}
+		if len(tags) > 0 {
+			tagged++
+			j.log.Info("dataquality: tag (BE-A-09)",
+				zap.Int64("tenant_id", tenantID),
+				zap.Int64("product_id", p.ID),
+				zap.Strings("tags", tags))
 		}
 	}
 	j.log.Info("dataquality: tenant done",

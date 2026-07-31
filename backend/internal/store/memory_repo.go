@@ -59,22 +59,25 @@ func (r *MemoryStoreRepo) seed() {
 	})
 }
 
-// createInternal stores s with a fresh id; caller MUST hold r.mu.
-func (r *MemoryStoreRepo) createInternal(s *Store) {
+// createInternal stores s with a fresh id and returns the stored record (with
+// its assigned ID); caller MUST hold r.mu. The returned pointer is the repo's
+// own record — callers that hand it out MUST clone it first.
+func (r *MemoryStoreRepo) createInternal(s *Store) *Store {
 	stored := cloneStore(s)
 	stored.ID = r.nextID.Add(1)
 	r.storesByID[stored.ID] = stored
 	r.storesByTen[stored.TenantID] = append(r.storesByTen[stored.TenantID], stored.ID)
+	return stored
 }
 
-// Seed inserts a demo store for the given tenant and returns it. Used by tests
-// to populate a non-default tenant (the production-style onboarding path is
-// not yet wired). It is NOT part of the StoreRepo interface.
+// Seed inserts a demo store for the given tenant and returns it (with the
+// repo-assigned ID). Used by tests to populate a non-default tenant (the
+// production-style onboarding path is not yet wired). It is NOT part of the
+// StoreRepo interface.
 func (r *MemoryStoreRepo) Seed(s *Store) *Store {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.createInternal(s)
-	return cloneStore(r.storesByID[s.ID])
+	return cloneStore(r.createInternal(s))
 }
 
 // ListStores implements StoreRepo. It returns the active stores of tenantID,

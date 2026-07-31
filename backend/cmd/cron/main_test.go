@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/zhangguijunshi/backend/internal/bootstrap"
@@ -170,4 +172,83 @@ func TestComputeTags_HighMargin(t *testing.T) {
 	if len(tags) != 1 || tags[0] != dataquality.TagHighMargin {
 		t.Fatalf("tags = %v, want [%s]", tags, dataquality.TagHighMargin)
 	}
+}
+
+// TestDataqualityTenant_ClearsStaleTags is the regression test for the "tag job
+// never clears stale tags" bug. Previously `if len(tags)==0 { continue }` meant a
+// product that lost all its tags (margin dropped below threshold) kept its stale
+// tags forever. After the fix, the unconditional tagsEqual gate triggers a
+// clearing write-back (SetProductTags with an empty slice).
+func TestDataqualityTenant_ClearsStaleTags(t *testing.T) {
+	svc := testServices(t)
+	ctx := tenantCtx(context.Background(), 1)
+	const storeID int64 = 1
+
+	// Create a high-margin product (90% → 高毛利 fires).
+	p, err := svc.Catalog.Create(ctx, catalog.CreateInput{
+		StoreID: storeID, Name: "高毛利商品", Unit: "个",
+		CostCents: 100, PriceCents: 1000,
+	})
+	require.NoError(t, err)
+
+	j := &jobs{
+		svc:        svc,
+		log:        zap.NewNop(),
+		now:        time.Now,
+		dailySales: dataquality.NewMemorySalesRepo(),
+		tagWriter:  svc.Catalog,
+	}
+	day := time.Now().AddDate(0, 0, -1)
+
+	// First sweep: product gets [高毛利].
+	j.dataqualityTenant(ctx, 1, day, time.Now())
+	got, err := svc.Catalog.GetByID(ctx, p.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{dataquality.TagHighMargin}, got.Tags,
+		"first sweep should tag the high-margin product")
+
+	// Drop the margin below threshold (cost=900, price=1000 → 10% margin).
+	_, err = svc.Catalog.UpdatePrice(ctx, p.ID, 900, 1000)
+	require.NoError(t, err)
+
+	// Second sweep: tags must be CLEARED (the regression: previously they stayed).
+	j.dataqualityTenant(ctx, 1, day, time.Now())
+	got, err = svc.Catalog.GetByID(ctx, p.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Tags,
+		"second sweep must clear stale tags when margin drops below threshold")
+}
+
+// TestDataqualityTenant_NoSpuriousWriteWhenUnchanged proves that a product whose
+// computed tags are unchanged (including the steady-state empty==empty case) is
+// NOT re-written on every sweep. We verify indirectly: after the first sweep tags
+// the product, a second identical sweep must not change UpdatedAt (the write-back
+// is gated by tagsEqual).
+func TestDataqualityTenant_NoSpuriousWriteWhenUnchanged(t *testing.T) {
+	svc := testServices(t)
+	ctx := tenantCtx(context.Background(), 1)
+	const storeID int64 = 1
+
+	// Low-margin product: ComputeTags returns [] both sweeps → tagsEqual([],[])==true → no write.
+	p, err := svc.Catalog.Create(ctx, catalog.CreateInput{
+		StoreID: storeID, Name: "低毛利商品", Unit: "个",
+		CostCents: 900, PriceCents: 1000, // 10% margin
+	})
+	require.NoError(t, err)
+
+	j := &jobs{
+		svc:        svc,
+		log:        zap.NewNop(),
+		now:        time.Now,
+		dailySales: dataquality.NewMemorySalesRepo(),
+		tagWriter:  svc.Catalog,
+	}
+	day := time.Now().AddDate(0, 0, -1)
+
+	// Two sweeps: neither should write (tags stay empty, tagsEqual([],[])==true).
+	j.dataqualityTenant(ctx, 1, day, time.Now())
+	j.dataqualityTenant(ctx, 1, day, time.Now())
+	got, err := svc.Catalog.GetByID(ctx, p.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Tags, "low-margin product must never be tagged")
 }

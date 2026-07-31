@@ -127,3 +127,20 @@ func TestPGStoreRepo_QueryError(t *testing.T) {
 	require.Error(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+// TestSqlStoreList_ActiveFilter guards the C 端 visibility口径 of the list query.
+// Per migration 000016 the consumer-facing visibility bit is the stores.active
+// BOOLEAN column (decoupled from the boss/admin status text enum), so the query
+// must (a) filter hidden/closed-to-consumers stores with WHERE active = TRUE and
+// (b) project that real active column into Store.Active — NOT derive it from
+// status = 'active'. pgxmock does not evaluate WHERE / projection expressions
+// (every ListStores test above matches sqlStoreList verbatim), so this asserts
+// on the exact SQL text the repo sends to the database.
+func TestSqlStoreList_ActiveFilter(t *testing.T) {
+	require.Contains(t, sqlStoreList, "active = TRUE",
+		"C 端 list must filter hidden stores via the active bool column")
+	require.Contains(t, sqlStoreList, ", active, created_at",
+		"projection must read the real active column into Store.Active")
+	require.NotContains(t, sqlStoreList, "status = 'active'",
+		"C 端 visibility must not key off the boss/admin status enum")
+}
