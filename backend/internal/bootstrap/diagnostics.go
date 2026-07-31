@@ -43,7 +43,10 @@ const (
 //   - postgres:        a live pool was built (hasDB).
 //   - redis:           a live client was built (hasRedis).
 //   - wx_miniprogram:  WX.AppID AND WX.Secret present.
-//   - cos:             COS.SecretID AND COS.SecretKey AND COS.Bucket present.
+//   - cos:             COS.SecretID AND COS.SecretKey AND (COS.Bucket OR
+//     COS.Endpoint) present — mirrors buildCOS, which builds a real client when
+//     the creds are set and a base URL is resolvable (Bucket for the standard
+//     domain, Endpoint for a custom domain / private deployment).
 //   - llm:             at least one AI provider has a non-empty APIKey.
 //   - wxpay_v3:        PaymentConfig.Configured() (mch_id + api_v3_key +
 //     cert_serial + a private key).
@@ -60,10 +63,32 @@ func ClientStatus(cfg *config.Config, hasDB, hasRedis bool) map[string]bool {
 		return status
 	}
 	status[integrationWXMini] = cfg.WX.AppID != "" && cfg.WX.Secret != ""
-	status[integrationCOS] = cfg.COS.SecretID != "" && cfg.COS.SecretKey != "" && cfg.COS.Bucket != ""
+	status[integrationCOS] = cosConfigured(cfg.COS)
 	status[integrationLLM] = len(activeLLMProviders(cfg)) > 0
 	status[integrationWxPayV3] = cfg.Payment.Configured()
 	return status
+}
+
+// cosConfigured reports whether buildCOS would construct a real *cos.Client for
+// the given config. It MUST stay in lock-step with the gate in buildCOS
+// (bootstrap.go): creds present AND a resolvable base URL — either a Bucket (for
+// the standard <bucket>.cos.<region>.myqcloud.com domain) or an explicit
+// Endpoint (custom domain / private deployment / test fake object storage).
+// Keeping this here (rather than re-deriving the expression inline) means the
+// diagnostic and the wiring share one source of truth.
+func cosConfigured(c config.COSConfig) bool {
+	return c.SecretID != "" && c.SecretKey != "" && (c.Bucket != "" || c.Endpoint != "")
+}
+
+// wxSubscribeConfigured reports whether buildReachSender would construct the
+// real WeChat subscribe-message WxSender for the given config. It MUST stay in
+// lock-step with the gate in buildReachSender (bootstrap.go): the mini-program
+// AppID + Secret present AND at least one reach-code -> WeChat template_id
+// mapping configured. When false, reach keeps the in-memory dev stub (zero
+// network). Keeping this here means the diagnostic and the wiring share one
+// source of truth.
+func wxSubscribeConfigured(c config.WXConfig) bool {
+	return c.AppID != "" && c.Secret != "" && len(c.SubscribeTemplates) > 0
 }
 
 // activeLLMProviders returns the sorted names of AI providers that carry a
@@ -150,10 +175,10 @@ func wxDetail(cfg *config.Config) string {
 }
 
 func cosDetail(cfg *config.Config) string {
-	if cfg != nil && cfg.COS.SecretID != "" && cfg.COS.SecretKey != "" && cfg.COS.Bucket != "" {
-		return "COS SecretID + SecretKey + Bucket present; uploads enabled"
+	if cfg != nil && cosConfigured(cfg.COS) {
+		return "COS SecretID + SecretKey + (Bucket or Endpoint) present; uploads enabled"
 	}
-	return "COS SecretID/SecretKey/Bucket incomplete; uploads disabled (clean error)"
+	return "COS SecretID/SecretKey/(Bucket or Endpoint) incomplete; uploads disabled (clean error)"
 }
 
 func llmDetail(cfg *config.Config) string {

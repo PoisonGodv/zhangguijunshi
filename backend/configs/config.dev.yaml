@@ -55,6 +55,15 @@ wx:
   secret: ""
   code2session_url: ""
   timeout: "5s"
+  # Reach subscribe-message (订阅消息) wiring. When app_id+secret AND this map
+  # are non-empty the reach domain sends real WeChat subscribe messages; empty
+  # (dev) keeps the in-memory stub (no network). Key = reach template code
+  # (new_welcome|birthday|recall_30|recall_60|recall_90|repurchase|balance_low|
+  # points_expire), value = the WeChat-side template_id from the MP console.
+  # Env form: ZG_WX_SUBSCRIBE_TEMPLATES_RECALL_30=<template_id> (nested key).
+  subscribe_templates: {}
+  # Default mini-program page a tapped notification opens (empty -> home page).
+  subscribe_page: ""
 
 # AI gateway (POC). Providers configured via env in staging; defaults below.
 ai:

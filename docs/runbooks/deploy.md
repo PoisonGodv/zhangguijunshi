@@ -59,17 +59,68 @@ vi .env
 
 `docker-compose.prod.yml` 用 `--profile migrate` 起一次性 migrate 任务（init 容器语义），跑完退出。
 
+### 2.0 上线前 migrate 标准流程（务必按序）
+
+1. **先备份**（任何 schema 变更前）：
+   ```bash
+   pg_dump --host=<pg-host> -U zg -d zhanggui -F c -f zhanggui-pre-migrate-$(date +%F-%H%M).dump
+   ```
+2. **查当前版本**（只读，确认起点 + dirty=f）：
+   ```bash
+   # 容器内已部署的 migrate 二进制（推荐，env/镜像与 api 完全一致）
+   docker exec zg-backend-prod /out/migrate version
+   #   -> version=19 dirty=false
+   # 或直接查库
+   docker exec zg-postgres-prod psql -U zg -d zhanggui -c "SELECT version, dirty FROM schema_migrations;"
+   ```
+3. **跑 up**（幂等；已是最新则 ErrNoChange，无害）：
+   ```bash
+   docker compose --env-file .env -f infra/compose/docker-compose.prod.yml run --rm migrate up
+   # 或复用已部署镜像（同一二进制 + /app/migrations）：
+   docker exec zg-backend-prod /out/migrate up
+   ```
+4. **复核**：`schema_migrations` 的 `version` == `migrations/` 里最大编号、`dirty=f`；退出码 0。
+
+> **重跑 up 是幂等无害的**：golang-migrate 以 `schema_migrations.version` 为准，只应用「编号 > 当前 version」的迁移；当前已是最高版本时 `up` 直接返回 `ErrNoChange`（`cmd/migrate` 将其吞掉、退出码 0），不触碰任何表。本机真 PG 已于 2026-07-31 实测验证（见 §2.3）。
+>
+> **切勿**手工 `psql -f` 逐个跑 `.up.sql`：迁移文件本身**不**幂等（33 处 `CREATE TABLE` 无 `IF NOT EXISTS`），幂等性完全由 migrate 的版本表保证。
+
+### 2.1 执行
+
 ```bash
 docker compose -f infra/compose/docker-compose.prod.yml --profile migrate up
 ```
 
 观察要点：
 - migrate 容器退出码必须为 `0`（`docker compose ps -a` 看 migrate 服务 `Exited (0)`）。
-- 日志出现 `migrate up` 成功应用 16 个迁移（`000001_init_tenant_user_store` … `000016_store_cside`）。
-- `migrate` 读 `ZG_MIGRATIONS_DIR`（默认 `migrations`，相对 CWD=`/app`），与 api 共用同一套分层配置（`ZG_ENV` + `ZG_POSTGRES_*`）定位数据库。
-- 若 migrate 报 `ErrNoChange` 是正常的（无待应用迁移）。
+- 首次部署日志出现 `migrate up` 成功应用 19 个迁移（`000001_init_tenant_user_store` … `000019_daily_product_sales`）；升级部署只应用新增编号。
+- `migrate` 读 `ZG_MIGRATIONS_DIR`（prod compose 显式设为 `/app/migrations`），与 api 共用同一套分层配置（`ZG_ENV` + `ZG_POSTGRES_*`）定位数据库。
+- 若 migrate 报 `ErrNoChange` 是正常的（无待应用迁移，退出码仍为 0）。
 
-> migrate 二进制在镜像内为 `/out/migrate`（见 `backend/Dockerfile`），prod compose 通过 `entrypoint: /out/migrate` + `command: ["up"]` 复用同一镜像。
+> migrate 二进制在镜像内为 `/out/migrate`（见 `backend/Dockerfile`），prod compose 通过 `entrypoint: /out/migrate` + `command: ["up"]` 复用同一镜像，保证二进制与 `/app/migrations` 永远同源。
+
+### 2.2 dirty 状态恢复（仅当 `dirty=t`）
+
+迁移中途失败会把 `dirty` 置 `t`，此后任何 `up` 都会拒绝执行。恢复步骤：
+
+1. 看 migrate 日志定位失败的那条迁移编号 N（失败发生在 N，N 未完整应用）。
+2. 从 2.0 第 1 步的备份核对：N 的语句应用了多少。若 N 是「半应用」（部分 DDL 已落），先手工 `psql` 把 N 已落的对象清掉（或从备份恢复），使库回到 N-1 的干净状态。
+3. `force` 把版本钉回 N-1（清 dirty 标志）：
+   ```bash
+   docker exec zg-backend-prod /out/migrate force <N-1>
+   ```
+4. 重新 `migrate up`，让它干净地重跑 N 及以后。
+5. 复核 `version`/`dirty=f`。
+
+> `force` 只改 `schema_migrations` 两个字段，**不**执行任何 SQL——它只是「告诉 migrate 现在该从哪个版本继续」。真正修复数据/对象靠备份与手工 psql。prod 上 `force`/`down` 属破坏性操作，须二人复核后再动。
+
+### 2.3 本机真 PG 验证结论（2026-07-31）
+
+- `zg-postgres-prod`（库 `zhanggui`，用户 `zg`）`schema_migrations` = **version 19 / dirty f**。
+- `migrations/` 有 **19 个 `.up.sql`**（最新 `000019_daily_product_sales`），与库内 version 一致；up/down 各 19 配对齐全。
+- 用容器内已部署 `/out/migrate`（env 指向 `postgres:5432`）实测：`migrate version` → `version=19 dirty=false`（退出 0）；`migrate up` → 退出 0、无输出（ErrNoChange 吞掉，零变更）；复查 `schema_migrations` 仍 `19/false`。**重跑 up 幂等无害已实证。**
+- 抽查文件↔库一致性：public 34 张表；`daily_product_sales`(019)、`users.username`/`users.version`(018)、`wx_sessions`(014)、`sub_merchants`(012) 均存在。
+- 健康度扫描：无内联 `UNIQUE(...) WHERE` 非法写法（唯一 grep 命中是 000018 的注释，实际用 `CREATE UNIQUE INDEX ... WHERE`）；金额列一律 BIGINT 分，无浮点/NUMERIC 金额；`.up.sql` 内无 DROP/TRUNCATE/DELETE（grep 命中均为 `deleted_at` 列名误报）。JSONB 仅用于不透明快照/弹性参数（int64/float64 往返不对称是 Go 侧已知约束，非 SQL 问题）。
 
 ---
 

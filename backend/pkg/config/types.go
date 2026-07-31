@@ -89,6 +89,15 @@ type WXConfig struct {
 	Code2SessionURL string `mapstructure:"code2session_url"`
 	// Timeout for upstream WeChat calls.
 	Timeout time.Duration `mapstructure:"timeout"`
+	// SubscribeTemplates maps a reach template code (e.g. "recall_30",
+	// "birthday") to the WeChat-side subscribe-message template_id registered in
+	// the Mini Program console (tech plan §4.3). When AppID+Secret AND this map
+	// are non-empty the reach domain wires the real WxSender (subscribe_msg
+	// channel); otherwise it keeps the in-memory dev stub (no network).
+	SubscribeTemplates map[string]string `mapstructure:"subscribe_templates"`
+	// SubscribePage is the default mini-program page a tapped subscribe
+	// notification opens (optional; empty -> home page).
+	SubscribePage string `mapstructure:"subscribe_page"`
 }
 
 // AIProviderConfig describes one OpenAI-compatible LLM provider (tech plan

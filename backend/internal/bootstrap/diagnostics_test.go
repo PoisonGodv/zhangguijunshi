@@ -109,6 +109,16 @@ func TestClientStatusDiagnostic_TableDriven(t *testing.T) {
 			want: map[string]bool{integrationCOS: true},
 		},
 		{
+			name: "cos endpoint-only (custom domain, no bucket) -> active",
+			cfg:  &config.Config{COS: config.COSConfig{SecretID: "id", SecretKey: "key", Endpoint: "https://cos.example.com"}},
+			want: map[string]bool{integrationCOS: true},
+		},
+		{
+			name: "cos creds but neither bucket nor endpoint -> inactive",
+			cfg:  &config.Config{COS: config.COSConfig{SecretID: "id", SecretKey: "key"}},
+			want: map[string]bool{integrationCOS: false},
+		},
+		{
 			name: "llm only empty keys -> inactive",
 			cfg: &config.Config{AI: config.AIConfig{Providers: map[string]config.AIProviderConfig{
 				"qwen": {APIKey: ""},

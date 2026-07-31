@@ -325,7 +325,7 @@ func BuildServices(ctx context.Context, cfg *config.Config, log *zap.Logger, inf
 		reachRepo = reach.NewPGReachRepo(database.Pool())
 	}
 	reachOpts := []reach.Option{
-		reach.WithSender(reach.NewMemorySender()),
+		reach.WithSender(buildReachSender(cfg.WX, membershipSvc)),
 		reach.WithFreqGate(freqGateAdapter{freqSvc}),
 		reach.WithContentFilter(cfFilterAdapter{contentFilter}),
 	}
@@ -457,12 +457,44 @@ func BuildLogger(cfg *config.Config) (*zap.Logger, error) {
 }
 
 // buildCOS returns a COS client when the credentials are configured, else nil
-// (the asset handler reports "COS 未配置" instead of panicking).
+// (the asset handler reports "COS 未配置" instead of panicking). The gate is
+// cosConfigured (diagnostics.go) — the single source of truth shared with the
+// startup diagnostic so the reported active flag always matches the wiring.
 func buildCOS(cfg config.COSConfig) *cos.Client {
-	if cfg.SecretID == "" || cfg.SecretKey == "" || (cfg.Bucket == "" && cfg.Endpoint == "") {
+	if !cosConfigured(cfg) {
 		return nil
 	}
 	return cos.New(cfg)
+}
+
+// buildReachSender selects the reach channel adapter: the REAL WeChat
+// subscribe-message WxSender when the mini-program credentials AND a
+// subscribe-template mapping are configured, else the in-memory dev stub (zero
+// network, backward compatible). The gate is wxSubscribeConfigured
+// (diagnostics.go) so the startup diagnostic's active flag always matches the
+// wiring. The token cache reuses the same baseURL/timeout overrides as the
+// code2session client so a fake server covers both.
+func buildReachSender(cfg config.WXConfig, membershipSvc *membership.Service) reach.Sender {
+	if !wxSubscribeConfigured(cfg) {
+		return reach.NewMemorySender()
+	}
+	wxOpts := []wxsdk.Option{}
+	tokenOpts := []wxsdk.TokenOption{}
+	if cfg.Code2SessionURL != "" {
+		wxOpts = append(wxOpts, wxsdk.WithBaseURL(cfg.Code2SessionURL))
+		tokenOpts = append(tokenOpts, wxsdk.WithTokenBaseURL(cfg.Code2SessionURL))
+	}
+	if cfg.Timeout > 0 {
+		wxOpts = append(wxOpts, wxsdk.WithTimeout(cfg.Timeout))
+		tokenOpts = append(tokenOpts, wxsdk.WithTokenTimeout(cfg.Timeout))
+	}
+	return reach.NewWxSender(
+		wxsdk.New(wxOpts...),
+		wxTokenSourceAdapter{cache: wxsdk.NewTokenCache(tokenOpts...), appID: cfg.AppID, secret: cfg.Secret},
+		memberResolverAdapter{svc: membershipSvc},
+		cfg.SubscribeTemplates,
+		reach.WithWxPage(cfg.SubscribePage),
+	)
 }
 
 // tenantEnumerator selects the tenant enumeration strategy: a real DB-backed

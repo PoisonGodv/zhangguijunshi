@@ -32,6 +32,7 @@ import (
 	"github.com/zhangguijunshi/backend/internal/strategy"
 	"github.com/zhangguijunshi/backend/internal/subscription"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
+	"github.com/zhangguijunshi/backend/pkg/wxsdk"
 )
 
 // defaultMarginFloorPct is the gross-margin floor (10%) the marketing margin
@@ -190,6 +191,41 @@ func (a cfFilterAdapter) Do(text string) reach.ContentResult {
 		HitWords: r.HitWords,
 		Replaced: r.Replaced,
 	}
+}
+
+// ---- reach ↔ wxsdk / membership (real subscribe-message WxSender) ----
+
+// wxTokenSourceAdapter adapts a *wxsdk.TokenCache onto reach.TokenSource by
+// closing over the tenant's AppID/Secret, so the reach domain never sees WeChat
+// credentials (tech plan §A.1.1). GetAccessToken ignores the reach payload's
+// tenant and always fetches the single configured mini-program's token.
+type wxTokenSourceAdapter struct {
+	cache  *wxsdk.TokenCache
+	appID  string
+	secret string
+}
+
+func (a wxTokenSourceAdapter) GetAccessToken(ctx context.Context) (string, error) {
+	return a.cache.GetAccessToken(ctx, a.appID, a.secret)
+}
+
+// memberResolverAdapter adapts *membership.Service onto reach.MemberResolver.
+// membership.Service.GetMember resolves the tenant from ctx, so the adapter
+// injects a system-source tenant context (tenantID comes from the reach
+// payload, which reach already enforced) before reading the member's WxOpenID.
+// An absent / cross-tenant member surfaces membership.ErrNotFound, which reach
+// maps to a failed send.
+type memberResolverAdapter struct{ svc *membership.Service }
+
+func (a memberResolverAdapter) ResolveOpenID(ctx context.Context, tenantID, memberID int64) (string, error) {
+	if a.svc == nil {
+		return "", nil
+	}
+	m, err := a.svc.GetMember(withTenantCtx(ctx, tenantID), memberID)
+	if err != nil {
+		return "", err
+	}
+	return m.WxOpenID, nil
 }
 
 // ---- payment ↔ billing / membership / subscription ----
