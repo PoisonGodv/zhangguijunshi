@@ -10,7 +10,15 @@
 // 金额: 后端 int64 分 → 元(整除显示整数,否则两位小数),与 today/task-detail 一致。
 // 失败策略: 单卡片失败只 toast,不阻塞其他卡片渲染。
 
-import { getWhoami, getDailySummaryToday, getSubscription, ApiError } from '../../utils/request'
+import {
+  getWhoami,
+  getDailySummaryToday,
+  getSubscription,
+  getAccessToken,
+  clearTokens,
+  logoutReq,
+  ApiError,
+} from '../../utils/request'
 import type { Whoami, DailySummary, SubscriptionResp } from '../../types/api'
 
 // === plan → 中文名 ===
@@ -71,10 +79,20 @@ Page({
   } as MeData,
 
   onLoad() {
+    // 登录守卫 (FE-MP-05): 无 token 或 refresh 也失败 → 去登录页
+    if (!getAccessToken()) {
+      wx.redirectTo({ url: '/pages/login/login' })
+      return
+    }
     this.load()
   },
 
   onShow() {
+    // 登录守卫: 退出后 reLaunch 回登录页,若从后台/栈残留回到本页且已无 token,同样拦下
+    if (!getAccessToken()) {
+      wx.redirectTo({ url: '/pages/login/login' })
+      return
+    }
     // tab 切回时刷新一次,让营业额/订阅状态保持最新
     this.load()
   },
@@ -178,8 +196,8 @@ Page({
   },
 
   onTapLogout(): void {
-    // B 端走 X-Mock-Tenant mock 直连,无本地 token 可清,这里仅做提示;
-    // FE-MP-02 接 JWT 后在此 clearTokens + reLaunch 到登录/首页。
+    // FE-MP-05: showModal 确认 → logoutReq() (POST /v1/boss/auth/logout,本地失败也继续)
+    //   → 无论结果如何 clearTokens + reLaunch 到登录页
     wx.showModal({
       title: '退出登录',
       content: '确认退出当前账号?',
@@ -187,13 +205,14 @@ Page({
       confirmColor: '#FF6B35',
       success: (res) => {
         if (!res.confirm) return
-        try {
-          wx.removeStorageSync('zgjs_access')
-          wx.removeStorageSync('zgjs_refresh')
-        } catch (_e) {
-          // 忽略 storage 异常
-        }
-        wx.showToast({ title: '已退出', icon: 'none' })
+        logoutReq()
+          .catch(() => {
+            // 本地/网络失败也继续清 token 退出
+          })
+          .finally(() => {
+            clearTokens()
+            wx.reLaunch({ url: '/pages/login/login' })
+          })
       },
     })
   },

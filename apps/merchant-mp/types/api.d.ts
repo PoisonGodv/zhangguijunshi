@@ -12,6 +12,16 @@ export interface Envelope<T> {
   trace_id?: string
 }
 
+/**
+ * 登录/续期响应 (POST /v1/boss/auth/login 与 POST /v1/wxshop/auth/refresh 同构,CONTRACT §19)
+ * refresh 走 X-Refresh-Token 头 (首选) 或 body {refresh_token}。
+ */
+export interface LoginResp {
+  access_token: string
+  refresh_token: string
+  expires_in?: number
+}
+
 /** 营销策略 (CONTRACT §12.3.1 strategy.Strategy —— 严格镜像 json tag) */
 export interface Strategy {
   id: number

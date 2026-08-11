@@ -1,5 +1,6 @@
-// app.ts — 商家小程序入口 (FE-MP-03)
-// globalData: 后端 baseURL + 多租户鉴权头 (M0-S2 前用 X-Mock-Tenant,FE-MP-02 接 JWT 后改 utils/request.ts 的 attachAuth)
+// app.ts — 商家小程序入口
+// globalData: 后端 baseURL + X-Mock-Tenant dev 兜底头 (prod 走 JWT Bearer,见 utils/request.ts attachAuth)。
+// 登录页只在「无 token 或 refresh 也失败」时出现,onLaunch 不做强制登录,由各页面 ensureToken/捕获 10002 触发。
 
 interface AppGlobalData {
   baseURL: string
@@ -12,6 +13,6 @@ App({
     tenantHeader: { 'X-Mock-Tenant': '1' },
   } as AppGlobalData,
   onLaunch() {
-    // M0-S2 JWT 接入后:读本地 access token,在 attachAuth 注入 Authorization: Bearer <jwt>
+    // 鉴权由各页面惰性触发: utils/request.ts 401/10001/10002 → refresh → 失败抛 10002,页面跳登录页
   },
 })

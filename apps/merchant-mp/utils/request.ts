@@ -1,10 +1,18 @@
-// utils/request.ts — wx.request 封装 (技术方案 §9.2.5 范式 + CONTRACT §12.7 端点/errcode)
+// utils/request.ts — B 端 JWT 鉴权请求封装 (技术方案 §9.2.5 + CONTRACT §19 鉴权端点)
 //
-// 职责: baseURL 注入 + 鉴权头 (attachAuth 钩子) + envelope 解包 (code===0 取 data) +
-//       errcode 中文映射 + 三种 AI 引擎 API (getToday/getStrategy/executeItem)。
+// 职责: baseURL 注入 + 鉴权头 (Bearer 优先,X-Mock-Tenant dev 兜底) + envelope 解包 (code===0 取 data) +
+//       401/10001/10002→refresh→只重发一次 (防死循环) + errcode 中文映射 + 幂等 GET 网络重试。
+//
+// 鉴权范式照抄 consumer-mp/utils/request.ts:token 存 storage (zgjs_access/zgjs_refresh)、
+// ensureToken 并发去重、refresh 失败清双 token。差异: B 端登录是 boss 员工账密登录
+// (POST /v1/boss/auth/login),无 wx.login;无 token 时保留 X-Mock-Tenant dev 兜底
+// (globalData.tenantHeader,BE-A-01 真登录后 dev 仍可用 mock 头直连)。
+//
+// ARCH-01: tenant/store/role 永远由后端从 JWT ctx 解析,前端绝不信任 body/localStorage 里的租户信息。
 
 import type {
   Envelope,
+  LoginResp,
   Advice,
   Strategy,
   ExecResult,
@@ -31,18 +39,31 @@ function appGlobal(): AppGlobalData {
   return { baseURL: 'http://localhost:8080', tenantHeader: {} }
 }
 
-// === 鉴权头钩子 (FE-MP-02 接 JWT 时只改这处) ===
-// 当前: 注入 app.globalData.tenantHeader (X-Mock-Tenant: 1) + Content-Type。
-// M0-S2 后: 在此读取本地 access token,追加 'Authorization': `Bearer ${token}`。
-export function attachAuth(header: Record<string, string>): Record<string, string> {
-  const { tenantHeader } = appGlobal()
-  return { ...tenantHeader, ...header }
+// === token 存储 (key 与 consumer-mp 一致: zgjs_access/zgjs_refresh) ===
+const KEY_ACCESS = 'zgjs_access'
+const KEY_REFRESH = 'zgjs_refresh'
+
+export function getAccessToken(): string {
+  return wx.getStorageSync(KEY_ACCESS) || ''
+}
+export function getRefreshToken(): string {
+  return wx.getStorageSync(KEY_REFRESH) || ''
+}
+function saveTokens(access: string, refresh: string): void {
+  wx.setStorageSync(KEY_ACCESS, access)
+  if (refresh) wx.setStorageSync(KEY_REFRESH, refresh)
+}
+export function clearTokens(): void {
+  wx.removeStorageSync(KEY_ACCESS)
+  wx.removeStorageSync(KEY_REFRESH)
 }
 
 // === errcode → 中文映射 (CONTRACT §12.7) ===
+// 10001 未登录 / 10002 登录已过期 命中鉴权链路,不在此映射 (走 refresh)。
 // 降级非失败 (60018-60020 / Advice.degrade) 不走这里,由 today 页 degrade 提示条展示。
 const ERR_CODE_MSG: Record<number, string> = {
   40404: '策略不存在',
+  10003: '无权限',
   60017: '毛利护栏拦截',
   60018: 'AI 预算熔断,已降级',
   60019: 'AI 增强异常,已降级',
@@ -50,6 +71,7 @@ const ERR_CODE_MSG: Record<number, string> = {
   60021: '动作被拦截',
   60022: '该动作暂不支持',
 }
+const FALLBACK_SYSTEM_MSG = '系统异常请重试'
 
 /** ApiError: 携带后端 errcode + trace_id 的错误对象 */
 export class ApiError extends Error {
@@ -65,35 +87,195 @@ export class ApiError extends Error {
 
 type Method = 'GET' | 'POST' | 'PUT' | 'DELETE'
 
+// === 并发去重: 同时多个请求触发 refresh 时复用同一个 promise ===
+let refreshing: Promise<string> | null = null
+
 /**
- * request<T>: 统一 wx.request Promise 封装。
- *  - header: attachAuth 注入租户头 + Content-Type: application/json
- *  - 解 envelope: code===0 resolve(data);否则按 ERR_CODE_MSG 映射中文 reject(ApiError)
+ * bossLogin: 商家员工账密登录。
+ * POST /v1/boss/auth/login {tenant_id, phone, password} → {access_token, refresh_token, expires_in?}
+ * 存 token 到 storage 并返回 LoginResp;失败统一 ErrLoginFailed (后端不区分账号不存在/密码错)。
  */
-export function request<T>(method: Method, path: string, data?: unknown): Promise<T> {
-  const baseURL = appGlobal().baseURL
-  return new Promise<T>((resolve, reject) => {
+export function bossLogin(tenantID: number, phone: string, password: string): Promise<LoginResp> {
+  return new Promise<LoginResp>((resolve, reject) => {
     wx.request({
-      url: baseURL + path,
-      method,
-      data: data as Record<string, unknown> | string | undefined,
+      url: appGlobal().baseURL + '/v1/boss/auth/login',
+      method: 'POST',
       timeout: 10000,
-      header: attachAuth({ 'Content-Type': 'application/json' }),
-      success: (res) => {
-        const body = ((res.data as Envelope<T>) || { code: -1, message: '' }) as Envelope<T>
-        if (body && body.code === 0) {
+      header: { 'Content-Type': 'application/json', 'X-Client': 'merchant-mp' },
+      data: { tenant_id: tenantID, phone, password },
+      success: (r) => {
+        const body = (r.data as Envelope<LoginResp>) || ({ code: -1 } as Envelope<LoginResp>)
+        if (r.statusCode === 200 && body.code === 0 && body.data && body.data.access_token) {
+          saveTokens(body.data.access_token, body.data.refresh_token)
           resolve(body.data)
           return
         }
-        const code = (body && typeof body.code === 'number') ? body.code : -1
-        const msg = ERR_CODE_MSG[code] || (body && body.message) || '请求失败'
-        reject(new ApiError(code, msg, body && body.trace_id))
+        clearTokens()
+        const code = typeof body.code === 'number' ? body.code : -1
+        reject(new ApiError(code, body.message || '登录失败', body.trace_id))
       },
-      fail: (err) => {
-        reject(new ApiError(-1, err.errMsg || '网络异常'))
-      },
+      fail: (err) => reject(new ApiError(-1, err.errMsg || '网络异常')),
     })
   })
+}
+
+/**
+ * ensureToken: 有 access 直接返回;无 access 但有 refresh → 静默续期;两者皆无 → reject 10002。
+ * (B 端登录需要手机号+密码,无法自动重登,由页面捕获 10002 后跳登录页。)
+ */
+export function ensureToken(): Promise<string> {
+  const t = getAccessToken()
+  if (t) return Promise.resolve(t)
+  if (getRefreshToken()) return refreshToken()
+  return Promise.reject(new ApiError(10002, '登录已过期'))
+}
+
+/** isLoggedIn: 本地存在 access token (不校验有效期,过期由请求层 refresh 兜底) */
+export function isLoggedIn(): boolean {
+  return !!getAccessToken()
+}
+
+/**
+ * refreshToken: 用 refresh_token 调 POST /v1/wxshop/auth/refresh (X-Refresh-Token 头),
+ * 成功更新 storage 并返回新 access;失败清空两个 token (页面捕获后跳登录页)。并发去重。
+ */
+export function refreshToken(): Promise<string> {
+  if (refreshing) return refreshing
+  refreshing = (async () => {
+    const refresh = getRefreshToken()
+    if (!refresh) throw new ApiError(10002, '登录已过期')
+    const resp = await new Promise<LoginResp>((resolve, reject) => {
+      wx.request({
+        url: appGlobal().baseURL + '/v1/wxshop/auth/refresh',
+        method: 'POST',
+        timeout: 10000,
+        header: {
+          'Content-Type': 'application/json',
+          'X-Client': 'merchant-mp',
+          'X-Refresh-Token': refresh,
+        },
+        success: (r) => {
+          const body = (r.data as Envelope<LoginResp>) || ({ code: -1 } as Envelope<LoginResp>)
+          if (r.statusCode === 200 && body.code === 0 && body.data && body.data.access_token) {
+            resolve(body.data)
+            return
+          }
+          const code = typeof body.code === 'number' ? body.code : -1
+          reject(new ApiError(code, body.message || '续期失败', body.trace_id))
+        },
+        fail: (err) => reject(new ApiError(-1, err.errMsg || '网络异常')),
+      })
+    })
+    saveTokens(resp.access_token, resp.refresh_token)
+    return resp.access_token
+  })()
+  return refreshing.then(
+    (token) => { refreshing = null; return token },
+    (err) => { refreshing = null; clearTokens(); throw err }, // refresh 失败清空,强制重新登录
+  )
+}
+
+/**
+ * attachAuth: 鉴权头钩子 —— 有 access token → Authorization: Bearer (prod 真登录);
+ * 无 token → 保留 X-Mock-Tenant dev 兜底 (globalData.tenantHeader,与 admin-web「真登录优先、dev 回落」一致)。
+ */
+export function attachAuth(header: Record<string, string>): Record<string, string> {
+  const token = getAccessToken()
+  if (token) return { ...header, 'Authorization': `Bearer ${token}` }
+  const { tenantHeader } = appGlobal()
+  return { ...tenantHeader, ...header }
+}
+
+interface RawOpts {
+  url: string
+  method: Method
+  data?: unknown
+  retry?: number   // 仅 GET 网络失败时递减重试
+}
+
+/**
+ * request<T>: 统一 wx.request Promise 封装。
+ *  - header: attachAuth 注入 Bearer/X-Mock-Tenant + Content-Type: application/json
+ *  - 解 envelope: code===0 resolve(data)
+ *  - statusCode 401 或 body.code 为 10001/10002 → 清 access → refreshToken → 只重发一次 (retried 闭包防死循环)
+ *  - 其余 code → errcode 中文映射 reject(ApiError)
+ *  - 网络 fail 且 GET 且 retry>0 → 800ms 递减重试
+ *  - 最终鉴权失败: 清 token 并抛 10002 (页面捕获后跳登录页)
+ */
+export function request<T>(method: Method, path: string, data?: unknown): Promise<T> {
+  // 防死循环: 本次调用链内是否已因 401 重发过一次
+  let retried = false
+
+  const attempt = async (retryLeft: number): Promise<T> => {
+    const traceId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    return new Promise<T>((resolve, reject) => {
+      wx.request({
+        url: appGlobal().baseURL + path,
+        method,
+        data: data as Record<string, unknown> | string | undefined,
+        timeout: 10000,
+        header: attachAuth({ 'Content-Type': 'application/json', 'X-Client': 'merchant-mp', 'X-Trace-Id': traceId }),
+        success: (res) => {
+          const body = ((res.data as Envelope<T>) || { code: -1, message: '' }) as Envelope<T>
+          const code = (body && typeof body.code === 'number') ? body.code : (res.statusCode === 200 ? 0 : -1)
+
+          // 1) 成功
+          if (res.statusCode === 200 && code === 0) {
+            resolve(body.data)
+            return
+          }
+
+          // 2) 鉴权失效: 清 access → refresh → 只重发一次
+          const isAuthFail = res.statusCode === 401 || code === 10001 || code === 10002
+          if (isAuthFail) {
+            if (retried) {
+              // 已重发过一次仍失败: refresh 也救不回,清空强制重新登录
+              clearTokens()
+              reject(new ApiError(10002, '登录已过期', body && body.trace_id))
+              return
+            }
+            retried = true
+            wx.removeStorageSync(KEY_ACCESS) // 清 access 保留 refresh
+            refreshToken()
+              .then(() => attempt(retryLeft).then(resolve, reject))
+              .catch((e) => reject(e instanceof ApiError ? e : new ApiError(10002, '登录已过期')))
+            return
+          }
+
+          // 3) 业务/系统错误: 中文映射
+          let msg = ERR_CODE_MSG[code]
+          if (!msg) {
+            if (code >= 50000) msg = FALLBACK_SYSTEM_MSG
+            else msg = (body && body.message) || '请求失败'
+          }
+          reject(new ApiError(code, msg, body && body.trace_id))
+        },
+        fail: (err) => {
+          // 4) 网络层失败: 仅幂等 GET 重试
+          if (method === 'GET' && retryLeft > 0) {
+            setTimeout(() => {
+              attempt(retryLeft - 1).then(resolve, reject)
+            }, 800)
+            return
+          }
+          reject(new ApiError(-1, err.errMsg || '网络异常', traceId))
+        },
+      })
+    })
+  }
+
+  return attempt(method === 'GET' ? 2 : 0)
+}
+
+/** logoutReq: POST /v1/boss/auth/logout (带 Bearer),无论成败都清空本地 token。 */
+export async function logoutReq(): Promise<void> {
+  try {
+    await request<unknown>('POST', '/v1/boss/auth/logout')
+  } catch (_e) {
+    // 登出失败不阻断本地清理 (token 可能已失效)
+  } finally {
+    clearTokens()
+  }
 }
 
 // === AI 引擎 API (CONTRACT §12.7 端点) ===
@@ -130,7 +312,7 @@ export function executeItem(id: number, itemId: number, body: ExecuteBody = {}):
 /**
  * getDailySummaryToday: 当日流水摘要。
  * GET /v1/boss/billing/summary/today → billing.DailySummary (无 json tag,字段 PascalCase)。
- * storeID 由后端从 ctx (X-Mock-Tenant 注入的 MockTenant) 解析,无需前端传。
+ * storeID 由后端从 JWT/MockTenant ctx 解析 (ARCH-01),无需前端传。
  */
 export function getDailySummaryToday(): Promise<DailySummary> {
   return request<DailySummary>('GET', '/v1/boss/billing/summary/today')

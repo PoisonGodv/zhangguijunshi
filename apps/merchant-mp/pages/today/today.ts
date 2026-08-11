@@ -6,7 +6,7 @@
 //         → items 空 → 空状态
 //         → tap 卡片 → navigateTo task-detail?id=strategy.id&itemId=item.id
 
-import { getToday, ApiError } from '../../utils/request'
+import { getToday, getAccessToken, ApiError } from '../../utils/request'
 import type { Advice, StrategyItem, AdviceCardVM } from '../../types/api'
 const ACTION_TYPE_LABEL: Record<string, string> = {
   group_seckill: '群秒杀',
@@ -50,6 +50,11 @@ Page({
   } as TodayData,
 
   onLoad() {
+    // 登录守卫 (FE-MP-05): 无 token 或 refresh 也失败 → 去登录页
+    if (!getAccessToken()) {
+      wx.redirectTo({ url: '/pages/login/login' })
+      return
+    }
     this.load()
   },
 

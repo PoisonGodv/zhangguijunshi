@@ -1,0 +1,58 @@
+/* pages/login/login.wxss — 登录页样式 (暖色系,对齐 app.wxss 主色 #FF6B35) */
+
+.login-container {
+  padding-top: 120rpx;
+}
+
+/* === 顶部品牌区 === */
+.login-brand {
+  text-align: center;
+  margin-bottom: 60rpx;
+}
+
+.login-title {
+  font-size: 56rpx;
+  font-weight: 700;
+  color: #FF6B35;
+  line-height: 1.3;
+}
+
+.login-subtitle {
+  font-size: 26rpx;
+  color: #8C8C8C;
+  margin-top: 12rpx;
+}
+
+/* === 登录表单卡片 === */
+.login-card {
+  padding: 40rpx 32rpx;
+}
+
+.login-field {
+  margin-bottom: 32rpx;
+}
+
+.login-label {
+  font-size: 26rpx;
+  color: #8C8C8C;
+  margin-bottom: 12rpx;
+}
+
+.login-input {
+  height: 80rpx;
+  background: #FFF9F0;
+  border-radius: 12rpx;
+  padding: 0 24rpx;
+  font-size: 30rpx;
+  color: #1F1F1F;
+  box-sizing: border-box;
+}
+
+/* MVP 单租户期: 租户ID 预填 1,灰显但保留可改 */
+.login-input-tenant {
+  color: #8C8C8C;
+}
+
+.login-btn {
+  margin-top: 16rpx;
+}

@@ -22,6 +22,7 @@ import {
   getProductByBarcode,
   createPendingOrder,
   payOrder,
+  getAccessToken,
   ApiError,
 } from '../../utils/request'
 import type { Product, Order, CreateOrderItem } from '../../types/api'
@@ -87,6 +88,11 @@ Page({
   _searchTimer: 0 as unknown as ReturnType<typeof setTimeout>,
 
   onLoad() {
+    // 登录守卫 (FE-MP-05): 无 token 或 refresh 也失败 → 去登录页
+    if (!getAccessToken()) {
+      wx.redirectTo({ url: '/pages/login/login' })
+      return
+    }
     this._offset = 0
     this.refreshList()
   },

@@ -3,7 +3,8 @@
     "pages/today/today",
     "pages/task-detail/task-detail",
     "pages/billing/billing",
-    "pages/me/me"
+    "pages/me/me",
+    "pages/login/login"
   ],
   "tabBar": {
     "color": "#8C8C8C",

@@ -2,13 +2,13 @@
 //
 // 范式对齐 apps/consumer-mp/utils/request.ts 与 apps/merchant-mp/utils/request.ts:
 //   - baseURL '/v1' (vite proxy 转发到后端 :8080)
-//   - 请求拦截: 注入 dev 鉴权头 (X-Mock-Tenant/Store/User/Role) + X-Client + X-Trace-Id
+//   - 请求拦截: 真登录 token 优先 → Authorization; 仅 dev 未登录时回落 dev 鉴权头 (X-Mock-*)
 //   - 响应拦截: 解 envelope (code===0 返 data; 否则 message 提示 + reject); 401 清理
 //   - errcode 中文映射 (复用 consumer-mp 思路, 补 boss 域码)
 //
-// 鉴权模式:
-//   - 当前 dev: X-Mock-* 请求头直连 (与 apps/merchant-mp 一致, BE-A-01 真实登录延后)。
-//   - prod 预留: Authorization 注入位 (见下方 PROD 注释, BE-A-01 落地后改)。
+// 鉴权模式 (BE-A-01 已落地):
+//   - dev: 有 token 走 JWT; 未登录回落 X-Mock-* 头直连 (后端 dev_mock_header=true 时生效)。
+//   - prod: 仅 Authorization: Bearer <jwt>, mock 头分支被构建期常量折叠移除 (见 DEV_HEADERS)。
 
 import axios, { type AxiosInstance, type AxiosRequestConfig, type AxiosResponse, type InternalAxiosRequestConfig } from 'axios'
 import { message } from 'antd'
@@ -17,19 +17,29 @@ import type { Envelope } from '@/types/api'
 // === dev 兜底鉴权头 (BE-A-01 已落地: 真登录优先, 仅 dev 未登录时兜底) ===
 // 鉴权顺序 (见请求拦截器): localStorage.admin_token → Authorization: Bearer <jwt>;
 // 无 token 且处于 dev (import.meta.env.DEV) 时, 回落 X-Mock-* 头直连, 便于后端
-// 未开真登录/本地无账号时联调。prod 构建 (import.meta.env.DEV=false) 永不注入 mock 头。
-const DEV_HEADERS: Record<string, string> = {
-  'X-Mock-Tenant': '1',
-  'X-Mock-Store': '0',
-  'X-Mock-User': 'dev',
-  'X-Mock-Role': 'owner',
-}
+// 未开真登录/本地无账号时联调。prod 构建 (import.meta.env.DEV=false) 该分支被
+// vite/esbuild 常量折叠 + minify 移除, mock 头字符串不进 prod bundle。
+const DEV_HEADERS: Record<string, string> | undefined = import.meta.env.DEV
+  ? {
+      'X-Mock-Tenant': '1',
+      'X-Mock-Store': '0',
+      'X-Mock-User': 'dev',
+      'X-Mock-Role': 'owner',
+    }
+  : undefined
 
 // === 登录态存取 (BE-A-01) ===
+// access token 走 Authorization; refresh token 用于 401 换签 (见响应拦截器)。
 const TOKEN_KEY = 'admin_token'
+const REFRESH_KEY = 'admin_refresh_token'
 export const getToken = (): string | null => localStorage.getItem(TOKEN_KEY)
 export const setToken = (token: string): void => localStorage.setItem(TOKEN_KEY, token)
-export const clearToken = (): void => localStorage.removeItem(TOKEN_KEY)
+export const getRefreshToken = (): string | null => localStorage.getItem(REFRESH_KEY)
+export const setRefreshToken = (token: string): void => localStorage.setItem(REFRESH_KEY, token)
+export const clearToken = (): void => {
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(REFRESH_KEY)
+}
 
 // 跳登录页 (避免在拦截器里 import router 造成循环; 直接改 location)。
 function redirectToLogin(): void {
@@ -126,7 +136,7 @@ client.interceptors.request.use((cfg: InternalAxiosRequestConfig) => {
   if (token) {
     // BE-A-01 真登录: 所有业务请求 tenant 来自 JWT, 绝不带 mock 头。
     cfg.headers.set('Authorization', `Bearer ${token}`)
-  } else if (import.meta.env.DEV) {
+  } else if (import.meta.env.DEV && DEV_HEADERS) {
     // dev 兜底: 未登录时用 X-Mock-* 直连 (后端 dev_mock_header=true 时生效)。
     Object.entries(DEV_HEADERS).forEach(([k, v]) => {
       cfg.headers.set(k, v)
@@ -137,6 +147,64 @@ client.interceptors.request.use((cfg: InternalAxiosRequestConfig) => {
   return cfg
 })
 
+// === 401 换签 (refresh token, 并发去重 + 只重发一次) ===
+// 范式对齐 apps/consumer-mp/utils/request.ts: 401 → 清 access → refreshToken →
+// 重发原请求 (retried 标志防死循环)。refresh 复用公开端点 POST /v1/wxshop/auth/refresh
+// (svc.Refresh 与场景无关, refresh token 自身携带 claims 决定新签身份)。
+let refreshing: Promise<string | null> | null = null
+
+async function refreshAccessToken(): Promise<string | null> {
+  const refresh = getRefreshToken()
+  if (!refresh) return null
+  // 并发去重: 多个请求同时 401 只发起一次换签。
+  refreshing ??= axios
+    .post<Envelope<{ access_token: string; refresh_token?: string }>>(
+      '/v1/wxshop/auth/refresh',
+      { refresh_token: refresh },
+      { timeout: 10000 },
+    )
+    .then((res) => {
+      const body = res.data
+      if (body?.code === 0 && body.data?.access_token) {
+        setToken(body.data.access_token)
+        // refresh token 轮转: 后端返回新 refresh 则覆盖存储。
+        if (body.data.refresh_token) setRefreshToken(body.data.refresh_token)
+        return body.data.access_token
+      }
+      return null
+    })
+    .catch(() => null)
+    .finally(() => {
+      refreshing = null
+    })
+  return refreshing
+}
+
+/** 换签失败统一登出: 清双 token + 跳登录页 */
+function forceReLogin(): void {
+  clearToken()
+  message.error('登录已失效，请重新登录')
+  redirectToLogin()
+}
+
+/** 401 后尝试换签并重发原请求一次; cfg._retried 防死循环 */
+async function tryRefreshAndRetry(
+  cfg: InternalAxiosRequestConfig & { _retried?: boolean },
+): Promise<AxiosResponse> {
+  if (cfg._retried) {
+    forceReLogin()
+    return Promise.reject(new ApiError(40101, '登录已失效，请重新登录'))
+  }
+  const token = await refreshAccessToken()
+  if (!token) {
+    forceReLogin()
+    return Promise.reject(new ApiError(40101, '登录已失效，请重新登录'))
+  }
+  cfg._retried = true
+  cfg.headers.set('Authorization', `Bearer ${token}`)
+  return client(cfg)
+}
+
 // 响应拦截: 解 envelope (返回 data 部分, 改写 AxiosResponse.data 为 envelope.data)
 client.interceptors.response.use(
   (res: AxiosResponse) => {
@@ -146,12 +214,10 @@ client.interceptors.response.use(
       // 返回 data 部分 (与 api.get<T> 泛型约定一致: axios 默认返 res.data, 这里再解一层 envelope)
       return body.data as unknown as AxiosResponse
     }
-    // 鉴权失效 (BE-A-01 真登录: token 过期/无效)
+    // 鉴权失效 (BE-A-01 真登录: token 过期/无效): 先换签重发, 失败才强制重登。
     if (code === 10001 || code === 10002 || code === 10003 || code === 40101) {
-      clearToken()
-      message.error('登录已失效，请重新登录')
-      redirectToLogin()
-      return Promise.reject(new ApiError(code, body.message || '登录已失效', body.trace_id))
+      const cfg = res.config as InternalAxiosRequestConfig & { _retried?: boolean }
+      return tryRefreshAndRetry(cfg)
     }
     // 业务/系统错误: 中文映射
     let msg = ERR_CODE_MSG[code]
@@ -168,9 +234,10 @@ client.interceptors.response.use(
     if (status && status >= 500) {
       message.error('服务开小差, 请稍后重试')
     } else if (status === 401) {
-      clearToken()
-      message.error('登录已失效，请重新登录')
-      redirectToLogin()
+      // HTTP 401: 先换签重发一次, 失败才清 token 跳登录 (闭环见 tryRefreshAndRetry)。
+      const cfg = (err.config ?? {}) as InternalAxiosRequestConfig & { _retried?: boolean }
+      cfg.headers ??= new axios.AxiosHeaders()
+      return tryRefreshAndRetry(cfg)
     } else if (err.code === 'ECONNABORTED') {
       message.error('请求超时, 请重试')
     } else if (!err.response) {

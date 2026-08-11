@@ -10,7 +10,7 @@
 //            failed   → showToast 错误
 //         action_type==recharge_promo → 按钮置灰「暂不支持」
 
-import { getStrategy, executeItem, ApiError } from '../../utils/request'
+import { getStrategy, executeItem, getAccessToken, ApiError } from '../../utils/request'
 import type { StrategyItem, DetailVM } from '../../types/api'
 
 // === action_type → 中文 (CONTRACT §12.3.0) ===
@@ -53,6 +53,11 @@ Page({
   } as TaskDetailData,
 
   onLoad(query: Record<string, string | undefined>) {
+    // 登录守卫 (FE-MP-05): 无 token 或 refresh 也失败 → 去登录页
+    if (!getAccessToken()) {
+      wx.redirectTo({ url: '/pages/login/login' })
+      return
+    }
     const id = Number(query.id)
     const itemId = Number(query.itemId)
     if (!id || !itemId) {

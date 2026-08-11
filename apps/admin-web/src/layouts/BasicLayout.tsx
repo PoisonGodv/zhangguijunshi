@@ -36,10 +36,11 @@ export default function BasicLayout() {
         </div>
       )}
       avatarProps={{
-        title: 'dev',
+        title: '运营',
         size: 'small',
         render: (_props, dom) => (
-          <Tooltip title="dev 头模式 (X-Mock-Tenant:1)。BE-A-01 后改 JWT。">
+          // BE-A-01 真登录已落地; dev 未登录时 request.ts 才回落 mock 头。
+          <Tooltip title={import.meta.env.DEV ? 'dev 模式: 未登录请求回落 mock 头直连 (request.ts)。' : '生产模式: JWT 鉴权。'}>
             {dom}
           </Tooltip>
         ),

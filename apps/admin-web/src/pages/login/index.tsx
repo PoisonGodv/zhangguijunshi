@@ -1,13 +1,13 @@
 // src/pages/login/index.tsx — 平台运营登录页 (FE-ADMIN / BE-A-01 真登录)
 //
-// 账号(平台运营 name)+密码登录 → POST /v1/admin/auth/login → 存 admin_token
-// (localStorage) → 跳经营看板。request.ts 的请求拦截器随后自动注入
-// Authorization: Bearer <jwt>。登录失败由 request 拦截器统一中文提示。
+// 账号(平台运营 name)+密码登录 → POST /v1/admin/auth/login → 存 admin_token +
+// admin_refresh_token (localStorage) → 跳经营看板。request.ts 的请求拦截器随后
+// 自动注入 Authorization: Bearer <jwt>。登录失败由 request 拦截器统一中文提示。
 import { useState } from 'react'
 import { Form, Input, Button, Card, Typography, Alert, App } from 'antd'
 import { UserOutlined, LockOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
-import { api, setToken } from '@/services/request'
+import { api, setToken, setRefreshToken } from '@/services/request'
 
 const { Title, Paragraph } = Typography
 
@@ -40,6 +40,10 @@ export default function LoginPage() {
         return
       }
       setToken(res.access_token)
+      if (res.refresh_token) {
+        // 401 换签所需 (request.ts tryRefreshAndRetry); 不存则过期即强制重登。
+        setRefreshToken(res.refresh_token)
+      }
       message.success('登录成功')
       navigate('/dashboard', { replace: true })
     } catch {
