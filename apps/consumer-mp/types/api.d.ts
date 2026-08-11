@@ -75,6 +75,17 @@ export interface Balance {
   gift_cents: number      // 赠送(分)
 }
 
+/** 储值充值结果 (POST /v1/wxshop/member/balance/recharge; CONTRACT §24.4)
+ *  PascalCase: 镜像后端 membership.RechargeResult (membership 域实体无 json tag, 与 boss 端 /membership/members/:id/recharge 同形)
+ *  BalanceCents/GiftCents = 充值后余额; RechargedCents/GiftedCents = 本次入账 */
+export interface RechargeResult {
+  MemberID: number
+  BalanceCents: number
+  GiftCents: number
+  RechargedCents: number
+  GiftedCents: number
+}
+
 /** 订单明细行 (GET /v1/wxshop/orders → items[]; CONTRACT §16.3(7)) */
 export interface OrderItem {
   name: string
@@ -91,6 +102,21 @@ export interface Order {
   total_cents: number
   paid_cents: number
   created_at: string     // ISO 时间
+  items: OrderItem[]
+}
+
+/** 订单详情 (GET /v1/wxshop/orders/:id; CONTRACT §24.3)
+ *  snake_case; 复用 OrderItem; channel/payment_method/paid_at omitempty (后端 toOrderDTO 已剥敏感字段) */
+export interface OrderDetail {
+  id: number
+  order_no: string
+  status: 'pending' | 'paid' | 'refunded' | 'voided'
+  total_cents: number
+  paid_cents: number
+  channel?: string          // 支付渠道 (线下/微信/...; pending 订单可能缺省)
+  payment_method?: string   // 支付方式 (余额/现金/...; pending 订单可能缺省)
+  created_at: string        // ISO 时间
+  paid_at?: string          // ISO 时间 (paid/refunded 才有; pending/voided 缺省)
   items: OrderItem[]
 }
 

@@ -6,8 +6,8 @@
 //     "quantity":..} (snake_case 键; quantity 小写, CONTRACT §17 提醒) — 仅返某商品
 //     当前总余量, 非批次明细。
 //   - GET /inventory/movements 直接返 []Movement (无包装, 无 total) → 前端全量拉取分页。
-//   - 注意: 后端无 "list-batches" 接口; 批次明细只能从 purchase_in 流水 (Movement.BatchID/
-//     Quantity) 侧面呈现, Batch.ExpiryDate 无法在列表展示 (见 stock 页 TODO)。
+//   - CONTRACT §24.2 起新增 GET /inventory/batches → {items:[Batch], total:int64}
+//     (handler 层 DTO snake_case 键; Batch 实体 PascalCase), 临期看板改用真实批次。
 
 import { api } from '@/services/request'
 
@@ -74,6 +74,22 @@ export interface MovementsParams {
   offset?: number
 }
 
+/** ListBatches 查询参数 (CONTRACT §24.2, snake_case query) */
+export interface BatchesParams {
+  store_id?: number
+  product_id?: number
+  status?: string // active | nearing | expired | cleared
+  expiry_before?: string // YYYY-MM-DD, 临期看板筛选用
+  limit?: number
+  offset?: number
+}
+
+/** ListBatches 响应 (handler gin.H 包装, snake_case 键; items 为 Batch 实体 PascalCase) */
+export interface BatchesListResp {
+  items: Batch[]
+  total: number
+}
+
 /** GET /v1/boss/inventory/stock?product_id=&store_id= — 查商品当前总库存 */
 export function getStock(productId: number, storeId?: number): Promise<StockResp> {
   return api.get<StockResp>('/boss/inventory/stock', {
@@ -89,6 +105,11 @@ export function purchase(body: PurchaseBody): Promise<Batch> {
 /** GET /v1/boss/inventory/movements — 库存流水 (返全量, 无 total) */
 export function listMovements(params?: MovementsParams): Promise<Movement[]> {
   return api.get<Movement[]>('/boss/inventory/movements', { params })
+}
+
+/** GET /v1/boss/inventory/batches — 批次列表 (CONTRACT §24.2, 返 {items,total}) */
+export function listBatches(params?: BatchesParams): Promise<BatchesListResp> {
+  return api.get<BatchesListResp>('/boss/inventory/batches', { params })
 }
 
 /** POST /v1/boss/inventory/products/:id/consume — FIFO 扣库存 (返被扣批次) */

@@ -6,6 +6,7 @@
     "pages/join/join",
     "pages/member-code/member-code",
     "pages/orders/orders",
+    "pages/orders-detail/orders-detail",
     "pages/balance/balance",
     "pages/group-buy/group-buy",
     "pages/group-buy-detail/group-buy-detail",

@@ -1,0 +1,54 @@
+<!-- pages/orders-detail/orders-detail.wxml — 订单详情 -->
+<view class="container">
+  <block wx:if="{{loading}}">
+    <view class="loading">加载中…</view>
+  </block>
+
+  <block wx:elif="{{detail}}">
+    <!-- 订单主卡片 (白底, 突出金额) -->
+    <view class="section od-card">
+      <view class="od-head">
+        <view class="od-no">单号 {{detail.order_no}}</view>
+        <view class="{{detail.status_cls}}">{{detail.status_text}}</view>
+      </view>
+      <view class="od-amount">
+        <view class="od-amount-label">订单金额</view>
+        <view class="od-amount-num">¥{{detail.total}}</view>
+      </view>
+      <view wx:if="{{detail.hasPaid}}" class="od-paid-row">
+        <text class="od-paid-label">已支付</text>
+        <text class="od-paid-num">¥{{detail.paid}}</text>
+      </view>
+    </view>
+
+    <!-- 商品明细 -->
+    <view class="section">
+      <view class="section-title">商品明细</view>
+      <view class="od-items">
+        <view
+          wx:for="{{detail.items}}"
+          wx:for-item="it"
+          wx:key="key"
+          class="od-item-row"
+        >
+          <view class="od-item-name">{{it.line}}</view>
+          <view class="od-item-price">¥{{it.price}}</view>
+        </view>
+        <view wx:if="{{!detail.items.length}}" class="od-item-row od-item-empty">
+          <view class="od-item-name">—</view>
+        </view>
+      </view>
+    </view>
+
+    <!-- 订单信息 -->
+    <view class="section">
+      <view class="section-title">订单信息</view>
+      <view class="od-row"><view class="od-row-label">下单时间</view><view class="od-row-val">{{detail.created}}</view></view>
+      <view class="od-row"><view class="od-row-label">支付时间</view><view class="od-row-val">{{detail.paidAt}}</view></view>
+      <view class="od-row"><view class="od-row-label">支付渠道</view><view class="od-row-val">{{detail.channel}}</view></view>
+      <view class="od-row"><view class="od-row-label">支付方式</view><view class="od-row-val">{{detail.payment_method}}</view></view>
+    </view>
+  </block>
+
+  <empty-state wx:else icon="📋" text="订单不存在"/>
+</view>

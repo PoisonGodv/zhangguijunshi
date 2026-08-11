@@ -28,6 +28,8 @@ type Groupbuy struct {
 	ID, TenantID, StoreID, ProductID int64
 	StrategyID                       int64 `json:"strategy_id"` // 归因键: 自哪条 strategy_item (0=非AI来源); M3-S3 groupbuy→strategy linkage
 	Title                            string
+	Desc                             string // 独立描述文案; '' = 未设置 (C 端降级回退 Title) — CONTRACT §24.6
+	OriginalPriceCents               int64  // 原价(分); 0 = 未设置 (C 端降级回退 Params.PriceCents) — CONTRACT §24.6
 	Params                           GroupbuyParams
 	RequiredCount                    int // 3-4 成团
 	Joined                           int
@@ -121,6 +123,8 @@ type CreateInput struct {
 	StoreID, ProductID int64
 	StrategyID         int64 // 归因键: 写入 Groupbuy.StrategyID; 0=非AI来源
 	Title              string
+	Desc               string // 独立描述文案; '' = 未设置 (C 端降级回退 Title) — CONTRACT §24.6
+	OriginalPriceCents int64  // 原价(分); 0 = 未设置 (C 端降级回退 Params.PriceCents) — CONTRACT §24.6
 	Params             GroupbuyParams
 	RequiredCount      int // <=0 时取 Params.GroupSize 或默认 3
 	ValidHours         int // 计算 EndAt = StartAt + ValidHours；<=0 默认 24

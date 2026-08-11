@@ -1,0 +1,13 @@
+{
+  "name": "consumer-mp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "掌柜军师消费者小程序(原生微信小程序 + TS)",
+  "devDependencies": {
+    "typescript": "5.5.4",
+    "miniprogram-api-typings": "5.2.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

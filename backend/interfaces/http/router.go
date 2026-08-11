@@ -187,6 +187,7 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.POST("/inventory/purchase", h.PurchaseIn)
 		boss.GET("/inventory/stock", h.GetStock)
 		boss.GET("/inventory/movements", h.ListMovements)
+		boss.GET("/inventory/batches", h.ListBatches) // B2 §24.2: 批次列表(临期看板)
 		boss.POST("/inventory/products/:id/consume", h.Consume)
 	}
 	if deps.Membership != nil {
@@ -296,6 +297,7 @@ func wireWxshop(r *gin.Engine, deps Deps) {
 		authed.GET("/coupons/:id", h.CouponDetail)
 		authed.GET("/member/profile", h.Profile)
 		authed.GET("/member/balance", h.Balance)
+		authed.POST("/member/balance/recharge", h.Recharge) // B2 §24.4: C端储值充值(SimulateRecharge)
 		authed.GET("/member/points", h.Points)
 		authed.POST("/member/code", h.MemberCode)
 		authed.POST("/member/claim-newcomer", h.ClaimNewcomer)
@@ -303,6 +305,7 @@ func wireWxshop(r *gin.Engine, deps Deps) {
 		authed.GET("/groupbuys/:id", h.GroupbuyDetail)
 		authed.POST("/groupbuys/:id/join", h.GroupbuyJoin)
 		authed.GET("/orders", h.Orders)
+		authed.GET("/orders/:id", h.Order) // B2 §24.3: C端订单详情(越权 40404)
 		authed.GET("/stores", h.Stores)
 	}
 }

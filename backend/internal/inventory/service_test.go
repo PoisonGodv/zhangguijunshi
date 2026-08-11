@@ -853,3 +853,151 @@ func TestEarliestExpiryByProduct_RepoWithoutCapabilityDegrades(t *testing.T) {
 		t.Errorf("degraded path map = %+v, want empty", got)
 	}
 }
+
+// --- ListBatches (BE-A, §24.2) ---
+
+// seedBatch stamps a batch directly into the repo with full field control,
+// bypassing the service lookuper so status/expiry can be set freely for filter
+// tests (nearing/expired are normally assigned by the BE-A-09 tag job).
+func seedBatch(t *testing.T, repo *MemoryBatchRepo, b *Batch) *Batch {
+	t.Helper()
+	created, err := repo.CreateBatch(context.Background(), b)
+	if err != nil {
+		t.Fatalf("seedBatch: %v", err)
+	}
+	return created
+}
+
+func TestListBatches_FiltersAndPaging(t *testing.T) {
+	svc, repo, _ := newService(tenantLookuper())
+	ctx := ctxFor(100, 10, 7)
+
+	soon := baseNow.AddDate(0, 0, 3)
+	past := baseNow.AddDate(0, 0, -5)
+	far := baseNow.AddDate(0, 1, 0)
+
+	// Tenant 100: four lots of mixed status/store/product/expiry.
+	b1 := seedBatch(t, repo, &Batch{TenantID: 100, StoreID: 10, ProductID: 1, Quantity: 5, InPriceCents: 100, ExpiryDate: &soon, Status: BatchStatusActive})
+	seedBatch(t, repo, &Batch{TenantID: 100, StoreID: 10, ProductID: 1, Quantity: 0, InPriceCents: 100, Status: BatchStatusCleared}) // b2: cleared, no expiry
+	b3 := seedBatch(t, repo, &Batch{TenantID: 100, StoreID: 11, ProductID: 2, Quantity: 7, InPriceCents: 100, ExpiryDate: &past, Status: "expired"})
+	seedBatch(t, repo, &Batch{TenantID: 100, StoreID: 10, ProductID: 2, Quantity: 9, InPriceCents: 100, ExpiryDate: &far, Status: BatchStatusActive}) // b4
+
+	// No filter: all 4 lots across every status (临期看板 sees cleared/expired too).
+	got, err := svc.ListBatches(ctx, BatchFilter{})
+	if err != nil {
+		t.Fatalf("ListBatches: %v", err)
+	}
+	if len(got) != 4 {
+		t.Errorf("no-filter count = %d, want 4", len(got))
+	}
+	total, err := svc.ListBatchesCount(ctx, BatchFilter{})
+	if err != nil {
+		t.Fatalf("ListBatchesCount: %v", err)
+	}
+	if total != 4 {
+		t.Errorf("no-filter total = %d, want 4", total)
+	}
+
+	// Status filter = active -> b1 + b4.
+	if got, _ := svc.ListBatches(ctx, BatchFilter{Status: BatchStatusActive}); len(got) != 2 {
+		t.Errorf("status=active count = %d, want 2", len(got))
+	}
+	// Store filter = 10 -> b1 + b2(cleared) + b4.
+	if got, _ := svc.ListBatches(ctx, BatchFilter{StoreID: 10}); len(got) != 3 {
+		t.Errorf("store=10 count = %d, want 3", len(got))
+	}
+	// Product filter = 1 -> b1 + b2.
+	if got, _ := svc.ListBatches(ctx, BatchFilter{ProductID: 1}); len(got) != 2 {
+		t.Errorf("product=1 count = %d, want 2", len(got))
+	}
+
+	// ExpiryBefore = baseNow+10d -> b1(soon=+3d) + b3(past=-5d); b2 (nil expiry)
+	// and b4 (far=+1mo) are excluded.
+	cutoff := baseNow.AddDate(0, 0, 10)
+	got, _ = svc.ListBatches(ctx, BatchFilter{ExpiryBefore: &cutoff})
+	ids := map[int64]bool{}
+	for _, b := range got {
+		ids[b.ID] = true
+	}
+	if len(got) != 2 || !ids[b1.ID] || !ids[b3.ID] {
+		t.Errorf("expiry_before = ids %v, want b1(id=%d)+b3(id=%d)", ids, b1.ID, b3.ID)
+	}
+	if tot, _ := svc.ListBatchesCount(ctx, BatchFilter{ExpiryBefore: &cutoff}); tot != 2 {
+		t.Errorf("expiry_before total = %d, want 2", tot)
+	}
+
+	// Paging over all 4 ordered by id: page1 tail id < page2 head id; total
+	// ignores Limit/Offset.
+	page1, _ := svc.ListBatches(ctx, BatchFilter{Limit: 2, Offset: 0})
+	page2, _ := svc.ListBatches(ctx, BatchFilter{Limit: 2, Offset: 2})
+	if len(page1) != 2 || len(page2) != 2 {
+		t.Fatalf("paging lens = %d/%d, want 2/2", len(page1), len(page2))
+	}
+	if page1[1].ID >= page2[0].ID {
+		t.Errorf("paging not ordered by id: page1 tail=%d page2 head=%d", page1[1].ID, page2[0].ID)
+	}
+	if tot, _ := svc.ListBatchesCount(ctx, BatchFilter{Limit: 2, Offset: 2}); tot != 4 {
+		t.Errorf("count ignored paging: total = %d, want 4", tot)
+	}
+}
+
+func TestListBatches_CrossTenantInvisible(t *testing.T) {
+	svc, repo, _ := newService(tenantLookuper())
+	ctxB := ctxFor(200, 20, 8)
+
+	soon := baseNow.AddDate(0, 0, 2)
+	// Tenant A seeds two batches directly into the shared repo (tenant 100 owns
+	// products 1,2 per the lookuper).
+	seedBatch(t, repo, &Batch{TenantID: 100, StoreID: 10, ProductID: 1, Quantity: 5, InPriceCents: 100, ExpiryDate: &soon, Status: BatchStatusActive})
+	seedBatch(t, repo, &Batch{TenantID: 100, StoreID: 10, ProductID: 2, Quantity: 3, InPriceCents: 100, Status: BatchStatusCleared})
+
+	// Tenant B sees zero batches and zero total (cross-tenant == absent).
+	got, err := svc.ListBatches(ctxB, BatchFilter{})
+	if err != nil {
+		t.Fatalf("tenant 200 ListBatches: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("tenant 200 saw %d batches, want 0", len(got))
+	}
+	if total, _ := svc.ListBatchesCount(ctxB, BatchFilter{}); total != 0 {
+		t.Errorf("tenant 200 total = %d, want 0", total)
+	}
+	// Repo-level calls for tenant 200 also exclude tenant 100's lots.
+	if direct, _ := repo.ListBatches(context.Background(), 200, BatchFilter{}); len(direct) != 0 {
+		t.Errorf("repo cross-tenant leak: %d batches", len(direct))
+	}
+	if direct, _ := repo.ListBatchesCount(context.Background(), 200, BatchFilter{}); direct != 0 {
+		t.Errorf("repo cross-tenant count leak: %d", direct)
+	}
+}
+
+func TestListBatches_NoTenantRejected(t *testing.T) {
+	svc, _, _ := newService(tenantLookuper())
+	if _, err := svc.ListBatches(context.Background(), BatchFilter{}); !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant ListBatches err = %v, want ErrNoTenant", err)
+	}
+	if _, err := svc.ListBatchesCount(context.Background(), BatchFilter{}); !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("no-tenant ListBatchesCount err = %v, want ErrNoTenant", err)
+	}
+}
+
+// narrowRepo (defined above) also hides the new BatchLister capability, so the
+// service must degrade to an empty slice / 0 total rather than erroring.
+func TestListBatches_RepoWithoutCapabilityDegrades(t *testing.T) {
+	svc := New(narrowRepo{BatchRepo: NewMemoryBatchRepo()}, tenantLookuper(), WithNowFunc(newClock().now))
+	ctx := ctxFor(100, 10, 7)
+	got, err := svc.ListBatches(ctx, BatchFilter{})
+	if err != nil {
+		t.Fatalf("degraded ListBatches err = %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("degraded ListBatches = %+v, want empty", got)
+	}
+	total, err := svc.ListBatchesCount(ctx, BatchFilter{})
+	if err != nil {
+		t.Fatalf("degraded ListBatchesCount err = %v, want nil", err)
+	}
+	if total != 0 {
+		t.Errorf("degraded ListBatchesCount = %d, want 0", total)
+	}
+}

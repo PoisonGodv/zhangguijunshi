@@ -68,6 +68,42 @@ func TestCreate_DefaultsAndWindow(t *testing.T) {
 	}
 }
 
+// TestCreate_DescAndOriginalPricePassthrough (CONTRACT §24.6): CreateInput 的
+// Desc/OriginalPriceCents 透传写进 Groupbuy 实体；省略时保持零值(” / 0),
+// 由 C 端降级回退 title / 团购价。
+func TestCreate_DescAndOriginalPricePassthrough(t *testing.T) {
+	s := newSvc(t)
+	g, err := s.Create(ctxWithTenant(50021), CreateInput{
+		Title: "荔枝三人团", ProductID: 7,
+		Desc:               "现摘现发，拼团更划算",
+		OriginalPriceCents: 2990,
+		Params:             GroupbuyParams{PriceCents: 1990},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if g.Desc != "现摘现发，拼团更划算" {
+		t.Errorf("expect desc passthrough, got %q", g.Desc)
+	}
+	if g.OriginalPriceCents != 2990 {
+		t.Errorf("expect original=2990, got %d", g.OriginalPriceCents)
+	}
+	// 读回路径也携带 (memory repo 值拷贝自动透传)。
+	back, err := s.Get(ctxWithTenant(50021), g.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if back.Desc != g.Desc || back.OriginalPriceCents != g.OriginalPriceCents {
+		t.Errorf("expect round-trip desc/original, got %q/%d", back.Desc, back.OriginalPriceCents)
+	}
+
+	// 省略时保持零值 (降级语义由 C 端 wxshop 负责)。
+	g2 := mustCreate(t, s, CreateInput{Title: "无描述团", ProductID: 8})
+	if g2.Desc != "" || g2.OriginalPriceCents != 0 {
+		t.Errorf("expect zero-value desc/original when omitted, got %q/%d", g2.Desc, g2.OriginalPriceCents)
+	}
+}
+
 func TestCreate_RequiredCountFallback(t *testing.T) {
 	s := newSvc(t)
 	ctx := ctxWithTenant(50021)

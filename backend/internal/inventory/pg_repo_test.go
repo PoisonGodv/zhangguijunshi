@@ -350,3 +350,93 @@ func TestPGBatchRepo_NilPoolIsSafe(t *testing.T) {
 	_, err = repo.ConsumeFIFOAtomic(context.Background(), 1, 10, 77, 1, func(int64, int64) *Movement { return nil })
 	require.ErrorIs(t, err, ErrNotFound)
 }
+
+// --- ListBatches / ListBatchesCount (BE-A, §24.2) ---
+
+func TestPGBatchRepo_ListBatches(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGBatchRepo(mock)
+	// Full-status listing with store+status filters, default paging (limit 50,
+	// offset 0). product_id is unset (0 -> the ($3=0 OR ...) match-all branch),
+	// expiry_before is unset (nil -> the $5::date IS NULL branch).
+	mock.ExpectQuery(sqlBatchList).
+		WithArgs(int64(1), int64(10), int64(0), BatchStatusActive, nil, 50, 0).
+		WillReturnRows(pgxmock.NewRows(batchColumns()).
+			AddRow(int64(7001), int64(1), int64(10), int64(77), int64(5), int64(5000), fixedTime, nil, BatchStatusActive, fixedTime, fixedTime).
+			AddRow(int64(7002), int64(1), int64(10), int64(88), int64(9), int64(5200), nil, nil, BatchStatusActive, fixedTime, fixedTime))
+	got, err := repo.ListBatches(context.Background(), 1, BatchFilter{StoreID: 10, Status: BatchStatusActive})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, int64(7001), got[0].ID)
+	require.Equal(t, int64(7002), got[1].ID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGBatchRepo_ListBatches_ExpiryBefore(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGBatchRepo(mock)
+	// expiry_before is dereferenced by dateArg into a time.Time arg bound to
+	// $5::date; store/product/status unset. Only the soon-expiry lot matches.
+	cutoff := fixedTime.AddDate(0, 0, 7)
+	mock.ExpectQuery(sqlBatchList).
+		WithArgs(int64(1), int64(0), int64(0), "", cutoff, 50, 0).
+		WillReturnRows(pgxmock.NewRows(batchColumns()).
+			AddRow(int64(7001), int64(1), int64(10), int64(77), int64(5), int64(5000), fixedTime, nil, BatchStatusActive, fixedTime, fixedTime))
+	got, err := repo.ListBatches(context.Background(), 1, BatchFilter{ExpiryBefore: &cutoff})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.NotNil(t, got[0].ExpiryDate)
+	require.True(t, !got[0].ExpiryDate.After(cutoff)) // expiry_date <= cutoff
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGBatchRepo_ListBatches_Empty(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGBatchRepo(mock)
+	// No filter at all: every sentinel arg hits its match-all branch.
+	mock.ExpectQuery(sqlBatchList).
+		WithArgs(int64(1), int64(0), int64(0), "", nil, 50, 0).
+		WillReturnRows(pgxmock.NewRows(batchColumns()))
+	got, err := repo.ListBatches(context.Background(), 1, BatchFilter{})
+	require.NoError(t, err)
+	require.Empty(t, got)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGBatchRepo_ListBatchesCount(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGBatchRepo(mock)
+	// COUNT(*) goes through QueryRow (the frozen PGPool surface); same filter
+	// dimensions as ListBatches minus ORDER/LIMIT/OFFSET.
+	mock.ExpectQuery(sqlBatchListCount).
+		WithArgs(int64(1), int64(10), int64(0), BatchStatusActive, nil).
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(7)))
+	n, err := repo.ListBatchesCount(context.Background(), 1, BatchFilter{StoreID: 10, Status: BatchStatusActive})
+	require.NoError(t, err)
+	require.Equal(t, int64(7), n)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGBatchRepo_ListBatchesCount_WithExpiryBefore(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGBatchRepo(mock)
+	cutoff := fixedTime.AddDate(0, 0, 7)
+	mock.ExpectQuery(sqlBatchListCount).
+		WithArgs(int64(1), int64(0), int64(0), "", cutoff).
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(3)))
+	n, err := repo.ListBatchesCount(context.Background(), 1, BatchFilter{ExpiryBefore: &cutoff})
+	require.NoError(t, err)
+	require.Equal(t, int64(3), n)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGBatchRepo_ListBatches_NilPool(t *testing.T) {
+	// A nil pool degrades to an empty slice / 0 total (dev wires the memory repo).
+	repo := NewPGBatchRepo(nil)
+	got, err := repo.ListBatches(context.Background(), 1, BatchFilter{Status: BatchStatusActive})
+	require.NoError(t, err)
+	require.Empty(t, got)
+	n, err := repo.ListBatchesCount(context.Background(), 1, BatchFilter{Status: BatchStatusActive})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), n)
+}

@@ -27,12 +27,14 @@ func NewGroupbuyHandler(svc *groupbuy.Service) *GroupbuyHandler {
 }
 
 type createGroupbuyRequest struct {
-	StoreID       int64                   `json:"store_id"`
-	ProductID     int64                   `json:"product_id" binding:"required,min=1"`
-	Title         string                  `json:"title" binding:"required"`
-	Params        groupbuy.GroupbuyParams `json:"params"`
-	RequiredCount int                     `json:"required_count"`
-	ValidHours    int                     `json:"valid_hours"`
+	StoreID            int64                   `json:"store_id"`
+	ProductID          int64                   `json:"product_id" binding:"required,min=1"`
+	Title              string                  `json:"title" binding:"required"`
+	Desc               string                  `json:"desc"`                 // 独立描述文案; 空 = C 端降级回退 title (CONTRACT §24.6)
+	OriginalPriceCents int64                   `json:"original_price_cents"` // 原价(分); 0 = C 端降级回退团购价 (CONTRACT §24.6)
+	Params             groupbuy.GroupbuyParams `json:"params"`
+	RequiredCount      int                     `json:"required_count"`
+	ValidHours         int                     `json:"valid_hours"`
 }
 
 // Create opens a new active squad.
@@ -44,12 +46,14 @@ func (h *GroupbuyHandler) Create(c *gin.Context) {
 		return
 	}
 	g, err := h.svc.Create(c.Request.Context(), groupbuy.CreateInput{
-		StoreID:       req.StoreID,
-		ProductID:     req.ProductID,
-		Title:         req.Title,
-		Params:        req.Params,
-		RequiredCount: req.RequiredCount,
-		ValidHours:    req.ValidHours,
+		StoreID:            req.StoreID,
+		ProductID:          req.ProductID,
+		Title:              req.Title,
+		Desc:               req.Desc,
+		OriginalPriceCents: req.OriginalPriceCents,
+		Params:             req.Params,
+		RequiredCount:      req.RequiredCount,
+		ValidHours:         req.ValidHours,
 	})
 	if err != nil {
 		httpx.FailError(c, err)

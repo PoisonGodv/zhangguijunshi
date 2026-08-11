@@ -38,9 +38,10 @@ func newMockPool(t *testing.T) pgxmock.PgxPoolIface {
 }
 
 // gbColumns returns the groupbuys column set in scanGroupbuy order (the row
-// mapping pgxmock relies on).
+// mapping pgxmock relies on). description/original_price_cents were added by
+// migration 000024 (CONTRACT §24.6).
 func gbColumns() []string {
-	return []string{"id", "tenant_id", "store_id", "product_id", "title", "params", "required_count", "joined", "status", "start_at", "end_at", "strategy_id", "created_at", "updated_at"}
+	return []string{"id", "tenant_id", "store_id", "product_id", "title", "description", "original_price_cents", "params", "required_count", "joined", "status", "start_at", "end_at", "strategy_id", "created_at", "updated_at"}
 }
 
 // partColumns returns the groupbuy_participants column set in scanParticipant
@@ -53,8 +54,10 @@ func partColumns() []string {
 func sampleGroupbuy(joined int) *Groupbuy {
 	return &Groupbuy{
 		ID: 42, TenantID: 1, StoreID: 10, ProductID: 7, Title: "荔枝拼团",
-		Params:        GroupbuyParams{GroupSize: 3, PriceCents: 1990, ValidHours: 24},
-		RequiredCount: 3, Joined: joined, Status: StatusActive,
+		Desc:               "现摘现发，拼团更划算",
+		OriginalPriceCents: 2990,
+		Params:             GroupbuyParams{GroupSize: 3, PriceCents: 1990, ValidHours: 24},
+		RequiredCount:      3, Joined: joined, Status: StatusActive,
 		StartAt: fixedTime, EndAt: fixedTime.Add(24 * time.Hour), StrategyID: 9001,
 		CreatedAt: fixedTime, UpdatedAt: fixedTime,
 	}
@@ -66,18 +69,22 @@ func TestPGGroupbuyRepo_Create(t *testing.T) {
 	paramsBytes, _ := json.Marshal(GroupbuyParams{GroupSize: 3, PriceCents: 1990, ValidHours: 24})
 	g := &Groupbuy{
 		TenantID: 1, StoreID: 10, ProductID: 7, Title: "荔枝拼团",
-		Params:        GroupbuyParams{GroupSize: 3, PriceCents: 1990, ValidHours: 24},
-		RequiredCount: 3, Joined: 0, Status: StatusActive,
+		Desc:               "现摘现发，拼团更划算",
+		OriginalPriceCents: 2990,
+		Params:             GroupbuyParams{GroupSize: 3, PriceCents: 1990, ValidHours: 24},
+		RequiredCount:      3, Joined: 0, Status: StatusActive,
 		StartAt: fixedTime, EndAt: fixedTime.Add(24 * time.Hour), StrategyID: 9001,
 		CreatedAt: fixedTime, UpdatedAt: fixedTime,
 	}
 	mock.ExpectQuery(sqlGBCreate).
-		WithArgs(int64(1), int64(10), int64(7), "荔枝拼团", paramsBytes, 3, 0, StatusActive,
+		WithArgs(int64(1), int64(10), int64(7), "荔枝拼团", "现摘现发，拼团更划算", int64(2990), paramsBytes, 3, 0, StatusActive,
 			fixedTime, fixedTime.Add(24*time.Hour), int64(9001), fixedTime, fixedTime).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(42)))
 	got, err := repo.Create(context.Background(), g)
 	require.NoError(t, err)
 	require.Equal(t, int64(42), got.ID)
+	require.Equal(t, "现摘现发，拼团更划算", got.Desc)
+	require.Equal(t, int64(2990), got.OriginalPriceCents)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -88,12 +95,14 @@ func TestPGGroupbuyRepo_GetByID(t *testing.T) {
 	mock.ExpectQuery(sqlGBGetByID).
 		WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			int64(42), int64(1), int64(10), int64(7), "荔枝拼团", paramsBytes, 3, 1, StatusActive,
+			int64(42), int64(1), int64(10), int64(7), "荔枝拼团", "现摘现发", int64(2990), paramsBytes, 3, 1, StatusActive,
 			fixedTime, fixedTime.Add(24*time.Hour), int64(9001), fixedTime, fixedTime,
 		))
 	g, err := repo.GetByID(context.Background(), 1, 42)
 	require.NoError(t, err)
 	require.Equal(t, "荔枝拼团", g.Title)
+	require.Equal(t, "现摘现发", g.Desc)
+	require.Equal(t, int64(2990), g.OriginalPriceCents)
 	require.Equal(t, 3, g.RequiredCount)
 	require.Equal(t, int64(7), g.ProductID)
 	require.Equal(t, int64(9001), g.StrategyID)
@@ -118,13 +127,16 @@ func TestPGGroupbuyRepo_ListActive(t *testing.T) {
 	mock.ExpectQuery(sqlGBListActiveAll).
 		WithArgs(int64(1)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).
-			AddRow(int64(1), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 0, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime).
-			AddRow(int64(2), int64(1), int64(11), nil, "B", []byte(`{}`), 3, 1, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime))
+			AddRow(int64(1), int64(1), int64(10), int64(7), "A", "", int64(0), []byte(`{}`), 3, 0, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime).
+			AddRow(int64(2), int64(1), int64(11), nil, "B", "描述B", int64(5000), []byte(`{}`), 3, 1, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime))
 	got, err := repo.ListActive(context.Background(), 1, 0)
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Equal(t, int64(7), got[0].ProductID)
 	require.Equal(t, int64(0), got[1].ProductID) // NULL product_id → 0
+	require.Equal(t, "描述B", got[1].Desc)
+	require.Equal(t, int64(5000), got[1].OriginalPriceCents)
+	require.Equal(t, "", got[0].Desc) // DEFAULT '' (old rows degrade to title client-side)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -134,7 +146,7 @@ func TestPGGroupbuyRepo_ListActiveByStore(t *testing.T) {
 	mock.ExpectQuery(sqlGBListActiveStore).
 		WithArgs(int64(1), int64(10)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).
-			AddRow(int64(1), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 0, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime))
+			AddRow(int64(1), int64(1), int64(10), int64(7), "A", "", int64(0), []byte(`{}`), 3, 0, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime))
 	got, err := repo.ListActive(context.Background(), 1, 10)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
@@ -148,7 +160,7 @@ func TestPGGroupbuyRepo_ListByStrategy(t *testing.T) {
 	mock.ExpectQuery(sqlGBListByStrategy).
 		WithArgs(int64(1), int64(9001)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).
-			AddRow(int64(1), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 3, StatusSuccess, fixedTime, fixedTime, int64(9001), fixedTime, fixedTime))
+			AddRow(int64(1), int64(1), int64(10), int64(7), "A", "", int64(0), []byte(`{}`), 3, 3, StatusSuccess, fixedTime, fixedTime, int64(9001), fixedTime, fixedTime))
 	got, err := repo.ListByStrategy(context.Background(), 1, 9001)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
@@ -173,13 +185,13 @@ func TestPGGroupbuyRepo_UpdateStatus(t *testing.T) {
 	mock.ExpectQuery(sqlGBGetByID).
 		WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			int64(42), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 0, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
+			int64(42), int64(1), int64(10), int64(7), "A", "", int64(0), []byte(`{}`), 3, 0, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
 		))
 	// Step 2: conditional UPDATE returns the failed row.
 	mock.ExpectQuery(sqlGBUpdateStatus).
 		WithArgs(StatusFailed, fixedTime, int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			int64(42), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 0, StatusFailed, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
+			int64(42), int64(1), int64(10), int64(7), "A", "", int64(0), []byte(`{}`), 3, 0, StatusFailed, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
 		))
 	g, err := repo.UpdateStatus(context.Background(), 1, 42, StatusFailed, fixedTime)
 	require.NoError(t, err)
@@ -194,7 +206,7 @@ func TestPGGroupbuyRepo_UpdateStatusIllegalTransition(t *testing.T) {
 	mock.ExpectQuery(sqlGBGetByID).
 		WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			int64(42), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 3, StatusSuccess, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
+			int64(42), int64(1), int64(10), int64(7), "A", "", int64(0), []byte(`{}`), 3, 3, StatusSuccess, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
 		))
 	_, err := repo.UpdateStatus(context.Background(), 1, 42, StatusFailed, fixedTime)
 	require.ErrorIs(t, err, ErrGroupbuyClosed)
@@ -225,7 +237,7 @@ func TestPGGroupbuyRepo_UpdateStatusGuardMiss(t *testing.T) {
 	mock.ExpectQuery(sqlGBGetByID).
 		WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			int64(42), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 3, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
+			int64(42), int64(1), int64(10), int64(7), "A", "", int64(0), []byte(`{}`), 3, 3, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
 		))
 	// Guarded UPDATE (AND status='active') matches no rows: a concurrent writer
 	// settled the squad in the gap.
@@ -247,7 +259,7 @@ func TestPGGroupbuyRepo_JoinAtomic(t *testing.T) {
 	mock.ExpectQuery(sqlGBGetByID).
 		WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
+			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, cur.Desc, cur.OriginalPriceCents, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
 		))
 	// 2. Already-joined check → not joined.
 	mock.ExpectQuery(sqlPartGetByMember).
@@ -265,7 +277,7 @@ func TestPGGroupbuyRepo_JoinAtomic(t *testing.T) {
 	mock.ExpectQuery(sqlGBJoinIncr).
 		WithArgs(fixedTime, int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			int64(42), int64(1), int64(10), int64(7), "荔枝拼团", paramsBytes, 3, 1, StatusActive, fixedTime, fixedTime.Add(24*time.Hour), int64(9001), fixedTime, fixedTime,
+			int64(42), int64(1), int64(10), int64(7), "荔枝拼团", "现摘现发", int64(2990), paramsBytes, 3, 1, StatusActive, fixedTime, fixedTime.Add(24*time.Hour), int64(9001), fixedTime, fixedTime,
 		))
 	mock.ExpectCommit()
 	p, g, err := repo.JoinAtomic(context.Background(), 1, 42, 100, fixedTime)
@@ -284,7 +296,7 @@ func TestPGGroupbuyRepo_JoinAtomicReachesSuccess(t *testing.T) {
 	paramsBytes, _ := json.Marshal(cur.Params)
 	mock.ExpectQuery(sqlGBGetByID).WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
+			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, cur.Desc, cur.OriginalPriceCents, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
 		))
 	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(101)).
 		WillReturnError(pgx.ErrNoRows)
@@ -294,7 +306,7 @@ func TestPGGroupbuyRepo_JoinAtomicReachesSuccess(t *testing.T) {
 	// joined 2→3 reaches required_count → status flips to success.
 	mock.ExpectQuery(sqlGBJoinIncr).WithArgs(fixedTime, int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			int64(42), int64(1), int64(10), int64(7), "荔枝拼团", paramsBytes, 3, 3, StatusSuccess, fixedTime, fixedTime.Add(24*time.Hour), int64(9001), fixedTime, fixedTime,
+			int64(42), int64(1), int64(10), int64(7), "荔枝拼团", "现摘现发", int64(2990), paramsBytes, 3, 3, StatusSuccess, fixedTime, fixedTime.Add(24*time.Hour), int64(9001), fixedTime, fixedTime,
 		))
 	mock.ExpectCommit()
 	p, g, err := repo.JoinAtomic(context.Background(), 1, 42, 101, fixedTime)
@@ -322,7 +334,7 @@ func TestPGGroupbuyRepo_JoinAtomicAlreadyJoined(t *testing.T) {
 	paramsBytes, _ := json.Marshal(cur.Params)
 	mock.ExpectQuery(sqlGBGetByID).WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
+			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, cur.Desc, cur.OriginalPriceCents, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
 		))
 	// Member already has a participant row → ErrAlreadyJoined (no INSERT).
 	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(100)).
@@ -339,7 +351,7 @@ func TestPGGroupbuyRepo_JoinAtomicRaceUniqueViolation(t *testing.T) {
 	paramsBytes, _ := json.Marshal(cur.Params)
 	mock.ExpectQuery(sqlGBGetByID).WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
+			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, cur.Desc, cur.OriginalPriceCents, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
 		))
 	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(100)).
 		WillReturnError(pgx.ErrNoRows)
@@ -370,7 +382,7 @@ func TestPGGroupbuyRepo_JoinAtomicIncrRaceRollback(t *testing.T) {
 	paramsBytes, _ := json.Marshal(cur.Params)
 	mock.ExpectQuery(sqlGBGetByID).WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
+			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, cur.Desc, cur.OriginalPriceCents, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
 		))
 	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(100)).
 		WillReturnError(pgx.ErrNoRows)
@@ -399,7 +411,7 @@ func TestPGGroupbuyRepo_JoinAtomicFull(t *testing.T) {
 	paramsBytes, _ := json.Marshal(cur.Params)
 	mock.ExpectQuery(sqlGBGetByID).WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
+			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, cur.Desc, cur.OriginalPriceCents, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
 		))
 	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(100)).
 		WillReturnError(pgx.ErrNoRows)
@@ -417,7 +429,7 @@ func TestPGGroupbuyRepo_JoinAtomicClosed(t *testing.T) {
 	paramsBytes, _ := json.Marshal(cur.Params)
 	mock.ExpectQuery(sqlGBGetByID).WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
+			cur.ID, cur.TenantID, cur.StoreID, cur.ProductID, cur.Title, cur.Desc, cur.OriginalPriceCents, paramsBytes, cur.RequiredCount, cur.Joined, cur.Status, cur.StartAt, cur.EndAt, cur.StrategyID, cur.CreatedAt, cur.UpdatedAt,
 		))
 	mock.ExpectQuery(sqlPartGetByMember).WithArgs(int64(1), int64(42), int64(100)).
 		WillReturnError(pgx.ErrNoRows)
@@ -458,7 +470,7 @@ func TestPGGroupbuyRepo_ListParticipants(t *testing.T) {
 	// Step 1: squad exists for this tenant.
 	mock.ExpectQuery(sqlGBGetByID).WithArgs(int64(1), int64(42)).
 		WillReturnRows(pgxmock.NewRows(gbColumns()).AddRow(
-			int64(42), int64(1), int64(10), int64(7), "A", []byte(`{}`), 3, 2, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
+			int64(42), int64(1), int64(10), int64(7), "A", "", int64(0), []byte(`{}`), 3, 2, StatusActive, fixedTime, fixedTime, int64(0), fixedTime, fixedTime,
 		))
 	// Step 2: list participants ordered by id.
 	mock.ExpectQuery(sqlPartListByGB).WithArgs(int64(1), int64(42)).

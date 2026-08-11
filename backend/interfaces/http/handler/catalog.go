@@ -63,7 +63,10 @@ func (h *CatalogHandler) CreateProduct(c *gin.Context) {
 	httpx.OK(c, p)
 }
 
-// ListProducts lists the tenant's products with optional filters.
+// ListProducts lists the tenant's products with optional filters and returns
+// the FULL match count for true pagination (CONTRACT §24.5): {items, total}.
+// Pagination params accept both ?limit=&offset= and ?page=&size= (same
+// dual-param idiom as the membership list handler).
 // GET /v1/boss/catalog/products?store_id=&query=&category=&limit=&offset=
 func (h *CatalogHandler) ListProducts(c *gin.Context) {
 	f := catalog.ProductFilter{
@@ -73,12 +76,27 @@ func (h *CatalogHandler) ListProducts(c *gin.Context) {
 		Limit:    int(queryInt64(c, "limit")),
 		Offset:   int(queryInt64(c, "offset")),
 	}
-	products, err := h.svc.List(c.Request.Context(), f)
+	// ?page=&size= alias (membership handler parity): page>=1, size<=200 cap;
+	// wins only when limit/offset are absent so explicit limit/offset still works.
+	if f.Limit <= 0 && f.Offset <= 0 {
+		if size := int(queryInt64(c, "size")); size > 0 {
+			page := int(queryInt64(c, "page"))
+			if page < 1 {
+				page = 1
+			}
+			if size > 200 {
+				size = 200
+			}
+			f.Limit = size
+			f.Offset = (page - 1) * size
+		}
+	}
+	res, err := h.svc.ListPage(c.Request.Context(), f)
 	if err != nil {
 		httpx.FailError(c, err)
 		return
 	}
-	httpx.OK(c, gin.H{"items": products, "count": len(products)})
+	httpx.OK(c, gin.H{"items": res.Items, "total": res.Total})
 }
 
 // GetProduct loads one product by id within the caller's tenant.

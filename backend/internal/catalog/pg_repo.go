@@ -69,8 +69,21 @@ WHERE tenant_id = $1
   AND ($2 = 0 OR store_id = $2)
   AND ($3 = '' OR category = $3)
   AND ($4 = '' OR position($4 in name) > 0 OR position($4 in barcode) > 0)
+  AND deleted_at IS NULL
 ORDER BY id
 LIMIT $5 OFFSET $6`
+	// sqlProductListCount is sqlProductList's WHERE (products are soft-deleted,
+	// deleted_at NULL = live) minus ORDER/LIMIT/OFFSET, returning the FULL match
+	// count for true pagination (CONTRACT §24.5). Keep the two predicates in
+	// lockstep. NOTE: $4 is reused inside the position() clause twice, so this
+	// statement takes exactly 4 args (no $5/$6).
+	sqlProductListCount = `SELECT COUNT(*)
+FROM products
+WHERE tenant_id = $1
+  AND ($2 = 0 OR store_id = $2)
+  AND ($3 = '' OR category = $3)
+  AND ($4 = '' OR position($4 in name) > 0 OR position($4 in barcode) > 0)
+  AND deleted_at IS NULL`
 	// sqlProductUpdateTags touches ONLY the tags column (BE-A-09 write-back); it
 	// never rewrites price/cost/name, so it cannot trip the uniqueness indexes.
 	// tags is the TEXT[] column from migration 000002 (round-trips as []string).
@@ -251,6 +264,29 @@ func (r *PGProductRepo) List(ctx context.Context, tenantID int64, f ProductFilte
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("catalog: pg product list rows: %w", err)
 	}
+	return out, nil
+}
+
+// ListPage implements the optional ProductLister capability (CONTRACT §24.5):
+// sqlProductListCount returns the FULL match count (Total) and sqlProductList
+// returns the offset/limit window (Items). A nil pool (or one without Query)
+// degrades to an empty result with Total=0 rather than failing.
+func (r *PGProductRepo) ListPage(ctx context.Context, tenantID int64, f ProductFilter) (ListProductsResult, error) {
+	out := ListProductsResult{Items: make([]*Product, 0)}
+	if r == nil || r.pool == nil {
+		return out, nil
+	}
+	if _, ok := r.pool.(queryer); !ok {
+		return out, nil
+	}
+	if err := r.pool.QueryRow(ctx, sqlProductListCount, tenantID, f.StoreID, f.Category, f.Query).Scan(&out.Total); err != nil {
+		return out, fmt.Errorf("catalog: pg product list count: %w", err)
+	}
+	items, err := r.List(ctx, tenantID, f)
+	if err != nil {
+		return out, err
+	}
+	out.Items = items
 	return out, nil
 }
 

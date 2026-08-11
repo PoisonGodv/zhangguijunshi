@@ -23,6 +23,9 @@ import (
 // defaultMovementLimit is used when MovementFilter.Limit <= 0.
 const defaultMovementLimit = 50
 
+// defaultBatchListLimit is used when BatchFilter.Limit <= 0 (BE-A, §24.2).
+const defaultBatchListLimit = 50
+
 // nowFunc is the repo clock. It is a package-level variable so tests can pin it
 // for deterministic CreatedAt/UpdatedAt; production leaves it as time.Now. All
 // access goes through now() under a mutex so -race stays clean.
@@ -230,6 +233,92 @@ func (r *MemoryBatchRepo) EarliestExpiryByProduct(_ context.Context, tenantID, s
 		}
 	}
 	return out, nil
+}
+
+// ListBatches implements the optional BatchLister capability (BE-A, §24.2). It
+// scans every batch in the repo under a read lock and returns the ctx tenant's
+// lots matching f (store/product/status/expiry_before), ordered by batch id for
+// deterministic pagination, with Limit/Offset applied. Unlike
+// ListActiveBatchesFIFO / ListNearingBatches it returns EVERY status
+// (active/nearing/expired/cleared) so the boss 临期看板 sees cleared/expired lots
+// too — it only READS status. Cross-tenant lots are invisible. Results are
+// defensive copies.
+func (r *MemoryBatchRepo) ListBatches(_ context.Context, tenantID int64, f BatchFilter) ([]*Batch, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultBatchListLimit
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Collect matching ids in ascending order so output is deterministic.
+	ids := make([]int64, 0)
+	for id, b := range r.batches {
+		if matchBatch(b, tenantID, f) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	out := make([]*Batch, 0, limit)
+	for _, id := range ids {
+		if offset > 0 {
+			offset--
+			continue
+		}
+		out = append(out, cloneBatch(r.batches[id]))
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ListBatchesCount implements the optional BatchLister capability (BE-A, §24.2).
+// It returns the total count of the ctx tenant's batches matching f (same
+// predicate as ListBatches) WITHOUT Limit/Offset, so the pager can render the
+// full total. Cross-tenant lots are invisible.
+func (r *MemoryBatchRepo) ListBatchesCount(_ context.Context, tenantID int64, f BatchFilter) (int64, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var n int64
+	for _, b := range r.batches {
+		if matchBatch(b, tenantID, f) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// matchBatch reports whether b belongs to tenantID and matches the non-paging
+// fields of f (StoreID/ProductID/Status/ExpiryBefore). Limit/Offset are ignored
+// so the same predicate drives both the page slice and the total count.
+func matchBatch(b *Batch, tenantID int64, f BatchFilter) bool {
+	if b.TenantID != tenantID {
+		return false
+	}
+	if f.StoreID > 0 && b.StoreID != f.StoreID {
+		return false
+	}
+	if f.ProductID > 0 && b.ProductID != f.ProductID {
+		return false
+	}
+	if f.Status != "" && b.Status != f.Status {
+		return false
+	}
+	if f.ExpiryBefore != nil {
+		// A lot with no expiry never satisfies a "expiry before cutoff" filter.
+		if b.ExpiryDate == nil || b.ExpiryDate.After(*f.ExpiryBefore) {
+			return false
+		}
+	}
+	return true
 }
 
 // AppendMovement implements BatchRepo. The movement is deep-copied and assigned

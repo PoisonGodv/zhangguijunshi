@@ -20,6 +20,7 @@ import type {
   DailySummary,
   SubscriptionResp,
   Whoami,
+  ListMembersResp,
   Product,
   ProductListResp,
   Order,
@@ -334,6 +335,17 @@ export function getSubscription(): Promise<SubscriptionResp> {
  */
 export function getWhoami(): Promise<Whoami> {
   return request<Whoami>('GET', '/v1/boss/whoami')
+}
+
+/**
+ * getMemberCount: 会员总数 (me 页会员数卡片, CONTRACT §24.7 路线 A,后端 0 改动)。
+ * 复用已有 GET /v1/boss/membership/members (§17.11 ListMembersPage 已返 {items,total}),
+ * page=1&size=1 最小拉取,只取 total;total 缺失/非法时兜底 0。
+ */
+export async function getMemberCount(): Promise<number> {
+  const resp = await request<ListMembersResp>('GET', '/v1/boss/membership/members?page=1&size=1')
+  const total = resp && typeof resp.total === 'number' ? resp.total : 0
+  return total
 }
 
 // === billing 开单页 (FE-MP-02) —— 商品/订单 API ===

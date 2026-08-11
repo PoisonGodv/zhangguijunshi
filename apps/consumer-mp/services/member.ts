@@ -6,7 +6,7 @@
 // 注意: claimNewMemberCoupon 传原始 11 位手机号 (后端自己 hash 存储,前端勿传掩码)。
 
 import { http } from '../utils/request'
-import type { MemberInfo, MemberCode, Coupon, Balance, PointsResult } from '../types/api'
+import type { MemberInfo, MemberCode, Coupon, Balance, PointsResult, RechargeResult } from '../types/api'
 
 const USE_MOCK = false // 后端 /v1/wxshop/member/* 已就绪 (CONTRACT §16)
 
@@ -115,6 +115,19 @@ export async function getBalance(): Promise<Balance> {
     console.warn('[member] getBalance 真接口失败,降级 0/0', err)
     return { balance_cents: 0, gift_cents: 0 }
   }
+}
+
+/**
+ * 储值充值 Simulate (POST /v1/wxshop/member/balance/recharge {amount_cents}; CONTRACT §24.4)。
+ * dev/test 便利 (对齐 billing.SimulatePay): 直接入账 membership.Recharge, 不走 wx.requestPayment / wxpay。
+ * 写操作不降级, 失败直接抛 ApiError (页面 toast 中文):
+ *   60003 超过储值上限 (membership.ErrBalanceOver→60003, rechargeAtomic cap 校验);
+ *   40404 会员不存在 / active 校验失败。
+ * 真实 wxpay 链路 (paymentFulfiller SubjectRecharge→Recharge 闭环已就位 §19) 延后到支付联调;
+ * 生产环境必须切真实 wxpay (资金直清 sub_merchant, 反二清硬约束 §15.5.3)。
+ */
+export function recharge(amountCents: number): Promise<RechargeResult> {
+  return http.post<RechargeResult>('/v1/wxshop/member/balance/recharge', { amount_cents: amountCents })
 }
 
 /**

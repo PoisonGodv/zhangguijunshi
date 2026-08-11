@@ -95,8 +95,13 @@ Page({
     }
   },
 
-  onTapOrder() {
-    // 订单详情后端无接口, 占位 (C2 补)
-    wx.showToast({ title: '订单详情即将上线', icon: 'none' })
+  onTapOrder(e: WechatMiniprogram.TouchEvent) {
+    // 订单详情接口已就绪 (GET /v1/wxshop/orders/:id, CONTRACT §24.3)
+    const id = Number(e.currentTarget.dataset.id || 0)
+    if (!id) {
+      wx.showToast({ title: '订单不存在', icon: 'none' })
+      return
+    }
+    wx.navigateTo({ url: '/pages/orders-detail/orders-detail?id=' + id })
   },
 })

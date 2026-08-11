@@ -173,6 +173,31 @@ func (s *Service) List(ctx context.Context, f ProductFilter) ([]*Product, error)
 	return products, nil
 }
 
+// ListPage returns products within the ctx tenant matching f plus the FULL
+// match count (Total) for true pagination (CONTRACT §24.5). It type-asserts
+// the optional ProductLister capability on the repo; a repo lacking it
+// degrades nil-safe to List with Total = len(current page) (the legacy
+// behaviour), so the call never fails on an un-upgraded implementation.
+func (s *Service) ListPage(ctx context.Context, f ProductFilter) (ListProductsResult, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return ListProductsResult{}, err
+	}
+	if lister, ok := s.repo.(ProductLister); ok {
+		res, err := lister.ListPage(ctx, tenantID, f)
+		if err != nil {
+			return ListProductsResult{}, mapRepoErr(err)
+		}
+		return res, nil
+	}
+	// Fallback: no ProductLister capability → legacy List + total=len(items).
+	products, err := s.repo.List(ctx, tenantID, f)
+	if err != nil {
+		return ListProductsResult{}, mapRepoErr(err)
+	}
+	return ListProductsResult{Items: products, Total: int64(len(products))}, nil
+}
+
 // UpdateTags replaces a product's BE-A-09 tag set (临期/滞销/高毛利) within the
 // ctx tenant and returns the updated record. It touches ONLY the tags column —
 // never price/cost/name — so it cannot trip the pricing rule or the uniqueness

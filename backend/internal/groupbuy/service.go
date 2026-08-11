@@ -100,19 +100,21 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Groupbuy, error)
 	validHours := resolveValidHours(in)
 	now := s.now()
 	g := &Groupbuy{
-		TenantID:      tenantID,
-		StoreID:       storeScope(ctx, in.StoreID),
-		StrategyID:    in.StrategyID,
-		ProductID:     in.ProductID,
-		Title:         in.Title,
-		Params:        in.Params,
-		RequiredCount: required,
-		Joined:        0,
-		Status:        StatusActive,
-		StartAt:       now,
-		EndAt:         now.Add(time.Duration(validHours) * time.Hour),
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		TenantID:           tenantID,
+		StoreID:            storeScope(ctx, in.StoreID),
+		StrategyID:         in.StrategyID,
+		ProductID:          in.ProductID,
+		Title:              in.Title,
+		Desc:               in.Desc,
+		OriginalPriceCents: in.OriginalPriceCents,
+		Params:             in.Params,
+		RequiredCount:      required,
+		Joined:             0,
+		Status:             StatusActive,
+		StartAt:            now,
+		EndAt:              now.Add(time.Duration(validHours) * time.Hour),
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	return s.repo.Create(ctx, g)
 }

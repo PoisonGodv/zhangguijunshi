@@ -62,14 +62,15 @@ type txBeginner interface {
 	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
-// SQL for groupbuys (migration 000006 + strategy_id from 000011). product_id is
-// nullable (NULL when the squad binds no product); params is JSONB. Every read /
-// update is scoped by tenant_id. JoinIncr is the atomic critical section: a
-// single conditional UPDATE that increments joined and, on reaching
-// required_count, flips status to success — the CASE references the pre-update
-// joined value, and the WHERE guard (joined < required_count AND status =
-// 'active') makes a concurrent join that raced the read reject with no rows
-// (mapped to ErrGroupbuyFull, matching memory's "succeeded squad → full").
+// SQL for groupbuys (migration 000006 + strategy_id from 000011 + description/
+// original_price_cents from 000024, CONTRACT §24.6). product_id is nullable
+// (NULL when the squad binds no product); params is JSONB. Every read / update
+// is scoped by tenant_id. JoinIncr is the atomic critical section: a single
+// conditional UPDATE that increments joined and, on reaching required_count,
+// flips status to success — the CASE references the pre-update joined value,
+// and the WHERE guard (joined < required_count AND status = 'active') makes a
+// concurrent join that raced the read reject with no rows (mapped to
+// ErrGroupbuyFull, matching memory's "succeeded squad → full").
 //
 // UpdateStatus carries a DB-side `AND status = 'active'` guard so a transition
 // can only land on a still-active squad. The Go-side isAllowedGroupbuyTransition
@@ -81,17 +82,17 @@ type txBeginner interface {
 // a squad that was already settled, matching the memory repo's under-lock
 // re-validation semantics.
 const (
-	sqlGBCreate = `INSERT INTO groupbuys (tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	sqlGBCreate = `INSERT INTO groupbuys (tenant_id, store_id, product_id, title, description, original_price_cents, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 RETURNING id`
-	sqlGBGetByID = `SELECT id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at
+	sqlGBGetByID = `SELECT id, tenant_id, store_id, product_id, title, description, original_price_cents, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at
 FROM groupbuys
 WHERE tenant_id = $1 AND id = $2`
-	sqlGBListActiveAll   = `SELECT id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND status = 'active' ORDER BY id`
-	sqlGBListActiveStore = `SELECT id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND store_id = $2 AND status = 'active' ORDER BY id`
-	sqlGBListByStrategy  = `SELECT id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND strategy_id = $2 ORDER BY id`
-	sqlGBUpdateStatus    = `UPDATE groupbuys SET status = $1, updated_at = $2 WHERE tenant_id = $3 AND id = $4 AND status = 'active' RETURNING id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at`
-	sqlGBJoinIncr        = `UPDATE groupbuys SET joined = joined + 1, status = CASE WHEN joined + 1 >= required_count THEN 'success' ELSE status END, updated_at = $1 WHERE tenant_id = $2 AND id = $3 AND joined < required_count AND status = 'active' RETURNING id, tenant_id, store_id, product_id, title, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at`
+	sqlGBListActiveAll   = `SELECT id, tenant_id, store_id, product_id, title, description, original_price_cents, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND status = 'active' ORDER BY id`
+	sqlGBListActiveStore = `SELECT id, tenant_id, store_id, product_id, title, description, original_price_cents, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND store_id = $2 AND status = 'active' ORDER BY id`
+	sqlGBListByStrategy  = `SELECT id, tenant_id, store_id, product_id, title, description, original_price_cents, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at FROM groupbuys WHERE tenant_id = $1 AND strategy_id = $2 ORDER BY id`
+	sqlGBUpdateStatus    = `UPDATE groupbuys SET status = $1, updated_at = $2 WHERE tenant_id = $3 AND id = $4 AND status = 'active' RETURNING id, tenant_id, store_id, product_id, title, description, original_price_cents, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at`
+	sqlGBJoinIncr        = `UPDATE groupbuys SET joined = joined + 1, status = CASE WHEN joined + 1 >= required_count THEN 'success' ELSE status END, updated_at = $1 WHERE tenant_id = $2 AND id = $3 AND joined < required_count AND status = 'active' RETURNING id, tenant_id, store_id, product_id, title, description, original_price_cents, params, required_count, joined, status, start_at, end_at, strategy_id, created_at, updated_at`
 )
 
 // SQL for groupbuy_participants (migration 000006). UNIQUE(tenant_id,
@@ -107,13 +108,14 @@ const (
 // ===== scan helpers =====
 
 // scanGroupbuy decodes one groupbuys row. product_id is nullable (NULL → 0);
-// params is JSONB decoded into GroupbuyParams.
+// params is JSONB decoded into GroupbuyParams. description/original_price_cents
+// are NOT NULL with ” / 0 defaults (migration 000024).
 func scanGroupbuy(s rowScanner) (*Groupbuy, error) {
 	var g Groupbuy
 	var productID sql.NullInt64
 	var paramsRaw []byte
 	if err := s.Scan(
-		&g.ID, &g.TenantID, &g.StoreID, &productID, &g.Title, &paramsRaw,
+		&g.ID, &g.TenantID, &g.StoreID, &productID, &g.Title, &g.Desc, &g.OriginalPriceCents, &paramsRaw,
 		&g.RequiredCount, &g.Joined, &g.Status, &g.StartAt, &g.EndAt,
 		&g.StrategyID, &g.CreatedAt, &g.UpdatedAt,
 	); err != nil {
@@ -178,7 +180,7 @@ func (r *PGGroupbuyRepo) Create(ctx context.Context, g *Groupbuy) (*Groupbuy, er
 		productID = nil // nullable column
 	}
 	if err := r.pool.QueryRow(ctx, sqlGBCreate,
-		g.TenantID, g.StoreID, productID, g.Title, params, g.RequiredCount, g.Joined,
+		g.TenantID, g.StoreID, productID, g.Title, g.Desc, g.OriginalPriceCents, params, g.RequiredCount, g.Joined,
 		g.Status, g.StartAt, g.EndAt, g.StrategyID, g.CreatedAt, g.UpdatedAt,
 	).Scan(&g.ID); err != nil {
 		return nil, fmt.Errorf("groupbuy: pg create: %w", err)

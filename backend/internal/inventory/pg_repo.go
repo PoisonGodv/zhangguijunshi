@@ -56,12 +56,14 @@ type txBeginner interface {
 }
 
 // Compile-time guarantees that PGBatchRepo satisfies the frozen BatchRepo
-// interface, the optional StockConsumer capability, and the optional
-// ProductExpirer capability (CONTRACT §17.5.1 / M7-A).
+// interface, the optional StockConsumer capability, the optional ProductExpirer
+// capability (CONTRACT §17.5.1 / M7-A), and the optional BatchLister capability
+// (BE-A, §24.2).
 var (
 	_ BatchRepo      = (*PGBatchRepo)(nil)
 	_ StockConsumer  = (*PGBatchRepo)(nil)
 	_ ProductExpirer = (*PGBatchRepo)(nil)
+	_ BatchLister    = (*PGBatchRepo)(nil)
 )
 
 // SQL for inventory_batches (migration 000002). expiry_date / expiry_warn_date
@@ -109,6 +111,31 @@ FROM inventory_batches
 WHERE tenant_id = $1 AND ($2 = 0 OR store_id = $2)
 AND status = 'active' AND quantity > 0 AND expiry_date IS NOT NULL
 GROUP BY product_id`
+	// BatchLister (BE-A, §24.2): full-status paged listing for the boss 临期看板.
+	// Optional filters reuse the ($N = 0 OR ...) / NULL-short-circuit idiom so the
+	// SQL text stays a single constant (QueryMatcherEqual friendly): store/product
+	// pass 0 when unset, status passes '' when unset, and expiry_before passes
+	// NULL when unset (the $5::date IS NULL branch short-circuits the OR). Unlike
+	// sqlBatchListActiveFIFO / sqlBatchListNearing this returns EVERY status
+	// (active/nearing/expired/cleared) — the临期看板 only READS status. tenant_id
+	// in the WHERE enforces row isolation.
+	sqlBatchList = `SELECT id, tenant_id, store_id, product_id, quantity, in_price_cents, expiry_date, expiry_warn_date, status, created_at, updated_at
+FROM inventory_batches
+WHERE tenant_id = $1
+AND ($2 = 0 OR store_id = $2)
+AND ($3 = 0 OR product_id = $3)
+AND ($4 = '' OR status = $4)
+AND ($5::date IS NULL OR expiry_date <= $5)
+ORDER BY id ASC
+LIMIT $6 OFFSET $7`
+	// sqlBatchListCount mirrors sqlBatchList's WHERE minus ORDER/LIMIT/OFFSET so
+	// the pager can render the full total matching the SAME filter dimensions.
+	sqlBatchListCount = `SELECT COUNT(*) FROM inventory_batches
+WHERE tenant_id = $1
+AND ($2 = 0 OR store_id = $2)
+AND ($3 = 0 OR product_id = $3)
+AND ($4 = '' OR status = $4)
+AND ($5::date IS NULL OR expiry_date <= $5)`
 )
 
 // SQL for inventory_movements (migration 000002). batch_id / ref_order_id /
@@ -368,6 +395,69 @@ func (r *PGBatchRepo) EarliestExpiryByProduct(ctx context.Context, tenantID, sto
 		return nil, fmt.Errorf("inventory: pg earliest expiry rows: %w", err)
 	}
 	return out, nil
+}
+
+// ListBatches implements the optional BatchLister capability (BE-A, §24.2). It
+// returns the ctx tenant's lots matching f (store/product/status/expiry_before)
+// ordered by id ASC with Limit/Offset applied, covering EVERY status
+// (active/nearing/expired/cleared) so the boss 临期看板 sees cleared/expired lots
+// too — it only READS status (nearing/expired transitions stay owned by the
+// BE-A-09 tag job). Optional filters use the same sentinel-arg idiom as
+// sqlMovementList. A nil/non-Query pool yields an empty slice.
+func (r *PGBatchRepo) ListBatches(ctx context.Context, tenantID int64, f BatchFilter) ([]*Batch, error) {
+	out := make([]*Batch, 0)
+	if r == nil || r.pool == nil {
+		return out, nil
+	}
+	q, ok := r.pool.(queryer)
+	if !ok {
+		return out, nil
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultBatchListLimit
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := q.Query(ctx, sqlBatchList,
+		tenantID, f.StoreID, f.ProductID, f.Status, dateArg(f.ExpiryBefore), limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("inventory: pg batch list: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		b, err := scanBatch(rows)
+		if err != nil {
+			return nil, fmt.Errorf("inventory: pg batch list scan: %w", err)
+		}
+		out = append(out, cloneBatch(b))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("inventory: pg batch list rows: %w", err)
+	}
+	return out, nil
+}
+
+// ListBatchesCount implements the optional BatchLister capability (BE-A, §24.2).
+// It returns the total count of the ctx tenant's batches matching f WITHOUT
+// Limit/Offset (same filter dimensions as ListBatches), so the pager can render
+// the full total. A nil/non-Query pool yields 0.
+func (r *PGBatchRepo) ListBatchesCount(ctx context.Context, tenantID int64, f BatchFilter) (int64, error) {
+	if r == nil || r.pool == nil {
+		return 0, nil
+	}
+	// COUNT(*) goes through QueryRow (the frozen PGPool surface), so no queryer
+	// type-assert is needed; a nil pool short-circuits above.
+	var n int64
+	if err := r.pool.QueryRow(ctx, sqlBatchListCount,
+		tenantID, f.StoreID, f.ProductID, f.Status, dateArg(f.ExpiryBefore),
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("inventory: pg batch list count: %w", err)
+	}
+	return n, nil
 }
 
 // AppendMovement appends an immutable ledger entry and returns a defensive copy

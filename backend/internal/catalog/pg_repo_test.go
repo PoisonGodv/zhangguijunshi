@@ -9,6 +9,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -238,6 +239,97 @@ func TestPGProductRepo_ListPaginationAndQuery(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, "可乐", got[0].Name)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// poolOnly is a PGPool WITHOUT the optional Query method, exercising the
+// queryer type-assert degradation path in List/ListPage.
+type poolOnly struct{ PGPool }
+
+func TestPGProductRepo_ListPage(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGProductRepo(mock)
+	// Count first (full match), then the page window.
+	mock.ExpectQuery(sqlProductListCount).
+		WithArgs(int64(1), int64(10), "饮料", "").
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(7)))
+	mock.ExpectQuery(sqlProductList).
+		WithArgs(int64(1), int64(10), "饮料", "", 50, 0).
+		WillReturnRows(pgxmock.NewRows(productColumns()).
+			AddRow(int64(1001), int64(1), int64(10), "6901234567890", "可乐", "饮料", "瓶",
+				int64(200), int64(300), "", int64(0), []string{}, "active", fixedTime, fixedTime).
+			AddRow(int64(1002), int64(1), int64(10), "6901111222233", "雪碧", "饮料", "瓶",
+				int64(210), int64(310), "", int64(0), []string{}, "active", fixedTime, fixedTime))
+	res, err := repo.ListPage(context.Background(), 1, ProductFilter{StoreID: 10, Category: "饮料"})
+	require.NoError(t, err)
+	require.Equal(t, int64(7), res.Total)
+	require.Len(t, res.Items, 2)
+	require.Equal(t, "可乐", res.Items[0].Name)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGProductRepo_ListPageEmpty(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGProductRepo(mock)
+	mock.ExpectQuery(sqlProductListCount).
+		WithArgs(int64(1), int64(0), "", "").
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(0)))
+	mock.ExpectQuery(sqlProductList).
+		WithArgs(int64(1), int64(0), "", "", 50, 0).
+		WillReturnRows(pgxmock.NewRows(productColumns()))
+	res, err := repo.ListPage(context.Background(), 1, ProductFilter{})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), res.Total)
+	require.Empty(t, res.Items)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGProductRepo_ListPageFilterAndPagination(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGProductRepo(mock)
+	// Query substring + explicit limit/offset flow into both statements.
+	mock.ExpectQuery(sqlProductListCount).
+		WithArgs(int64(1), int64(0), "", "可").
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(21)))
+	mock.ExpectQuery(sqlProductList).
+		WithArgs(int64(1), int64(0), "", "可", 10, 20).
+		WillReturnRows(pgxmock.NewRows(productColumns()).
+			AddRow(int64(1021), int64(1), int64(10), "6901234567890", "可乐", "饮料", "瓶",
+				int64(200), int64(300), "", int64(0), []string{}, "active", fixedTime, fixedTime))
+	res, err := repo.ListPage(context.Background(), 1, ProductFilter{Query: "可", Limit: 10, Offset: 20})
+	require.NoError(t, err)
+	require.Equal(t, int64(21), res.Total)
+	require.Len(t, res.Items, 1)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGProductRepo_ListPageCountError(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGProductRepo(mock)
+	mock.ExpectQuery(sqlProductListCount).
+		WithArgs(int64(1), int64(0), "", "").
+		WillReturnError(errors.New("boom"))
+	_, err := repo.ListPage(context.Background(), 1, ProductFilter{})
+	require.Error(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPGProductRepo_ListPageDegrades(t *testing.T) {
+	// Nil pool: empty result, Total=0, never panics.
+	res, err := NewPGProductRepo(nil).ListPage(context.Background(), 1, ProductFilter{})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), res.Total)
+	require.Empty(t, res.Items)
+
+	var nilRepo *PGProductRepo
+	res, err = nilRepo.ListPage(context.Background(), 1, ProductFilter{})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), res.Total)
+
+	// Pool without the optional Query method degrades the same way.
+	res, err = NewPGProductRepo(poolOnly{}).ListPage(context.Background(), 1, ProductFilter{})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), res.Total)
+	require.Empty(t, res.Items)
 }
 
 func TestPGRepo_NilPoolIsSafe(t *testing.T) {

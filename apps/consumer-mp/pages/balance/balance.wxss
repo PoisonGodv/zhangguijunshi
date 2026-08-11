@@ -49,3 +49,70 @@
 .recharge-btn {
   margin-top: 32rpx;
 }
+
+/* === 充值金额面板 (展开式) === */
+.recharge-panel {
+  margin-top: 24rpx;
+}
+.recharge-presets {
+  display: flex;
+  gap: 16rpx;
+  margin-bottom: 24rpx;
+}
+.recharge-preset {
+  flex: 1;
+  text-align: center;
+  font-size: 34rpx;
+  font-weight: 600;
+  color: #FF6B35;
+  background: rgba(255, 107, 53, 0.08);
+  border: 2rpx solid rgba(255, 107, 53, 0.3);
+  border-radius: 16rpx;
+  padding: 28rpx 0;
+}
+.recharge-preset-active {
+  background: #FF6B35;
+  color: #FFFFFF;
+  border-color: #FF6B35;
+}
+.recharge-input-row {
+  display: flex;
+  align-items: center;
+  background: #FAFAFA;
+  border: 2rpx solid #F0E6DE;
+  border-radius: 16rpx;
+  padding: 0 24rpx;
+  height: 96rpx;
+  margin-bottom: 24rpx;
+}
+.recharge-input-prefix {
+  font-size: 40rpx;
+  font-weight: 700;
+  color: #1F1F1F;
+  margin-right: 12rpx;
+}
+.recharge-input {
+  flex: 1;
+  height: 96rpx;
+  font-size: 40rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+}
+.recharge-actions {
+  display: flex;
+  gap: 16rpx;
+}
+.recharge-btn-cancel {
+  flex: 1;
+  height: 88rpx;
+  line-height: 88rpx;
+  text-align: center;
+  font-size: 30rpx;
+  color: #595959;
+  background: #F0F0F0;
+  border-radius: 44rpx;
+}
+.recharge-btn-cancel::after { border: none; }
+.recharge-btn-confirm {
+  flex: 2;
+}

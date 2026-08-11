@@ -260,7 +260,95 @@ func TestList_Filters(t *testing.T) {
 	}
 }
 
-// --- 唯一性 ------------------------------------------------------------------
+// --- ListPage 真分页 (CONTRACT §24.5) ------------------------------------------
+
+func TestListPage_TotalIsFullMatchCount(t *testing.T) {
+	svc := newSvc()
+	ctx := ctxFor(tenantA, store1)
+
+	for i, name := range []string{"可乐", "雪碧", "芬达", "美年达", "七喜"} {
+		if _, err := svc.Create(ctx, CreateInput{
+			Barcode: fmt.Sprintf("LP%03d", i), Name: name, Category: "饮料", Unit: "瓶",
+			CostCents: 1, PriceCents: 2,
+		}); err != nil {
+			t.Fatalf("Create(%s): %v", name, err)
+		}
+	}
+
+	// Total is the FULL match count even though Items is only the current page.
+	res, err := svc.ListPage(ctx, ProductFilter{Category: "饮料", Limit: 2, Offset: 0})
+	if err != nil {
+		t.Fatalf("ListPage: %v", err)
+	}
+	if res.Total != 5 || len(res.Items) != 2 {
+		t.Fatalf("want total=5 items=2, got total=%d items=%d", res.Total, len(res.Items))
+	}
+	// Second page: total stays the full count, window slices correctly.
+	res2, err := svc.ListPage(ctx, ProductFilter{Category: "饮料", Limit: 2, Offset: 4})
+	if err != nil {
+		t.Fatalf("ListPage page2: %v", err)
+	}
+	if res2.Total != 5 || len(res2.Items) != 1 {
+		t.Fatalf("want total=5 items=1, got total=%d items=%d", res2.Total, len(res2.Items))
+	}
+	if res.Items[0].ID == res2.Items[0].ID {
+		t.Fatal("ListPage pages returned overlapping ids")
+	}
+
+	// Filters narrow Total too (query substring).
+	res3, err := svc.ListPage(ctx, ProductFilter{Query: "可乐"})
+	if err != nil {
+		t.Fatalf("ListPage query: %v", err)
+	}
+	if res3.Total != 1 || len(res3.Items) != 1 || res3.Items[0].Name != "可乐" {
+		t.Fatalf("query 可乐: want total=1 items=[可乐], got total=%d items=%d", res3.Total, len(res3.Items))
+	}
+}
+
+func TestListPage_CrossTenantIsolated(t *testing.T) {
+	svc := newSvc()
+	if _, err := svc.Create(ctxFor(tenantA, store1), CreateInput{
+		Barcode: "LPC1", Name: "可乐", Unit: "瓶", CostCents: 1, PriceCents: 2,
+	}); err != nil {
+		t.Fatalf("Create(A): %v", err)
+	}
+	// Tenant B sees an empty page with Total=0 (indistinguishable from "none").
+	res, err := svc.ListPage(ctxFor(tenantB, store1), ProductFilter{})
+	if err != nil {
+		t.Fatalf("ListPage(B): %v", err)
+	}
+	if res.Total != 0 || len(res.Items) != 0 {
+		t.Fatalf("tenant B listed tenant A products: total=%d items=%d", res.Total, len(res.Items))
+	}
+}
+
+func TestListPage_NoTenant_Rejected(t *testing.T) {
+	svc := newSvc()
+	if _, err := svc.ListPage(context.Background(), ProductFilter{}); !errors.Is(err, multitenancy.ErrNoTenant) {
+		t.Fatalf("expected ErrNoTenant, got %v", err)
+	}
+}
+
+// legacyOnlyRepo wraps ProductRepo but hides the ProductLister capability,
+// simulating an un-upgraded repo implementation (the embedded interface only
+// promotes the frozen 6 methods, so the wrapper does NOT satisfy ProductLister).
+type legacyOnlyRepo struct{ ProductRepo }
+
+func TestListPage_FallbackWithoutListerCapability(t *testing.T) {
+	svc := NewService(legacyOnlyRepo{NewMemoryProductRepo()})
+	ctx := ctxFor(tenantA, store1)
+	if _, err := svc.Create(ctx, CreateInput{Barcode: "FB1", Name: "可乐", Unit: "瓶", CostCents: 1, PriceCents: 2}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Without ProductLister the service degrades to List + Total=len(items).
+	res, err := svc.ListPage(ctx, ProductFilter{})
+	if err != nil {
+		t.Fatalf("ListPage fallback: %v", err)
+	}
+	if res.Total != 1 || len(res.Items) != 1 {
+		t.Fatalf("fallback: want total=1 items=1, got total=%d items=%d", res.Total, len(res.Items))
+	}
+}
 
 func TestUniqueness(t *testing.T) {
 	svc := newSvc()

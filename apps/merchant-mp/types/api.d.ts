@@ -240,6 +240,16 @@ export interface SubscriptionResp {
 }
 
 /**
+ * GET /v1/boss/membership/members?page=&size=&level=&q= 响应 (CONTRACT §17.11):
+ *   httpx.OK(c, gin.H{"items": memberDTO[], "total": n})
+ * me 页会员数卡片只读 total (page=1&size=1 最小拉取),items 用 unknown[] 不展开 memberDTO。
+ */
+export interface ListMembersResp {
+  items: unknown[]
+  total: number
+}
+
+/**
  * GET /v1/boss/whoami 响应 (interfaces/http/router.go whoami):
  *   httpx.OK(c, gin.H{"tenant_id": tid, "source": source})
  * 注: 后端目前只返回 tenant_id + source,**没有** store_id / role / scene。

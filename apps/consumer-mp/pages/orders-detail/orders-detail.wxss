@@ -1,0 +1,103 @@
+/* pages/orders-detail/orders-detail.wxss — 订单详情页特有布局 */
+.od-card {
+  padding: 24rpx;
+}
+.od-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 16rpx;
+  border-bottom: 2rpx dashed #F0E6DE;
+}
+.od-no {
+  font-size: 26rpx;
+  color: #8C8C8C;
+}
+.order-status {
+  font-size: 24rpx;
+  padding: 4rpx 16rpx;
+  border-radius: 20rpx;
+}
+.order-status-pending {
+  color: #FF6B35;
+  background: rgba(255, 107, 53, 0.1);
+}
+.order-status-paid {
+  color: #2ECC71;
+  background: rgba(46, 204, 113, 0.1);
+}
+.order-status-refunded {
+  color: #FF4D4F;
+  background: rgba(255, 77, 79, 0.1);
+}
+.order-status-voided {
+  color: #BFBFBF;
+  background: rgba(191, 191, 191, 0.12);
+}
+.od-amount {
+  text-align: center;
+  padding: 24rpx 0 8rpx;
+}
+.od-amount-label {
+  font-size: 26rpx;
+  color: #8C8C8C;
+  margin-bottom: 8rpx;
+}
+.od-amount-num {
+  font-size: 56rpx;
+  font-weight: 700;
+  color: #FF6B35;
+  line-height: 1.2;
+}
+.od-paid-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-top: 8rpx;
+}
+.od-paid-label {
+  font-size: 26rpx;
+  color: #8C8C8C;
+}
+.od-paid-num {
+  font-size: 30rpx;
+  font-weight: 700;
+  color: #1F1F1F;
+  margin-left: 12rpx;
+}
+.od-items {
+  padding: 8rpx 0;
+}
+.od-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8rpx 0;
+}
+.od-item-name {
+  font-size: 30rpx;
+  color: #1F1F1F;
+  flex: 1;
+  min-width: 0;
+}
+.od-item-price {
+  font-size: 28rpx;
+  color: #595959;
+  margin-left: 16rpx;
+}
+.od-item-empty {
+  color: #BFBFBF;
+}
+.od-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 12rpx 0;
+}
+.od-row-label {
+  font-size: 28rpx;
+  color: #8C8C8C;
+}
+.od-row-val {
+  font-size: 28rpx;
+  color: #1F1F1F;
+}

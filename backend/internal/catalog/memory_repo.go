@@ -165,6 +165,42 @@ func (r *MemoryProductRepo) GetByBarcode(_ context.Context, tenantID, storeID in
 	return clone(p), nil
 }
 
+// matches reports whether p satisfies the optional filters (StoreID/Category/
+// Query) within tenantID. Shared by List and ListPage so both filter
+// identically.
+func matchProduct(p *Product, tenantID int64, f ProductFilter) bool {
+	if p.TenantID != tenantID {
+		return false
+	}
+	if f.StoreID > 0 && p.StoreID != f.StoreID {
+		return false
+	}
+	if f.Category != "" && p.Category != f.Category {
+		return false
+	}
+	if f.Query != "" && !strings.Contains(p.Name, f.Query) && !strings.Contains(p.Barcode, f.Query) {
+		return false
+	}
+	return true
+}
+
+// eachInIDOrder iterates stored products in ascending-id (insertion) order for
+// deterministic pagination, invoking fn until it returns false.
+func (r *MemoryProductRepo) eachInIDOrder(fn func(*Product) bool) {
+	for id := int64(1001); ; id++ { // ids allocated from 1001 upward
+		p, ok := r.byID[id]
+		if !ok {
+			if id > r.nextID.Load() {
+				return
+			}
+			continue
+		}
+		if !fn(p) {
+			return
+		}
+	}
+}
+
 // List implements ProductRepo. Filters are applied within tenantID; results are
 // returned in insertion (id) order for deterministic pagination.
 func (r *MemoryProductRepo) List(_ context.Context, tenantID int64, f ProductFilter) ([]*Product, error) {
@@ -182,36 +218,58 @@ func (r *MemoryProductRepo) List(_ context.Context, tenantID int64, f ProductFil
 
 	matched := make([]*Product, 0, limit)
 	seen := 0
-	for id := int64(1001); ; id++ { // ids allocated from 1001 upward
-		p, ok := r.byID[id]
-		if !ok {
-			if id > r.nextID.Load() {
-				break
-			}
-			continue
-		}
-		if p.TenantID != tenantID {
-			continue
-		}
-		if f.StoreID > 0 && p.StoreID != f.StoreID {
-			continue
-		}
-		if f.Category != "" && p.Category != f.Category {
-			continue
-		}
-		if f.Query != "" && !strings.Contains(p.Name, f.Query) && !strings.Contains(p.Barcode, f.Query) {
-			continue
+	r.eachInIDOrder(func(p *Product) bool {
+		if !matchProduct(p, tenantID, f) {
+			return true
 		}
 		if seen < offset {
 			seen++
-			continue
+			return true
 		}
 		matched = append(matched, clone(p))
-		if len(matched) >= limit {
-			break
-		}
-	}
+		return len(matched) < limit
+	})
 	return matched, nil
+}
+
+// ListPage implements the optional ProductLister capability (CONTRACT §24.5):
+// one pass filters+counts every matching row (Total), a second slices out the
+// offset/limit window (Items) — so Total is the FULL match count, not len(Items).
+func (r *MemoryProductRepo) ListPage(_ context.Context, tenantID int64, f ProductFilter) (ListProductsResult, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	var total int64
+	r.eachInIDOrder(func(p *Product) bool {
+		if matchProduct(p, tenantID, f) {
+			total++
+		}
+		return true
+	})
+
+	items := make([]*Product, 0, limit)
+	seen := int64(0)
+	r.eachInIDOrder(func(p *Product) bool {
+		if !matchProduct(p, tenantID, f) {
+			return true
+		}
+		if seen < int64(offset) {
+			seen++
+			return true
+		}
+		items = append(items, clone(p))
+		return len(items) < limit
+	})
+	return ListProductsResult{Items: items, Total: total}, nil
 }
 
 // UpdateTags implements ProductRepo. It replaces ONLY the tag set of the product

@@ -1,11 +1,11 @@
 // pages/me/me.ts — 「我的」页 (FE-MP-04)
 //
-// 数据流: onLoad / onShow / 下拉刷新 → 并发拉三路 B 端 BFF:
+// 数据流: onLoad / onShow / 下拉刷新 → 并发拉四路 B 端 BFF:
 //   - getWhoami()              GET /v1/boss/whoami              → 门店/身份卡 (tenant_id + source)
 //   - getDailySummaryToday()   GET /v1/boss/billing/summary/today → 今日营业额/订单数/客单价
 //   - getSubscription()        GET /v1/boss/subscription        → 当前套餐 + 到期时间 + 状态
-// 会员数: 后端 /v1/boss/membership 目前只有 Join/GetMember/IssueCode/Redeem/Recharge/SetRegionCap
-//   (见 interfaces/http/router.go wireBoss),**没有** GET /members 列表/计数 BFF,故该卡片固定显示「—」。
+//   - getMemberCount()         GET /v1/boss/membership/members?page=1&size=1 → 会员总数 (取 total)
+// 会员数: CONTRACT §24.7 路线 A,复用 §17.11 ListMembersPage 的 total 计数,后端 0 改动。
 //
 // 金额: 后端 int64 分 → 元(整除显示整数,否则两位小数),与 today/task-detail 一致。
 // 失败策略: 单卡片失败只 toast,不阻塞其他卡片渲染。
@@ -14,6 +14,7 @@ import {
   getWhoami,
   getDailySummaryToday,
   getSubscription,
+  getMemberCount,
   getAccessToken,
   clearTokens,
   logoutReq,
@@ -54,7 +55,7 @@ interface MeData {
   revenueYuan: string
   orderCount: number
   avgYuan: string // 客单价(0 单显示 —)
-  memberCountText: string // 会员数(后端无 BFF,固定 —)
+  memberCountText: string // 会员数(§24.7: /v1/boss/membership/members total,失败/加载中保持 —)
   // 订阅卡
   planLabel: string
   planStatus: string
@@ -103,11 +104,12 @@ Page({
 
   async load(): Promise<void> {
     this.setData({ loading: true })
-    // 三路并发,单路失败只 toast,不阻塞其他卡片
-    const [whoamiRes, summaryRes, subRes] = await Promise.allSettled([
+    // 四路并发,单路失败只 toast,不阻塞其他卡片
+    const [whoamiRes, summaryRes, subRes, memberCountRes] = await Promise.allSettled([
       getWhoami(),
       getDailySummaryToday(),
       getSubscription(),
+      getMemberCount(),
     ])
 
     if (whoamiRes.status === 'fulfilled') {
@@ -126,6 +128,12 @@ Page({
       this.applySubscription(subRes.value)
     } else {
       toastErr(subRes.reason, '订阅状态加载失败')
+    }
+
+    if (memberCountRes.status === 'fulfilled') {
+      this.applyMemberCount(memberCountRes.value)
+    } else {
+      toastErr(memberCountRes.reason, '会员数加载失败')
     }
 
     this.setData({ loading: false })
@@ -148,9 +156,12 @@ Page({
       revenueYuan: yuan(revenue),
       orderCount: count,
       avgYuan: count > 0 ? yuan(avg) : '—',
-      // 后端 /v1/boss/membership 无列表/计数 BFF,占位
-      memberCountText: '—',
     })
+  },
+
+  /** 会员数卡片 (§24.7): ListMembersPage total → 文本;失败时不调用,保持初始 '—' */
+  applyMemberCount(total: number): void {
+    this.setData({ memberCountText: String(total) })
   },
 
   applySubscription(r: SubscriptionResp): void {

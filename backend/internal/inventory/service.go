@@ -292,6 +292,50 @@ func (s *Service) EarliestExpiryByProduct(ctx context.Context, storeID int64) (m
 	return m, nil
 }
 
+// ListBatches returns the ctx tenant's batches matching f (BE-A, CONTRACT §24.2
+// 临期看板): every status (active/nearing/expired/cleared), paged by
+// Limit/Offset, with optional store/product/status/expiry_before filters. It
+// only READS status (nearing/expired transitions stay owned by the BE-A-09 tag
+// job). It delegates to the repo's optional BatchLister capability; when the
+// repo does not provide it the call degrades to an empty slice (nil-safe, §0).
+func (s *Service) ListBatches(ctx context.Context, f BatchFilter) ([]*Batch, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bl, ok := s.repo.(BatchLister)
+	if !ok {
+		return []*Batch{}, nil
+	}
+	items, err := bl.ListBatches(ctx, tenantID, f)
+	if err != nil {
+		return nil, mapRepoErr(err)
+	}
+	if items == nil {
+		items = []*Batch{}
+	}
+	return items, nil
+}
+
+// ListBatchesCount returns the total count of the ctx tenant's batches matching
+// f (BE-A, §24.2), WITHOUT Limit/Offset — the pager total. Degrades to 0 when
+// the repo lacks the BatchLister capability (nil-safe, §0).
+func (s *Service) ListBatchesCount(ctx context.Context, f BatchFilter) (int64, error) {
+	tenantID, err := multitenancy.EnforceTenant(ctx)
+	if err != nil {
+		return 0, err
+	}
+	bl, ok := s.repo.(BatchLister)
+	if !ok {
+		return 0, nil
+	}
+	n, err := bl.ListBatchesCount(ctx, tenantID, f)
+	if err != nil {
+		return 0, mapRepoErr(err)
+	}
+	return n, nil
+}
+
 // ListMovements returns the ctx tenant's ledger entries matching f.
 func (s *Service) ListMovements(ctx context.Context, f MovementFilter) ([]*Movement, error) {
 	tenantID, err := multitenancy.EnforceTenant(ctx)

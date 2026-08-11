@@ -1,15 +1,13 @@
-// src/pages/inventory/stock/index.tsx — 库存管理 (FE-ADMIN-02)
+// src/pages/inventory/stock/index.tsx — 库存管理 (FE-ADMIN-02 / B2 接通)
 //
-// Tab 切换 "批次库存" | "出入库流水"。批次库存页: 按商品 ID 查当前总库存 (GET /stock)
-// + 近期入库流水 (purchase_in) 侧面呈现批次; 流水页: 全量 Movement。
+// Tab 切换 "批次库存" | "出入库流水"。批次库存页: CONTRACT §24.2 起调真实
+// GET /boss/inventory/batches ({items,total} 服务端分页), 临期直接用 Batch.ExpiryDate
+// + Status; 流水页: 全量 Movement。
 // 工具栏 "入库" ModalForm 调 purchase; 行操作 "消耗扣减" 调 consume (FIFO)。
 //
-// 后端约束 (核实后):
-//   - 无 list-batches 接口; GET /stock 仅返某商品当前总余量 (quantity 小写)。
+// 后端约束:
+//   - GET /inventory/batches → {items:[Batch], total} (Batch PascalCase, §24.2)。
 //   - GET /movements 返全量 []Movement (无 total, 无分页) → 前端分页。
-//   - Movement.BatchID + Quantity(正) 可侧面还原入库批次; Batch.ExpiryDate 无法
-//     在列表展示 (无批次列表接口) → 临期标记仅在流水行的 Expiry 无从获取时,
-//     用 Movement.Type + CreatedAt 近似; 真正临期看板需后端补 batches 接口 (见 TODO)。
 
 import { useEffect, useRef, useState } from 'react'
 import { Button, Tag, Tabs, App } from 'antd'
@@ -17,10 +15,13 @@ import { PlusOutlined, ReloadOutlined, MinusOutlined } from '@ant-design/icons'
 import type { ActionType, ProColumns } from '@ant-design/pro-components'
 import { ProTable, ModalForm, ProForm, ProFormDigit, ProFormText, ProFormTextArea } from '@ant-design/pro-components'
 import { fmtDateTime, fmtDate } from '@/utils/format'
+import Money from '@/components/Money'
 import {
   purchase,
+  listBatches,
   listMovements,
   consume,
+  type Batch,
   type Movement,
 } from '@/services/inventory'
 import { getProducts } from '@/services/catalog'
@@ -35,7 +36,15 @@ const MOVE_TYPE_TAG: Record<string, { color: string; text: string }> = {
   transfer: { color: 'purple', text: '调拨' },
 }
 
-// 临期判定: expire 字段近 30 天 → 红色 Tag (用于批次列表; 流水无 expire 字段时跳过)
+// 批次状态 → Tag 颜色 (Batch.Status, §24.2)
+const BATCH_STATUS_TAG: Record<string, { color: string; text: string }> = {
+  active: { color: 'green', text: '正常' },
+  nearing: { color: 'red', text: '临期' },
+  expired: { color: 'volcano', text: '已过期' },
+  cleared: { color: 'default', text: '已清空' },
+}
+
+// 临期判定: expire 字段近 30 天 → 红色 Tag
 function expiryTag(expiry: string | null | undefined): React.ReactNode {
   if (!expiry) return <Tag>无保质期</Tag>
   const d = new Date(expiry)
@@ -52,7 +61,7 @@ export default function StockPage() {
   const moveRef = useRef<ActionType>(null)
   const [tab, setTab] = useState<'batches' | 'movements'>('batches')
   const [purchaseOpen, setPurchaseOpen] = useState(false)
-  const [consumeRow, setConsumeRow] = useState<Movement | null>(null)
+  const [consumeRow, setConsumeRow] = useState<Batch | null>(null)
   const [consumeOpen, setConsumeOpen] = useState(false)
   const [consumeForm] = ProForm.useForm()
 
@@ -101,9 +110,9 @@ export default function StockPage() {
     return true
   }
 
-  // === 批次库存列 (按 Movement purchase_in 行呈现, 侧面还原批次) ===
-  const batchColumns: ProColumns<Movement>[] = [
-    { title: '流水 ID', dataIndex: 'ID', width: 80, hideInSearch: true },
+  // === 批次库存列 (Batch 实体, CONTRACT §24.2 真实批次接口) ===
+  const batchColumns: ProColumns<Batch>[] = [
+    { title: '批次 ID', dataIndex: 'ID', width: 80, hideInSearch: true },
     {
       title: '商品 ID',
       dataIndex: 'ProductID',
@@ -118,32 +127,40 @@ export default function StockPage() {
       render: (_, r) => <ProductNameCell productID={r.ProductID} />,
     },
     {
-      title: '入库数量',
+      title: '当前余量',
       dataIndex: 'Quantity',
       width: 100,
       hideInSearch: true,
-      render: (_, r) => <Tag color="green">+{r.Quantity}</Tag>,
+      render: (_, r) => <Tag color={r.Quantity > 0 ? 'green' : 'default'}>{r.Quantity}</Tag>,
     },
     {
       title: '进货价',
       dataIndex: 'InPriceCents',
       width: 110,
       hideInSearch: true,
-      render: () => {
-        // Movement 无 InPriceCents; purchase 返的 Batch 才有. 流水行只能从 note 侧面看.
-        // 这里用 product 当前售价近似展示 (TODO: 后端补批次列表后改 Batch.InPriceCents)
-        return <span style={{ color: '#999' }}>—</span>
-      },
+      render: (_, r) => (r.InPriceCents ? <Money value={r.InPriceCents} colorSign={false} /> : <span style={{ color: '#999' }}>—</span>),
     },
     {
       title: '保质期',
       dataIndex: 'ExpiryDate',
       width: 130,
       hideInSearch: true,
+      render: (_, r) => expiryTag(r.ExpiryDate),
+    },
+    {
+      title: '状态',
+      dataIndex: 'Status',
+      width: 90,
+      valueType: 'select',
+      valueEnum: {
+        active: { text: '正常' },
+        nearing: { text: '临期' },
+        expired: { text: '已过期' },
+        cleared: { text: '已清空' },
+      },
       render: (_, r) => {
-        // Movement 无 ExpiryDate; 近期可从 note 解析 YYYY-MM-DD (入库时填了)
-        const m = r.Note?.match(/\d{4}-\d{2}-\d{2}/)
-        return expiryTag(m ? m[0] : null)
+        const t = BATCH_STATUS_TAG[r.Status] || { color: 'default', text: r.Status }
+        return <Tag color={t.color}>{t.text}</Tag>
       },
     },
     {
@@ -154,14 +171,15 @@ export default function StockPage() {
       render: (_, r) => fmtDateTime(r.CreatedAt),
     },
     {
-      title: '备注',
-      dataIndex: 'Note',
-      ellipsis: true,
-      hideInSearch: true,
-    },
-    {
       title: '商品 ID 查',
       dataIndex: 'product_id_search',
+      hideInTable: true,
+      render: () => null,
+    },
+    {
+      title: '临期早于',
+      dataIndex: 'expiry_before',
+      valueType: 'date',
       hideInTable: true,
       render: () => null,
     },
@@ -301,8 +319,8 @@ export default function StockPage() {
             key: 'batches',
             label: '批次库存',
             children: (
-              <ProTable<Movement>
-                headerTitle="批次库存 (按入库流水呈现)"
+              <ProTable<Batch>
+                headerTitle="批次库存"
                 actionRef={stockRef}
                 rowKey="ID"
                 columns={batchColumns}
@@ -310,22 +328,20 @@ export default function StockPage() {
                 search={{ labelWidth: 100, defaultCollapsed: false }}
                 options={{ density: false, reload: true }}
                 request={async (params) => {
-                  // 后端无批次列表接口; 用 purchase_in 流水侧面还原批次.
-                  const productId = (params.product_id_search as number | undefined) ?? undefined
-                  const resp = await listMovements({
-                    product_id: productId,
-                    type: 'purchase_in',
-                    limit: 500,
-                    offset: 0,
-                  })
-                  let items = resp || []
-                  // 倒序: 最新入库在前
-                  items = [...items].sort((a, b) => +new Date(b.CreatedAt) - +new Date(a.CreatedAt))
+                  // CONTRACT §24.2: GET /boss/inventory/batches → {items,total} 服务端分页。
                   const current = params.current ?? 1
                   const pageSize = params.pageSize ?? 10
-                  const start = (current - 1) * pageSize
-                  const page = items.slice(start, start + pageSize)
-                  return { data: page, success: true, total: items.length }
+                  const productId = (params.product_id_search as number | undefined) ?? undefined
+                  const status = (params.Status as string | undefined) ?? undefined
+                  const expiryBefore = params.expiry_before as string | undefined
+                  const resp = await listBatches({
+                    product_id: productId,
+                    status,
+                    expiry_before: expiryBefore ? fmtDate(expiryBefore) : undefined,
+                    limit: pageSize,
+                    offset: (current - 1) * pageSize,
+                  })
+                  return { data: resp.items || [], success: true, total: resp.total ?? 0 }
                 }}
                 toolBarRender={() => [
                   <Button

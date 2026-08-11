@@ -1,8 +1,8 @@
 // src/pages/catalog/products/index.tsx — 商品管理 (FE-ADMIN-02)
 //
 // ProTable 商品列表 (PascalCase 字段) + 新增商品 ModalForm + 改价 ModalForm +
-// 按条码查搜索栏。后端 ListProducts 无真分页 total (count=本次条数), 这里拉大 limit
-// 前端分页。
+// 按条码查搜索栏。CONTRACT §24.5 起 ListProducts 响应 {items,total} 真分页,
+// 服务端分页 (limit/offset 随页码翻页), 不再拉大 limit 前端切片。
 //
 // 接口:
 //   GET    /v1/boss/catalog/products              → getProducts
@@ -198,8 +198,9 @@ export default function ProductsPage() {
         search={{ labelWidth: 90, defaultCollapsed: false }}
         options={{ density: false, reload: true }}
         request={async (params) => {
-          // 后端无真分页: 拉大 limit (最多 500), 前端分页。
-          const limit = 500
+          // CONTRACT §24.5: 响应 {items,total} 真分页 → 服务端分页。
+          const current = params.current ?? 1
+          const pageSize = params.pageSize ?? 10
           // 条码精确查优先 (命中即单条); 否则走 query 模糊。
           const barcode = (params.barcode_search as string | undefined)?.trim()
           if (barcode) {
@@ -214,17 +215,13 @@ export default function ProductsPage() {
           const status = params.Status as string | undefined
           const resp = await getProducts({
             query: query || undefined,
-            limit,
-            offset: 0,
+            limit: pageSize,
+            offset: (current - 1) * pageSize,
           })
           let items = resp.items || []
-          // 状态前端二次过滤 (后端 ListProducts 不支持 status 维度)
+          // 状态前端二次过滤 (后端 ListProducts 不支持 status 维度; total 以未过滤口径为准)
           if (status) items = items.filter((p) => p.Status === status)
-          const current = params.current ?? 1
-          const pageSize = params.pageSize ?? 10
-          const start = (current - 1) * pageSize
-          const page = items.slice(start, start + pageSize)
-          return { data: page, success: true, total: items.length }
+          return { data: items, success: true, total: resp.total ?? items.length }
         }}
         toolBarRender={() => [
           <Button

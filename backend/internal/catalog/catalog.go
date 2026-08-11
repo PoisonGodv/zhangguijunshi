@@ -46,6 +46,27 @@ type ProductFilter struct {
 	Offset   int
 }
 
+// ListProductsResult is one page of products plus the TOTAL number of rows
+// matching the filter within the tenant (not just len(Items)). Total drives
+// the boss paginator (CONTRACT §24.5); Items is only the current offset/limit
+// window.
+type ListProductsResult struct {
+	Items []*Product
+	Total int64
+}
+
+// ProductLister is the OPTIONAL true-pagination capability (CONTRACT §24.5)
+// that a ProductRepo may additionally satisfy — same additive idiom as
+// inventory.StockConsumer / ProductExpirer: the frozen ProductRepo interface
+// keeps its 6 methods, and Service.ListPage type-asserts this capability,
+// falling back to List+total=len when the repo lacks it.
+type ProductLister interface {
+	// ListPage returns products within tenantID matching f plus the full
+	// match count. Cross-tenant is an empty result (indistinguishable from
+	// "no products", ARCH-01).
+	ListPage(ctx context.Context, tenantID int64, f ProductFilter) (ListProductsResult, error)
+}
+
 // ProductRepo persists products. Implementations MUST enforce tenant isolation:
 // every method takes tenantID (resolved from ctx) and treats a product owned by a
 // different tenant as non-existent. The real implementation is pgx-backed

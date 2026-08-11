@@ -36,7 +36,53 @@
       </view>
     </view>
 
-    <!-- 充值入口 (C 端充值接口未就绪, 占位) -->
+    <!-- 充值入口 (CONTRACT §24.4, Simulate 直接入账) -->
     <button class="btn-primary recharge-btn" bindtap="onTapRecharge">充值</button>
+
+    <!-- 充值金额面板 (展开式, 不新建独立页) -->
+    <view wx:if="{{rechargeOpen}}" class="section recharge-panel">
+      <view class="section-title">选择充值金额 (元)</view>
+
+      <!-- 预设档位 -->
+      <view class="recharge-presets">
+        <view
+          class="recharge-preset {{amountText === '50' ? 'recharge-preset-active' : ''}}"
+          data-amt="50"
+          bindtap="onTapPreset"
+        >¥50</view>
+        <view
+          class="recharge-preset {{amountText === '100' ? 'recharge-preset-active' : ''}}"
+          data-amt="100"
+          bindtap="onTapPreset"
+        >¥100</view>
+        <view
+          class="recharge-preset {{amountText === '200' ? 'recharge-preset-active' : ''}}"
+          data-amt="200"
+          bindtap="onTapPreset"
+        >¥200</view>
+      </view>
+
+      <!-- 自定义金额 -->
+      <view class="recharge-input-row">
+        <text class="recharge-input-prefix">¥</text>
+        <input
+          class="recharge-input"
+          type="digit"
+          placeholder="自定义金额"
+          value="{{amountText}}"
+          bindinput="onAmountInput"
+        />
+      </view>
+
+      <!-- 操作按钮 -->
+      <view class="recharge-actions">
+        <button class="recharge-btn-cancel" bindtap="onTapCancelRecharge">取消</button>
+        <button
+          class="btn-primary recharge-btn-confirm"
+          disabled="{{submitting}}"
+          bindtap="onConfirmRecharge"
+        >{{submitting ? '充值中...' : '确认充值'}}</button>
+      </view>
+    </view>
   </block>
 </view>

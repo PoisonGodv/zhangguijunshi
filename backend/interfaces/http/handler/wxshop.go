@@ -371,8 +371,8 @@ func (h *WxshopHandler) GroupbuysActive(c *gin.Context) {
 			ID:         g.ID,
 			Title:      g.Title,
 			PriceCents: g.Params.PriceCents,
-			// original_cents: 无原价字段,降级等于团购价(前端可据此渲染; TODO 补原价)
-			OriginalCents: g.Params.PriceCents,
+			// original_cents: 独立原价字段(B2 §24.6); 0=未设置 → 降级回退团购价
+			OriginalCents: groupbuyOriginalCents(g),
 			Required:      g.RequiredCount,
 			Joined:        joined,
 		})
@@ -477,6 +477,38 @@ func (h *WxshopHandler) Orders(c *gin.Context) {
 	httpx.OK(c, out)
 }
 
+// Order returns one of the caller's own orders (B2 §24.3). Cross-tenant reads and
+// reads of ANOTHER member's order are BOTH indistinguishable from absence (40404,
+// never a leak of another tenant's or member's resource — ARCH-01). Walk-in
+// orders (MemberID=0) are not visible to the C side.
+// GET /v1/wxshop/orders/:id
+func (h *WxshopHandler) Order(c *gin.Context) {
+	m := h.memberFromClaims(c, "")
+	if m == nil {
+		return
+	}
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	if h.billing == nil {
+		// Billing not wired (minimal fixture): single order has no "empty" semantics → 404.
+		httpx.Fail(c, errcode.Err{Code: 40401, Message: "订单不存在", HTTP: 404})
+		return
+	}
+	o, err := h.billing.GetOrder(c.Request.Context(), id) // EnforceTenant inside (cross-tenant → ErrNotFound)
+	if err != nil {
+		httpx.Fail(c, errcode.Err{Code: 40401, Message: "订单不存在", HTTP: 404})
+		return
+	}
+	if o.MemberID != m.ID { // not the caller's order → 404 (absence indistinguishable)
+		httpx.Fail(c, errcode.Err{Code: 40401, Message: "订单不存在", HTTP: 404})
+		return
+	}
+	httpx.OK(c, toOrderDTO(o))
+}
+
 // Balance returns the caller's stored-value (储值) balance, split into the real
 // paid-in balance and the bonus/gift part (CONTRACT §16.8). The member is
 // resolved idempotently from the verified claims; the account is read within
@@ -503,6 +535,49 @@ func (h *WxshopHandler) Balance(c *gin.Context) {
 		"balance_cents": acc.BalanceCents,
 		"gift_cents":    acc.GiftCents,
 	})
+}
+
+// wxRechargeRequest is the C-side 储值充值 request body (B2 §24.4). Named to
+// avoid colliding with the boss-side rechargeRequest in membership.go.
+type wxRechargeRequest struct {
+	AmountCents int64 `json:"amount_cents" binding:"required,min=1"`
+}
+
+// Recharge books the caller's stored-value top-up — SimulateRecharge, the
+// dev/test convenience that directly invokes membership.Recharge (mirrors
+// billing.SimulatePay). It does NOT touch payment/wxpay. The real 微信支付 V3
+// chain (paymentFulfiller SubjectRecharge → Recharge) is already wired in
+// bootstrap/adapters.go but is deferred to 真支付联调; production MUST switch
+// to real wxpay (资金直清 sub_merchant, 反二清 §15.5.3). Returns the
+// membership.RechargeResult (PascalCase, membership domain entity) — the
+// post-recharge balance split + this top-up's amounts.
+// POST /v1/wxshop/member/balance/recharge  {amount_cents}
+func (h *WxshopHandler) Recharge(c *gin.Context) {
+	m := h.memberFromClaims(c, "")
+	if m == nil {
+		return
+	}
+	var req wxRechargeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	res, err := h.membership.Recharge(c.Request.Context(), membership.RechargeInput{
+		MemberID:    m.ID,
+		AmountCents: req.AmountCents,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, errcode.ErrBalanceOver):
+			httpx.Fail(c, errcode.ErrBalanceOver) // 60003 储值余额超过单店上限
+		case errors.Is(err, membership.ErrNotFound):
+			httpx.Fail(c, errcode.Err{Code: 40404, Message: "会员不存在", HTTP: 404})
+		default:
+			httpx.FailError(c, err)
+		}
+		return
+	}
+	httpx.OK(c, res)
 }
 
 // failWxMarketing maps marketing domain errors to HTTP codes (C 端口径).
@@ -537,6 +612,25 @@ func (h *WxshopHandler) failWxGroupbuy(c *gin.Context, err error) {
 	default:
 		httpx.FailError(c, err)
 	}
+}
+
+// groupbuyDesc resolves the C-side 拼团描述: the independent Desc field when set
+// (B2 §24.6), else falls back to Title (降级 — legacy rows have Desc=”).
+func groupbuyDesc(g *groupbuy.Groupbuy) string {
+	if g.Desc != "" {
+		return g.Desc
+	}
+	return g.Title
+}
+
+// groupbuyOriginalCents resolves the C-side 拼团原价: the independent
+// OriginalPriceCents when set (B2 §24.6), else falls back to the 团购价
+// (Params.PriceCents) — legacy rows have OriginalPriceCents=0.
+func groupbuyOriginalCents(g *groupbuy.Groupbuy) int64 {
+	if g.OriginalPriceCents > 0 {
+		return g.OriginalPriceCents
+	}
+	return g.Params.PriceCents
 }
 
 // groupbuyDetailDTO is the C-side 拼团详情, the extended shape of groupbuyDTO
@@ -582,9 +676,9 @@ func (h *WxshopHandler) GroupbuyDetail(c *gin.Context) {
 	httpx.OK(c, groupbuyDetailDTO{
 		ID:            g.ID,
 		Title:         g.Title,
-		Desc:          g.Title, // 本期 desc = title (TODO 独立 desc 字段)
+		Desc:          groupbuyDesc(g), // B2 §24.6: 独立 desc 字段; '' 未设置 → 降级回退 title
 		PriceCents:    g.Params.PriceCents,
-		OriginalCents: g.Params.PriceCents, // 无原价字段,降级=团购价 (CONTRACT §16.4 TODO)
+		OriginalCents: groupbuyOriginalCents(g), // B2 §24.6: 独立原价; 0 未设置 → 降级回退团购价
 		Required:      g.RequiredCount,
 		Joined:        joined,
 		Status:        g.Status,

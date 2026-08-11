@@ -109,6 +109,42 @@ func (h *InventoryHandler) ListMovements(c *gin.Context) {
 	httpx.OK(c, moves)
 }
 
+// ListBatches returns the boss 临期看板 batch list with a pager total. It exposes
+// EVERY status (active/nearing/expired/cleared); the nearing/expired transitions
+// stay owned by the BE-A-09 tag job, this handler only reads them.
+// GET /v1/boss/inventory/batches?store_id=&product_id=&status=&expiry_before=&limit=&offset=
+func (h *InventoryHandler) ListBatches(c *gin.Context) {
+	// store_id uses the raw query (NOT storeScope): empty means ALL of the
+	// tenant's stores, matching the ($2=0 OR store_id=$2) idiom and the
+	// 临期看板 "全量批次" intent (same as catalog ListProducts).
+	f := inventory.BatchFilter{
+		StoreID:   queryInt64(c, "store_id"),
+		ProductID: queryInt64(c, "product_id"),
+		Status:    c.Query("status"),
+		Limit:     int(queryInt64(c, "limit")),
+		Offset:    int(queryInt64(c, "offset")),
+	}
+	if eb := c.Query("expiry_before"); eb != "" {
+		t, err := time.ParseInLocation("2006-01-02", eb, time.Local)
+		if err != nil {
+			httpx.Fail(c, errcode.ErrParam)
+			return
+		}
+		f.ExpiryBefore = &t
+	}
+	items, err := h.svc.ListBatches(c.Request.Context(), f)
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	total, err := h.svc.ListBatchesCount(c.Request.Context(), f)
+	if err != nil {
+		httpx.FailError(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"items": items, "total": total})
+}
+
 // consumeRequest drives a manual FIFO deduction (rare; mainly for testing the
 // stock path outside checkout). Checkout itself consumes via the StockConsumer.
 type consumeRequest struct {

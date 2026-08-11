@@ -81,6 +81,19 @@ type MovementFilter struct {
 	Limit, Offset      int
 }
 
+// BatchFilter narrows a ListBatches query (BE-A, CONTRACT §24.2 临期看板).
+// TenantID is NOT part of the filter: it is resolved from ctx by every
+// repo/service call (ARCH-01) and injected separately. Status filters by the
+// batch status (active/nearing/expired/cleared); empty means all. ExpiryBefore,
+// when non-nil, keeps only lots whose ExpiryDate is set and falls on or before
+// it (the 临期看板 cutoff). Limit<=0 lets the repo apply its own default.
+type BatchFilter struct {
+	StoreID, ProductID int64
+	Status             string
+	ExpiryBefore       *time.Time
+	Limit, Offset      int
+}
+
 // BatchRepo persists batches and movements. Implementations MUST enforce tenant
 // isolation: every method takes tenantID (resolved from ctx) and treats a batch
 // owned by a different tenant as non-existent. The real implementation is
@@ -141,6 +154,25 @@ type StockConsumer interface {
 // tenant isolation: a different tenant's batches are never aggregated.
 type ProductExpirer interface {
 	EarliestExpiryByProduct(ctx context.Context, tenantID, storeID int64) (map[int64]time.Time, error)
+}
+
+// BatchLister is an OPTIONAL repo capability for the boss 临期看板 paged,
+// full-status batch listing (BE-A, CONTRACT §24.2). It is NOT part of BatchRepo
+// (CONTRACT §9.3 fixes BatchRepo's six methods verbatim — same reason
+// StockConsumer / ProductExpirer live apart): it sits behind a separate
+// interface the Service reaches by type assertion, degrading to an empty slice /
+// 0 total when the repo does not provide it (nil-safe, §0 philosophy).
+//
+// Unlike ListActiveBatchesFIFO / ListNearingBatches, ListBatches returns EVERY
+// status (active/nearing/expired/cleared) so the boss 临期看板 can show cleared
+// and expired lots too — it only READS status (the nearing/expired transitions
+// stay owned by the BE-A-09 tag job). ListBatchesCount returns the total
+// matching the filter WITHOUT Limit/Offset, so the pager can render the full
+// count. Every implementation MUST keep tenant isolation: a different tenant's
+// batches are never returned.
+type BatchLister interface {
+	ListBatches(ctx context.Context, tenantID int64, f BatchFilter) ([]*Batch, error)
+	ListBatchesCount(ctx context.Context, tenantID int64, f BatchFilter) (int64, error)
 }
 
 // ProductLookuper is inventory's minimal view of the catalogue (防腐层). The

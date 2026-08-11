@@ -3603,3 +3603,108 @@ services 层：catalog.ts/inventory.ts/membership.ts（A2a）+ billing.ts/market
 - WX V3 真 sub_mch_id 透传 + Apply 字段级 RSA-OAEP。
 - 平台运营聚合维度扩展（GMV/营收等）。
 - 真 PG+Redis 密钥联调跑 migrate。
+
+## 24. B2 后端缺口补齐 + 双端接通（2026-08-11）
+
+关闭 §18.5 / §23.5 显式延后的 6 个后端缺口，前后端真实接通（不再降级占位）。**执行模式**：6-agent 并行 workflow（后端 3 域 + 前端 3 端，文件所有权隔离零冲突）+ 主线程收尾（共享文件 wxshop.go / router.go / bootstrap.go + 全量验证）。**纯加性**：不改任何域既有 Repo 接口签名/既有 service 方法签名/既有 migration；新能力一律走 optional capability interface（仿 inventory `StockConsumer`/`ProductExpirer` 范式，§9.3 BatchRepo 6 方法 verbatim 冻结）。
+
+**C 端储值充值走 SimulateRecharge**（dev/test 便利，对齐 `billing.SimulatePay`；直接调 `membership.Recharge` 入账，不经 payment/wxpay）。真实 wxpay 链路（`paymentFulfiller` SubjectRecharge→Recharge 闭环已在 bootstrap/adapters.go 就位，§19）因属真实支付联调延后——生产环境必须切真实 wxpay（资金直清 sub_merchant，反二清硬约束 §15.5.3），SimulateRecharge 仅 dev/test。
+
+### 24.1 缺口清单与改动量
+| 缺口 | 接口 | 后端域改动 | migration | 前端 |
+|---|---|---|---|---|
+| 1 inventory 批次列表 | `GET /v1/boss/inventory/batches` | inventory 域 + handler | 无（000002 已有列） | admin-web 临期看板 |
+| 2 C端订单详情 | `GET /v1/wxshop/orders/:id` | billing 域 **0 改动**（GetOrder 已有） | 无 | consumer-mp 新建 orders-detail 页 |
+| 3 C端储值充值 | `POST /v1/wxshop/member/balance/recharge` | membership 域 **0 改动**（Recharge 已有） | 无 | consumer-mp balance 充值 UI |
+| 4 catalog 真分页 total | `GET /v1/boss/catalog/products` | catalog 域 + handler | 无 | admin-web 分页器 count→total |
+| 5 groupbuy desc/原价 | `POST /v1/boss/groupbuys`（DTO 加字段） | groupbuy 域 + boss handler | **000024**（新） | C端去降级（handler 内） |
+| 6 me 会员数 | （复用 `/membership/members?page=1&size=1`） | **后端 0 改动** | 无 | merchant-mp me 页路线 A |
+
+### 24.2 inventory 批次列表（缺口 1，BE-A）
+- **新接口**：`GET /v1/boss/inventory/batches?store_id=&product_id=&status=&expiry_before=&limit=&offset=` → `{items:[Batch], total:int64}`（handler 层 DTO，snake_case 键；Batch 实体 PascalCase，boss 端契约）。boss authed 组，`deps.Inventory != nil` 块内。
+- **Batch 实体字段**（无 json tag → PascalCase）：`ID/TenantID/StoreID/ProductID/Quantity/InPriceCents/ExpiryDate *time.Time/ExpiryWarnDate *time.Time/Status/CreatedAt/UpdatedAt`。`Status` ∈ `{active,nearing,expired,cleared}`；`expiry_before` ISO 日期（临期看板筛选用）。**nearing status 由 BE-A-09 tag job 异步打**，本接口只读不写 status。
+- **加性改动**（BatchRepo 6 方法冻结，走 optional capability）：
+  - `inventory.go` 加 `BatchFilter{StoreID,ProductID int64; Status string; ExpiryBefore *time.Time; Limit,Offset int}` + `BatchLister interface{ ListBatches(ctx,tenantID,f) ([]*Batch,error); ListBatchesCount(ctx,tenantID,f) (int64,error) }`（或合一 `ListBatchesPage` 返 `{Items,Total}`）。
+  - `memory_repo.go`：加 `ListBatches`/count（扫 `r.batches` 过滤 + sort by id；count 双趟或一遍计数）。
+  - `pg_repo.go`：加 `sqlBatchList`（`WHERE tenant_id=$1 AND ($2=0 OR store_id=$2) AND ($3=0 OR product_id=$3) AND ($4='' OR status=$4) AND ($5::date IS NULL OR expiry_date<=$5) ORDER BY id LIMIT $6 OFFSET $7`，复用 `scanBatch`）+ `sqlBatchListCount`（同 WHERE 去 LIMIT/OFFSET）+ 方法（queryer type-assert + nil-pool 返空 slice/0）。
+  - `service.go`：加 `ListBatches(ctx,f) ([]*Batch,error)` + count（EnforceTenant + type-assert `s.repo.(BatchLister)`，nil-safe 降级空 slice，仿 `EarliestExpiryByProduct`）。
+  - `handler/inventory.go`：加 `ListBatches(c)` 读 query + `httpx.OK(c, gin.H{"items":items, "total":total})`。
+- **migration**：无（inventory_batches 表 000002 L85-119 已含全部列 + `idx_inv_tenant_store`）。
+- **测试**：`service_test.go` 加 ListBatches（过滤/分页/cross-tenant 空/nil-safe）；`pg_repo_test.go` 加 ListBatches happy/empty/filter/nil-pool + count（pgxmock 照 inventory/pg_repo_test.go 样板）。
+
+### 24.3 C端订单详情（缺口 2，BE-B）
+- **新接口**：`GET /v1/wxshop/orders/:id` → `orderDTO`（snake_case，复用现有 `toOrderDTO` mapper，已剥离 `CostCents/MemberID/TenantID/StoreID/OperatorID/DiscountCents/PaymentRef`）。wxshop authed 组。
+- **billing 域 0 改动**：`Service.GetOrder(ctx,id)`（L362）+ `OrderRepo.GetByID`（L74）已存在，内部 EnforceTenant（跨租户→ErrNotFound）。
+- **wxshop.go 加 `Order(c)` handler**（命门越权校验）：
+  1. `memberFromClaims(c, "")` 取调用者 member（idempotent Join）；
+  2. `h.billing.GetOrder(ctx, id)`（billing==nil 降级 40404）；
+  3. **`if order.MemberID != m.ID { → 40404 }`**——非本人订单不暴露存在性（与 groupbuy/coupon C 端 "absent indistinguishable from foreign" 一致）；walk-in（MemberID=0）对 C 端不可见；
+  4. `httpx.OK(c, toOrderDTO(order))`；`billing.ErrNotFound`→40404。
+- **migration**：无（orders 表 000003）。
+- **响应 shape**（C 端 orderDTO，snake_case）：`{id, order_no, status, total_cents, paid_cents, channel?, payment_method?, created_at, paid_at?, items:[orderItemDTO]}`；orderItemDTO：`{name, unit, qty, price_cents}`（已剥 ProductID/CostCents）。
+
+### 24.4 C端储值充值 SimulateRecharge（缺口 3，BE-C）
+- **新接口**：`POST /v1/wxshop/member/balance/recharge`，body `{amount_cents:int64}`（binding `required,min=1`）→ `RechargeResult`（PascalCase：`MemberID/BalanceCents/GiftCents/RechargedCents/GiftedCents`，membership 域实体无 json tag，与 boss 端 `/membership/members/:id/recharge` 同形）。wxshop authed 组。
+- **membership 域 0 改动**：`Service.Recharge(ctx, RechargeInput)`（L301）已存在（EnforceTenant→amount>0→member 存在 active→rechargeAtomic cap 校验 `ErrBalanceOver`→60003→入账+档位 gift）。
+- **wxshop.go 加 `Recharge(c)` handler**：
+  1. `memberFromClaims(c, "")` 取 member（同时验 active）；
+  2. `h.membership.Recharge(ctx, membership.RechargeInput{MemberID: m.ID, AmountCents: req.AmountCents})`（wxshop 已注入 membership，无需加 payment）；
+  3. 错误映射：`membership.ErrBalanceOver`→60003、`ErrNotFound`→40404；成功 `httpx.OK(c, result)`。
+  - 文件头/注释标注「dev/test 便利（对齐 SimulatePay）；真实 wxpay 链路（paymentFulfiller SubjectRecharge→Recharge 闭环已就位）延后到支付联调；生产必须切真实 wxpay 反二清」。
+- **migration**：无（member_balance_accounts 000004）。
+- **RegionCap 上限**：由 `rechargeAtomic` 自动校验，breach→60003（与 boss 端一致）。
+
+### 24.5 catalog 真分页 total（缺口 4，BE-D）
+- **契约变更**：`GET /v1/boss/catalog/products?...` 响应从 `{items, count}` 改 `{items, total}`（`count` 曾 = `len(本页)`）。**admin-web 分页器同步改字段名 count→total**。
+- **加性改动**（ProductRepo 6 方法冻结，走 optional capability）：
+  - `catalog.go` 加 `ProductLister interface{ ListPage(ctx,tenantID,f) (ListProductsResult, error) }` + `ListProductsResult{ Items []*Product; Total int64 }`。
+  - `memory_repo.go`：加 `ListPage`（scan all→filter→count 一趟 + 切 offset/limit 一趟）。
+  - `pg_repo.go`：加 `sqlProductListCount`（`SELECT COUNT(*) FROM products WHERE tenant_id=$1 AND ($2=0 OR store_id=$2) AND ($3='' OR category=$3) AND ($4='' OR position($5 in name) OR position($6 in barcode)) AND deleted_at IS NULL`，同 `sqlProductList` WHERE 去 ORDER/LIMIT/OFFSET）+ `ListPage`（queryer type-assert + 两次 Query；nil-pool 降级）。
+  - `service.go`：加 `ListPage(ctx,f)`（EnforceTenant + type-assert `s.repo.(ProductLister)`，nil-safe 降级到 `List`+total=len）。
+  - `handler/catalog.go`：`ListProducts` 内部改走 `ListPage`，返 `{items,total}`（handler 签名/路由不变）。
+- **顺带**：`sqlProductList` 补 `AND deleted_at IS NULL`（products 软删，现有遗漏）——改既有 SQL 常量字符串，`pg_repo_test.go` 用 `sqlProductList` 常量引用则自动跟随，硬编码字符串需同步改。
+- **分页参数**：沿用现有 `?limit=&offset=`（或兼容 `?page=&size=`，与 membership handler 一致；handler 兼容两者）。
+- **migration**：无（products 000002）。
+
+### 24.6 groupbuy desc/原价字段（缺口 5，BE-E）
+- **migration 000024_groupbuy_desc_original**（新）：
+  ```sql
+  ALTER TABLE groupbuys ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+  ALTER TABLE groupbuys ADD COLUMN IF NOT EXISTS original_price_cents BIGINT NOT NULL DEFAULT 0;
+  COMMENT ON COLUMN groupbuys.description IS '拼团独立描述文案(空=回退 title)';
+  COMMENT ON COLUMN groupbuys.original_price_cents IS '原价(分),0=未设置(前端回退=团购价)';
+  ```
+  down 删两列。NOT NULL + DEFAULT 保证旧行回退（desc=''→前端降级 title；original=0→降级团购价）。
+- **Groupbuy struct 加字段**（PascalCase，boss 加性）：`Desc string` + `OriginalPriceCents int64`（无 json tag）。**`GroupbuyParams` 不动**（JSONB 弹性参数，desc/original 是独立业务列，不进 params）。
+- **CreateInput 加字段**：`Desc string` + `OriginalPriceCents int64`；`Service.Create` 透传写入 struct。
+- **pg_repo.go**：`sqlGBCreate` INSERT 加 `description, original_price_cents`（15 列）；`scanGroupbuy` scan 加 `&g.Desc, &g.OriginalPriceCents`；**所有 `sqlGB*GetByID/ListActive*/ListByStrategy/UpdateStatus/JoinIncr` SELECT 常量加两列** → `pg_repo_test.go` 所有 `ExpectQuery` 同步（用 `sqlGB*` 常量引用则自动跟随）。
+- **boss handler**：`createGroupbuyRequest` DTO 加 `Desc string json:"desc"` + `OriginalPriceCents int64 json:"original_price_cents"`（boss DTO snake_case）；Create 透传。
+- **C 端去降级**（wxshop.go，主线程做）：`groupbuyDTO.OriginalCents` = `g.OriginalPriceCents`（0 时 fallback `g.Params.PriceCents`）；`groupbuyDetailDTO.Desc` = `g.Desc`（空时 fallback `g.Title`）；`groupbuyDetailDTO.OriginalCents` 同理。groupbuyDTO/groupbuyDetailDTO shape 不变（向后兼容）。
+- **memory seed**：seed_demo.sql 无 groupbuy，不涉及。
+
+### 24.7 me 会员数（缺口 6，前端路线 A，后端 0 改动）
+- merchant-mp me 页加 `getMemberCount(): Promise<number>` → `GET /v1/boss/membership/members?page=1&size=1` 取 `total`（ListMembersPage §17.11 已返 `{items,total}`）。
+- 后端 **0 改动**；me.ts `load()` 加第 4 路并发，新增 `applyMemberCount(total)` setData `memberCountText: String(total)`，删 `applySummary` 硬编码 `'—'`。
+
+### 24.8 路由接线（主线程收尾，interfaces/http/router.go）
+- `boss.GET("/inventory/batches", h.ListBatches)`（L191 inventory 块，`deps.Inventory != nil`）
+- `authed.GET("/orders/:id", h.Order)`（wxshop，L305 `/orders` 后）
+- `authed.POST("/member/balance/recharge", h.Recharge)`（wxshop，L298 `/member/balance` 后）
+- catalog `/catalog/products` 路由不变（handler 内部改）；groupbuy boss Create 路由不变（DTO 加字段）
+- **wxshop handler 构造**（L294 `NewWxshopHandler`）：走 SimulateRecharge 不需加 Payment 参数（复用已注入的 membership）
+- `/membership/summary` 本期**不做**（路线 A 复用 list）
+
+### 24.9 前端 tsc 基础设施（前置，已落地）
+- 双 mp 建 `package.json` + `tsconfig.json`：`typescript@5.5.4` + `miniprogram-api-typings@5.2.3`，strict + noEmit，lib ES2020（Promise.allSettled）。consumer-mp npm install 新装；merchant-mp 降级 typescript@7.0.2→5.5.4（TS7 移除 moduleResolution=node10，行为不可预期）。
+- consumer-mp 加 `types/globals.d.ts`（`declare const global: any`，app.ts 埋点劫持 Page 用）。
+- **三端基线全绿**：merchant-mp/consumer-mp `tsc --noEmit` 0 错；admin-web `npm run typecheck` 0 错。
+
+### 24.10 验证（主线程收尾）
+- `cd backend && go build ./...` + `go test -race ./... -count=1`（含 inventory/catalog/groupbuy pgxmock 新测）+ `gofmt`/`go vet` clean。
+- admin-web `npm run typecheck` + `npm run build`；consumer-mp/merchant-mp `tsc --noEmit` 0 错。
+
+### 24.11 仍延后（不在 B2）
+- C 端真实 wxpay 充值链路（paymentFulfiller 闭环已就位，待真实支付联调 + 真 sub_merchant）。
+- `POST /v1/track/batch` 埋点批量上报。
+- groupbuy memory seed（seed_demo.sql 无 groupbuy）。
+- 真 PG+Redis 联调（本期 pgxmock）；WX V3 真 sub_mch_id 透传 + Apply 字段级 RSA-OAEP。

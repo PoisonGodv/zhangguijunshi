@@ -3,8 +3,8 @@
 // 对齐 backend/interfaces/http/handler/catalog.go + internal/catalog/catalog.go:
 //   - Product 结构体无 json tag → 序列化为 PascalCase 字段名本身。
 //   - 金额字段 CostCents/PriceCents 单位为分 (int64)。
-//   - ListProducts 响应为 handler 内联 gin.H{"items":..,"count":..} (snake_case 键),
-//     count 仅为本次返回条数 (len), 非全量 total → 前端按全量拉取后分页。
+//   - ListProducts 响应为 handler 内联 gin.H{"items":..,"total":..} (snake_case 键;
+//     CONTRACT §24.5 起 count(本次条数) → total(全量真分页))。
 //   - UpdateProductPrice 走 PATCH (request.ts 的 api 仅暴露 get/post/put/del,
 //     这里复用 default client 的 patch, 与响应拦截器同一 envelope 解包链路)。
 
@@ -30,10 +30,10 @@ export interface Product {
   UpdatedAt: string
 }
 
-/** ListProducts 响应 (handler gin.H 包装, snake_case 键; count=本次条数, 非 total) */
+/** ListProducts 响应 (handler gin.H 包装, snake_case 键; CONTRACT §24.5: total=全量条数) */
 export interface ProductListResp {
   items: Product[]
-  count: number
+  total: number
 }
 
 export interface ProductListParams {
@@ -63,7 +63,7 @@ export interface UpdatePriceBody {
   price_cents: number
 }
 
-/** GET /v1/boss/catalog/products — 商品列表 (后端无真分页 total, 建议大 limit 前端分页) */
+/** GET /v1/boss/catalog/products — 商品列表 (CONTRACT §24.5 起响应含真分页 total) */
 export function getProducts(params?: ProductListParams): Promise<ProductListResp> {
   return api.get<ProductListResp>('/boss/catalog/products', { params })
 }
