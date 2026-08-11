@@ -128,8 +128,8 @@ services:
   backend-worker:
     # Async job consumer (CONTRACT §19): drains the Redis Stream (pregen
     # incremental refresh + deferred reach sends). Reuses the backend image with
-    # a different entrypoint. No HTTP port, no healthcheck (it is a pure loop);
-    # restart policy keeps it alive. Exits 0 cleanly when Redis is absent.
+    # a different entrypoint. Now exposes a minimal /healthz on :8091 (§25.4) so
+    # a dead/wedged worker is visible to compose. Exits 0 cleanly when Redis absent.
     image: zhanggui-junshi-backend:latest
     build:
       context: ../../backend
@@ -149,6 +149,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Liveness probe against the worker's /healthz (§25.4). Not /readyz — the
+    # worker has no DB-readiness concept; process-alive is the signal.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --tries=1 --timeout=3 http://127.0.0.1:8091/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks: [zg-net]
 

@@ -109,6 +109,9 @@ payment:
   # present the wiring builds the REAL V3 client (internal/payment/v3*.go);
   # otherwise it falls back to FakeWxPay (which never networks). private_key_pem
   # (inline) and private_key_file (mounted path) are mutually exclusive; PEM wins.
+  # MVP (计划书 §4.2.5): 砍在线支付(资质重阻塞 PMF) —— enabled=false, 路由不注册,
+  # 代码/密钥保留待用. V1 资质到位后把 enabled 设 true 并补齐下列密钥即恢复.
+  enabled: false
   mch_id: ${ZG_PAYMENT_MCH_ID}
   api_v3_key: ${ZG_PAYMENT_API_V3_KEY}
   cert_serial: ${ZG_PAYMENT_CERT_SERIAL}
@@ -117,6 +120,11 @@ payment:
   notify_url: ${ZG_PAYMENT_NOTIFY_URL}
   base_url: ${ZG_PAYMENT_BASE_URL}
   timeout: "10s"
+
+subscription:
+  # MVP (计划书 §4.2.5): 订阅付费墙不启用, 全免费 L1 —— enabled=false, FeatureGate
+  # 全放行 + /subscription 路由不注册. V1 接真实计费后设 true 恢复三档付费墙.
+  enabled: false
 
 job_queue:
   # prod: Redis Stream job queue shared by the worker binary + in-process

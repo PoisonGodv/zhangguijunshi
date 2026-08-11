@@ -86,6 +86,12 @@ type Deps struct {
 	// M4-S1 payment / subscription (nil in the minimal test fixture).
 	Payment      *payment.Service
 	Subscription *subscription.Service
+	// PaymentEnabled / SubscriptionEnabled gate the surfaces in MVP
+	// (CONTRACT §25.1/§25.2, 计划书 §4.2.5): when false the /payment,
+	// /wxshop/payment/notify and /subscription routes are NOT registered even
+	// though the domain services are assembled (code 保留待用, V1 flips on).
+	PaymentEnabled      bool
+	SubscriptionEnabled bool
 	// FE-MP-02 store domain (C-side 门店列表; nil in the minimal test fixture).
 	StoreSvc *store.Service
 	// M8-B platform-ops cross-tenant READ-ONLY aggregate (CONTRACT §23). nil in
@@ -126,8 +132,9 @@ func New(deps Deps) *gin.Engine {
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// M4-S1 WeChat-pay notify: unauthenticated callback (tenant recovered from
-	// the out_trade_no in the body, CONTRACT §15.7).
-	if deps.Payment != nil {
+	// the out_trade_no in the body, CONTRACT §15.7). MVP gates the whole payment
+	// surface off (§25.1): notify is not registered when PaymentEnabled=false.
+	if deps.Payment != nil && deps.PaymentEnabled {
 		ph := handler.NewPaymentHandler(deps.Payment)
 		r.POST("/v1/wxshop/payment/notify", ph.Notify)
 	}
@@ -249,7 +256,10 @@ func wireBoss(r *gin.Engine, deps Deps) {
 			boss.GET("/aiengine/strategies/:id/attribution", h.GetAttribution)
 		}
 	}
-	if deps.Payment != nil {
+	// M4-S1 payment + subscription surfaces: hidden in MVP (CONTRACT §25.1/§25.2,
+	// 计划书 §4.2.5 砍支付/付费墙不启用). The domain services stay assembled
+	// (code 保留待用); the routes are only registered when the config gate is on.
+	if deps.Payment != nil && deps.PaymentEnabled {
 		ph := handler.NewPaymentHandler(deps.Payment)
 		boss.POST("/payment/sub-merchants", ph.ApplySubMerchant)
 		boss.GET("/payment/sub-merchants", ph.ListSubMerchants)
@@ -258,7 +268,7 @@ func wireBoss(r *gin.Engine, deps Deps) {
 		boss.GET("/payment/payments/:id", ph.GetPayment)
 		boss.GET("/payment/ledger", ph.ListLedger)
 	}
-	if deps.Subscription != nil {
+	if deps.Subscription != nil && deps.SubscriptionEnabled {
 		sh := handler.NewSubscriptionHandler(deps.Subscription)
 		boss.GET("/subscription", sh.GetSubscription)
 		boss.POST("/subscription", sh.Subscribe)

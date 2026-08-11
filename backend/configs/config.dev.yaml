@@ -100,3 +100,9 @@ multitenancy:
   # boss/admin surfaces without logging in first (M5 added real login, but dev
   # keeps the mock-header fallback for quick manual testing). False in staging/prod.
   dev_mock_header: true
+
+# MVP 无支付版(计划书 §4.2.5): 支付/付费墙默认下架(代码保留待用, V1 启用).
+payment:
+  enabled: false
+subscription:
+  enabled: false

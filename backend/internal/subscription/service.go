@@ -60,6 +60,15 @@ func (s *Service) GetSubscription(ctx context.Context) (*Subscription, error) {
 // Gate exposes the FeatureGate for handler/middleware paywall checks.
 func (s *Service) Gate() *FeatureGate { return s.gate }
 
+// WithGate swaps the FeatureGate (bootstrap wires the disabled MVP gate when
+// subscription.enabled=false, CONTRACT §25.2). Additive; the default NewService
+// gate (enforced) is unchanged for V1.
+func (s *Service) WithGate(g *FeatureGate) { s.gate = g }
+
+// Store exposes the underlying SubscriptionStore (bootstrap needs it to build
+// the disabled FeatureGate over the same store, §25.2).
+func (s *Service) Store() SubscriptionStore { return s.store }
+
 // ExpireDue transitions every active subscription past its period end to
 // expired (CONTRACT §15.8), returning the count affected. It is a GLOBAL batch
 // operation run by the cron binary — unlike the per-tenant methods it does NOT

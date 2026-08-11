@@ -3708,3 +3708,63 @@ services 层：catalog.ts/inventory.ts/membership.ts（A2a）+ billing.ts/market
 - `POST /v1/track/batch` 埋点批量上报。
 - groupbuy memory seed（seed_demo.sql 无 groupbuy）。
 - 真 PG+Redis 联调（本期 pgxmock）；WX V3 真 sub_mch_id 透传 + Apply 字段级 RSA-OAEP。
+
+## 25. MVP 无支付版收尾（2026-08-11，对齐计划书 §4.2.5 ⭐）
+
+对齐计划书 4.2.5「MVP 砍掉在线支付」决策（微信支付服务商进件资质门槛重、周期长、阻塞 PMF）。M4-S1 已建的支付/反二清/付费墙代码**保留待用、配置层不挂载、路由层隐藏**，等资质到位（V1）再启用。本节为 MVP 支付收敛的权威实现约定。
+
+**执行模式**：多-agent 并行（后端 / 三端前端 / 运维 / 数据手册 / 批量录入），文件所有权隔离；config/bootstrap/router 等共享文件由主线程收尾。
+
+### 25.1 支付下架（后端，路由隐藏）
+- **新增 `PaymentConfig.Enabled bool`**（`mapstructure:"enabled"`，默认 false）。`pkg/config/config.go` `SetDefaults` 加 `payment.enabled=false`。
+- **装配不变**（Payment service 仍在 deps，内存库已建，FakeWxPay 兜底 —— 代码保留待用）。
+- **路由隐藏**：router.go 的 `if deps.Payment != nil` 两块（boss `/payment/*` 六个端点 + `POST /v1/wxshop/payment/notify`）改为 `if deps.Payment != nil && deps.PaymentEnabled`。`Deps` 加 `PaymentEnabled bool`（main.go 从 cfg.Payment.Enabled 填）。
+- **dev.yaml / staging / prod** 均 `payment.enabled: false`（MVP 下架）；`.env.example` 的支付密钥段标注「MVP 下架,V1 资质到位再启用」。
+- **结果**：MVP 起栈后 `/v1/boss/payment/*`、`/v1/wxshop/payment/notify` → 404（路由不注册）；域代码/测试/迁移不动，V1 打开开关即恢复。
+
+### 25.2 订阅付费墙下架（后端）
+- **新增 `SubscriptionConfig.Enabled bool`**（默认 false）。router.go `if deps.Subscription != nil` 块（`/subscription`、`/subscription/check`）同样 gate。
+- **FeatureGate 全免费放行**：MVP 三档 plan 矩阵的免费版（free）对 `ai_advice` 等 gate 默认放行——`subscription.gate` 在 `!enabled` 时 `Allows` 恒 true（或 service 层 Short-circuit），MVP 全免费（计划书：订阅付费墙不启用，全免费 L1）。付费墙代码保留，V1 启用。
+- **m4s1 冒烟测试**（`interfaces/http/m4s1_test.go` ⑥付费墙断言 free denied）在 enabled=false 下需适配：测试以 enabled=true 显式构造（付费墙逻辑仍验证），或跳过。主线程统一处理。
+
+### 25.3 店员手动充值入口（merchant-mp 新页，计划书「储值=店员手动充值」）
+- **后端零改动**：boss `POST /v1/boss/membership/members/:id/recharge` 已就绪（membership.Recharge + 档位 gift + RegionCap 60003）。
+- **merchant-mp 新建 `pages/recharge/recharge.{ts,wxml,wxss,json}`**：店员给会员加余额。
+  - 会员选择：输入手机号/会员ID 搜索（`GET /v1/boss/membership/members?q=` 复用 list）→ 选中会员。
+  - 金额输入：预设档位（充200送20/充500送80/充1000送200，对齐 membership `GiftForAmount`）+ 自定义金额 + 显示赠送金额预览。
+  - 提交：`POST /v1/boss/membership/members/:id/recharge` {amount_cents}，成功后显示新余额 + 赠送明细（RechargeResult PascalCase）；失败 ApiError 中文 toast（60003 上限 / 40404 会员不存在）。
+  - 登录守卫（B1 真登录）；me 页或 billing 页加入口。
+  - app.json 注册新页。request.ts 加 `searchMembers(q)` + `rechargeMember(id, amountCents)`。
+- **admin-web 已有会员充值 ModalForm**（membership/members 页，B2 已接通）——店员手动充值在 admin 端已可用，本轮补 merchant-mp 端（手机端店员主战场）。
+- **C 端 SimulateRecharge 保留**（§24.4，用户确认两者都保留）：consumer-mp balance 页充值入口保留，标注 dev/test 便利。
+
+### 25.4 worker 健康检查（运维）
+- **worker 加 HTTP 健康端点**：cmd/worker/main.go 起一个轻量 `/healthz`（net/http，独立端口如 `:8091` 或与 api 区分；或复用 cfg 配 health_port）。worker 是纯 jobqueue 消费 loop（无 HTTP），需最小起一 goroutine `http.ListenAndServe` 响应 200 {status:alive}；Readiness 可返回 jobqueue consumer 是否 running。
+- **compose 加 healthcheck**：infra/compose/docker-compose.prod.yml（+ local）的 worker 服务加 `healthcheck: test: wget -qO- http://localhost:8091/healthz`（对齐 api 的 /healthz 范式）；cron 同理（cron 也无健康端点，一并加或至少 worker）。
+- 解决「worker 容器无 healthcheck，线上挂了无感知」（计划书剩余清单 🟡）。
+
+### 25.5 seed 真实样板店 + onboarding 手册（数据/文档）
+- **migrations_seed/seed_demo.sql 扩充**：当前 168 行（21 单近 7 天 dashboard）。补「真实样板店」：一个完整可演示租户（商品 10-20 SKU 带分类/库存批次含临期、会员 5-10 带储值余额/积分、券模板、拼团示例、近 7 天订单流水、AI strategy 示例）——让首店开箱即有真实数据可看（onboarding 验收）。
+- **onboarding 上手手册**：新建 `docs/onboarding.md`（或 README 节）——首店上手 SOP：开通→登录（B1 真登录）→录商品→录会员→AI 今日3件事→一键执行→顾客领券入会→会员码核销→店员手动充值→当日小结，配 dev 起栈步骤（deploy.md 引用）+ dev 演示账号。
+- 计划书剩余清单 🟡「seed 真实样板店 + onboarding 手册」。
+
+### 25.6 商品批量录入提速（计划书 🔴，工作量最大）
+- **后端**：catalog 加批量导入。
+  - `POST /v1/boss/catalog/products/import`（CSV 上传或 JSON 数组批量）。最简：JSON 数组 `[{name,price_cents,cost_cents,barcode?,category?,unit?},...]` 一次建多品（事务/逐条 best-effort + 返回成功/失败明细）；CSV 解析（multipart）为加分项。
+  - catalog.Service 加 `ImportBatch(ctx, items []ProductInput) (ImportResult, error)`（加性 optional 或 service 直加）；repo 复用 Create（逐条）；返回 `{imported, failed, errors:[{row,reason}]}`。
+  - 跳过扫码建品 OCR（计划书：延后）。
+- **admin-web 商品页加批量导入入口**：`Upload.Dragger`（CSV）或粘贴 JSON/Excel 文本区 → 预览 → 调 import 接口 → 显示导入结果（成功 N / 失败 M 明细）。复用 ProTable + ModalForm 范式。
+- 解决「现仅 admin 手工表单；MVP 至少批量录入/Excel 导入」（扫码建品 OCR 延后）。
+
+### 25.7 显式延后（V1+，不在本轮）
+- 在线收款（微信支付服务商进件/反二清）、支付宝 ISV。
+- 企微活码/社群 SOP/SCRM。
+- 增值订阅付费墙实际收费、供应链/广告变现池、供应商/外卖对账。
+- 扫码建品 OCR。
+- reach 订阅消息模板 ID 申请（🟡 行政项，需真实小程序后台，本轮代码已 ready）。
+
+### 25.8 验证（主线程收尾）
+- `go build ./...` + `go test -race ./...` 全绿（付费墙 m4s1 测试适配 enabled）；gofmt/vet clean。
+- MVP 起栈（payment.enabled=false）：`/v1/boss/payment/*`、`/v1/wxshop/payment/notify`、`/v1/boss/subscription/*` → 404；业务接口（catalog/inventory/membership/billing/groupbuy/aiengine）正常。
+- merchant-mp / consumer-mp / admin-web `tsc --noEmit` 0 错；admin-web `npm run build` 通过。
+- 店员手动充值（merchant-mp 新页）+ 批量导入（admin）+ worker healthcheck 可起栈验证。

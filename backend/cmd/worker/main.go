@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -49,6 +50,32 @@ import (
 // idle loop paces itself on the XREADGROUP BLOCK (cfg.JobQueue.Block); the pump
 // paces on its sweep interval. A few seconds is generous for both.
 const shutdownGrace = 5 * time.Second
+
+// healthAddr is the worker's liveness endpoint listener (CONTRACT §25.4). The
+// worker is otherwise a pure jobqueue consumer with no HTTP surface, so a dead
+// container would be invisible to compose/orchestration. A minimal /healthz lets
+// `docker compose` healthcheck (and any uptime probe) detect a wedged worker.
+// Distinct port from the api (:8080) and cron (:8092).
+const healthAddr = ":8091"
+
+// serveHealth exposes a minimal liveness endpoint for the worker (a pure
+// consumer loop with no other HTTP surface). Returns the server so run can
+// shut it down alongside the consumer/pump on signal.
+func serveHealth(log *zap.Logger) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"alive"}`))
+	})
+	srv := &http.Server{Addr: healthAddr, Handler: mux, ReadHeaderTimeout: 3 * time.Second}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Warn("worker healthz server stopped", zap.Error(err))
+		}
+	}()
+	return srv
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -102,6 +129,14 @@ func run() error {
 	// them at RunAt (CONTRACT §20.3). Same cfg.JobQueue so producer (api) and
 	// pump (worker) resolve the same stream + delay lane.
 	pump := jobqueue.NewDelayPump(cmdable, cfg.JobQueue)
+
+	// Liveness endpoint (§25.4): a dead/wedged worker is otherwise invisible.
+	healthSrv := serveHealth(log)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = healthSrv.Shutdown(ctx)
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

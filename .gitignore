@@ -71,3 +71,10 @@ Thumbs.db
 
 # ---- Logs ----
 *.log
+
+# Go build artifacts (cmd/* binaries leak into backend/ when built without -o)
+/backend/api
+/backend/worker
+/backend/cron
+/backend/migrate
+/backend/llmbench

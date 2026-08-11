@@ -25,6 +25,15 @@ type Config struct {
 	JobQueue     JobQueueConfig     `mapstructure:"job_queue"`
 	Scheduler    SchedulerConfig    `mapstructure:"scheduler"`
 	Multitenancy MultitenancyConfig `mapstructure:"multitenancy"`
+	Subscription SubscriptionConfig `mapstructure:"subscription"`
+}
+
+// SubscriptionConfig configures the plan paywall (CONTRACT §25.2). MVP runs
+// with Enabled=false (计划书 §4.2.5: 订阅付费墙不启用, 全免费 L1) — the
+// FeatureGate passes every feature through, and the /subscription routes are
+// not registered. Flip Enabled=true in V1 (with real billing) to revive.
+type SubscriptionConfig struct {
+	Enabled bool `mapstructure:"enabled"` // MVP: false (paywall off, all-free)
 }
 
 type AppConfig struct {
@@ -157,6 +166,12 @@ type COSConfig struct {
 // (inline) and PrivateKeyFile (path) are mutually exclusive; PEM wins when both
 // are set.
 type PaymentConfig struct {
+	// Enabled gates the payment surface (CONTRACT §25.1). MVP runs with false
+	// (计划书 §4.2.5: 砍在线支付, 资质重阻塞 PMF) — the /payment routes and the
+	// wxshop payment-notify endpoint are NOT registered, even though the domain
+	// code/repos/FakeWxPay stay assembled (保留待用). Flip to true in V1 once the
+	// 微信支付服务商 资质 is in and the V3 credentials below are populated.
+	Enabled         bool          `mapstructure:"enabled"`
 	MchID           string        `mapstructure:"mch_id"`            // 服务商商户号
 	APiv3Key        string        `mapstructure:"api_v3_key"`        // APIv3 密钥 (AES-GCM 解密 resource + 证书)
 	CertSerial      string        `mapstructure:"cert_serial"`       // 商户 API 证书序列号

@@ -187,7 +187,16 @@ func SetDefaults(v *viper.Viper) {
 
 	// Payment (WeChat Pay V3): no creds by default → wiring keeps FakeWxPay
 	// (dev/test never network). Only a timeout has a safe built-in.
+	// Enabled gates the whole payment surface (CONTRACT §25.1): MVP runs false
+	// (计划书 §4.2.5 砍在线支付) — routes are not registered though the domain
+	// code stays assembled. V1 flips it true once the 资质 is in.
+	v.SetDefault("payment.enabled", false)
 	v.SetDefault("payment.timeout", 10*time.Second)
+
+	// Subscription paywall (CONTRACT §25.2): MVP runs false (全免费 L1,
+	// 计划书 §4.2.5 付费墙不启用) — FeatureGate passes every feature through
+	// and /subscription routes are not registered. V1 flips true with billing.
+	v.SetDefault("subscription.enabled", false)
 
 	// Job queue (Redis Stream): sane built-ins; the queue is effectively
 	// disabled when the Redis client is nil (dev without Redis).

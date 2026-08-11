@@ -55,7 +55,13 @@ func newM4S1Router() (*gin.Engine, *billing.Service, *membership.Service, *payme
 		Membership:   mbrSvc,
 		Payment:      paySvc,
 		Subscription: subSvc,
-		DevMock:      true,
+		// m4s1 tests exercise the payment/paywall logic itself, so they run with
+		// the surfaces ENABLED (V1). In MVP the binary defaults these to false
+		// (CONTRACT §25.1/§25.2) and the routes stay hidden — that is verified
+		// separately, not here.
+		PaymentEnabled:      true,
+		SubscriptionEnabled: true,
+		DevMock:             true,
 	})
 	return r, billSvc, mbrSvc, paySvc, subSvc, memberRepo
 }

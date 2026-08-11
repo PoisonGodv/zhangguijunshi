@@ -386,7 +386,13 @@ func BuildServices(ctx context.Context, cfg *config.Config, log *zap.Logger, inf
 
 	// ---- M4-S1 payment + subscription (CONTRACT §15). Real V3 client when the
 	// merchant credentials are configured, else the deterministic FakeWxPay. ----
+	// MVP 付费墙下架 (§25.2, 计划书 §4.2.5): subscription.enabled=false → the
+	// FeatureGate is disabled (全免费, Can/Require pass through). V1 flips the
+	// config gate to true to enforce the plan matrix again.
 	subscriptionSvc := subscription.NewService(subscription.NewMemoryStore())
+	if !cfg.Subscription.Enabled {
+		subscriptionSvc.WithGate(subscription.NewDisabledFeatureGate(subscriptionSvc.Store()))
+	}
 	s.Subscription = subscriptionSvc
 	var (
 		paySubMerchantRepo payment.SubMerchantRepo = payment.NewMemorySubMerchantRepo()

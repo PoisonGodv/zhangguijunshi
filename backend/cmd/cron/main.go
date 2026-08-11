@@ -16,6 +16,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -27,6 +28,31 @@ import (
 	"github.com/zhangguijunshi/backend/internal/bootstrap"
 	"github.com/zhangguijunshi/backend/pkg/config"
 )
+
+// healthAddr is the cron binary's liveness endpoint listener (CONTRACT §25.4).
+// cron is a pure scheduler loop with no HTTP surface; a minimal /healthz lets
+// compose healthcheck detect a dead/wedged cron. Distinct port from api (:8080)
+// and worker (:8091).
+const healthAddr = ":8092"
+
+// serveHealth exposes a minimal liveness endpoint for the cron binary (a pure
+// scheduler loop with no other HTTP surface). Returns the server so run can
+// shut it down on signal.
+func serveHealth(log *zap.Logger) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"alive"}`))
+	})
+	srv := &http.Server{Addr: healthAddr, Handler: mux, ReadHeaderTimeout: 3 * time.Second}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Warn("cron healthz server stopped", zap.Error(err))
+		}
+	}()
+	return srv
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -88,6 +114,14 @@ func run() error {
 	log.Info("cron binary started",
 		zap.Int("non_pregen_entries", len(c.Entries())),
 		zap.String("location", loc.String()))
+
+	// Liveness endpoint (§25.4): a dead/wedged cron is otherwise invisible.
+	healthSrv := serveHealth(log)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = healthSrv.Shutdown(ctx)
+	}()
 
 	// ---- block until signalled, then graceful stop. ----
 	stop := make(chan os.Signal, 1)
