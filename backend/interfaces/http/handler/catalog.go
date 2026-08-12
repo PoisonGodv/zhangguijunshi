@@ -131,6 +131,51 @@ func (h *CatalogHandler) GetProductByBarcode(c *gin.Context) {
 	httpx.OK(c, p)
 }
 
+// importProductsRequest is the batch-import body (CONTRACT §25.6). Items reuse
+// the single-create DTO so the per-row contract is identical to CreateProduct.
+type importProductsRequest struct {
+	Items []createProductRequest `json:"items"`
+}
+
+// importMaxRows caps a single import batch (abuse/latency guard, CONTRACT §25.6).
+const importMaxRows = 500
+
+// ImportProducts bulk-creates products from a JSON array. Rows are processed
+// one by one (best-effort): a bad/duplicate row is reported in errors with its
+// 1-based row index and never aborts the batch. Empty items or >500 rows -> 400.
+// POST /v1/boss/catalog/products/import
+func (h *CatalogHandler) ImportProducts(c *gin.Context) {
+	var req importProductsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	if len(req.Items) == 0 || len(req.Items) > importMaxRows {
+		httpx.Fail(c, errcode.ErrParam)
+		return
+	}
+	items := make([]catalog.CreateInput, 0, len(req.Items))
+	for _, it := range req.Items {
+		items = append(items, catalog.CreateInput{
+			Barcode:       it.Barcode,
+			Name:          it.Name,
+			Category:      it.Category,
+			Unit:          it.Unit,
+			CostCents:     it.CostCents,
+			PriceCents:    it.PriceCents,
+			ImageURL:      it.ImageURL,
+			ShelfLifeDays: it.ShelfLifeDays,
+			Tags:          it.Tags,
+		})
+	}
+	res := h.svc.ImportBatch(c.Request.Context(), items)
+	httpx.OK(c, gin.H{
+		"imported": res.Imported,
+		"failed":   res.Failed,
+		"errors":   res.Errors,
+	})
+}
+
 type updatePriceRequest struct {
 	CostCents  int64 `json:"cost_cents"`
 	PriceCents int64 `json:"price_cents"`

@@ -21,6 +21,8 @@ import type {
   SubscriptionResp,
   Whoami,
   ListMembersResp,
+  MemberDTO,
+  RechargeResult,
   Product,
   ProductListResp,
   Order,
@@ -71,6 +73,9 @@ const ERR_CODE_MSG: Record<number, string> = {
   60020: '数据不足,已降级',
   60021: '动作被拦截',
   60022: '该动作暂不支持',
+  60003: '储值余额超过单店上限',
+  42302: '会员已被冻结',
+  40402: '会员不存在',
 }
 const FALLBACK_SYSTEM_MSG = '系统异常请重试'
 
@@ -346,6 +351,31 @@ export async function getMemberCount(): Promise<number> {
   const resp = await request<ListMembersResp>('GET', '/v1/boss/membership/members?page=1&size=1')
   const total = resp && typeof resp.total === 'number' ? resp.total : 0
   return total
+}
+
+// === 充值页 (MVP-3, CONTRACT §25.3) —— 会员搜索 + 手动充值 ===
+
+/**
+ * searchMembers: 会员关键词搜索 (充值页选目标会员)。
+ * GET /v1/boss/membership/members?q={关键词}&page=1&size=20 → {items: memberDTO[], total}
+ * q 模糊匹配 Name/PhoneHash (后端 MemberFilter.Query);返回 memberDTO (snake_case)。
+ */
+export function searchMembers(query: string, page = 1, size = 20): Promise<ListMembersResp> {
+  const qs: string[] = [`page=${page}`, `size=${size}`]
+  if (query) qs.push(`q=${encodeURIComponent(query)}`)
+  return request<ListMembersResp>('GET', `/v1/boss/membership/members?${qs.join('&')}`)
+}
+
+/**
+ * rechargeMember: 店员手动充值 (MVP-3, 不做真实支付, 直接入账)。
+ * POST /v1/boss/membership/members/:id/recharge  body {amount_cents:int} → RechargeResult
+ * 赠送由后端 GiftForAmount 档位规则自动算,前端绝不传 gift。失败 errcode:
+ * 60003 超单店上限 / 42302 会员冻结 / 40402 会员不存在 / 40001 参数错。
+ */
+export function rechargeMember(memberID: number, amountCents: number): Promise<RechargeResult> {
+  return request<RechargeResult>('POST', `/v1/boss/membership/members/${memberID}/recharge`, {
+    amount_cents: amountCents,
+  })
 }
 
 // === billing 开单页 (FE-MP-02) —— 商品/订单 API ===

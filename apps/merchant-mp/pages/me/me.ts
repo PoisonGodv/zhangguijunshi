@@ -1,11 +1,13 @@
 // pages/me/me.ts — 「我的」页 (FE-MP-04)
 //
-// 数据流: onLoad / onShow / 下拉刷新 → 并发拉四路 B 端 BFF:
+// 数据流: onLoad / onShow / 下拉刷新 → 并发拉三路 B 端 BFF:
 //   - getWhoami()              GET /v1/boss/whoami              → 门店/身份卡 (tenant_id + source)
 //   - getDailySummaryToday()   GET /v1/boss/billing/summary/today → 今日营业额/订单数/客单价
-//   - getSubscription()        GET /v1/boss/subscription        → 当前套餐 + 到期时间 + 状态
 //   - getMemberCount()         GET /v1/boss/membership/members?page=1&size=1 → 会员总数 (取 total)
 // 会员数: CONTRACT §24.7 路线 A,复用 §17.11 ListMembersPage 的 total 计数,后端 0 改动。
+// 订阅卡: CONTRACT §25.2 — MVP 砍在线支付/订阅,GET /v1/boss/subscription 已下架(404)。
+//   本页不再调用 getSubscription,订阅卡静态展示「MVP 免费版 · 全部功能开放」。
+//   SubscriptionResp 类型/常量保留待用(V1 恢复订阅时再启用)。
 //
 // 金额: 后端 int64 分 → 元(整除显示整数,否则两位小数),与 today/task-detail 一致。
 // 失败策略: 单卡片失败只 toast,不阻塞其他卡片渲染。
@@ -13,27 +15,19 @@
 import {
   getWhoami,
   getDailySummaryToday,
-  getSubscription,
   getMemberCount,
   getAccessToken,
   clearTokens,
   logoutReq,
   ApiError,
 } from '../../utils/request'
-import type { Whoami, DailySummary, SubscriptionResp } from '../../types/api'
+import type { Whoami, DailySummary } from '../../types/api'
 
-// === plan → 中文名 ===
+// === plan → 中文名 === (§25.2: MVP 静态免费版,保留常量待 V1 恢复订阅时启用)
 const PLAN_LABEL: Record<string, string> = {
   free: '免费版',
   pro: 'Pro 版',
   flagship: '旗舰版',
-}
-
-// === subscription.status → 中文 ===
-const SUB_STATUS_LABEL: Record<string, string> = {
-  active: '生效中',
-  expired: '已过期',
-  cancelled: '已取消',
 }
 
 // === whoami.source → 中文 ===
@@ -56,11 +50,8 @@ interface MeData {
   orderCount: number
   avgYuan: string // 客单价(0 单显示 —)
   memberCountText: string // 会员数(§24.7: /v1/boss/membership/members total,失败/加载中保持 —)
-  // 订阅卡
+  // 订阅卡 (§25.2: MVP 静态免费版,不拉接口,plan 恒 free)
   planLabel: string
-  planStatus: string
-  planExpire: string // 到期时间(free/无记录 → 永久)
-  planRaw: string // free|pro|flagship (用于判断是否显示升级入口)
 }
 
 Page({
@@ -73,10 +64,7 @@ Page({
     orderCount: 0,
     avgYuan: '—',
     memberCountText: '—',
-    planLabel: '免费版',
-    planStatus: '',
-    planExpire: '永久',
-    planRaw: 'free',
+    planLabel: PLAN_LABEL.free,
   } as MeData,
 
   onLoad() {
@@ -104,11 +92,10 @@ Page({
 
   async load(): Promise<void> {
     this.setData({ loading: true })
-    // 四路并发,单路失败只 toast,不阻塞其他卡片
-    const [whoamiRes, summaryRes, subRes, memberCountRes] = await Promise.allSettled([
+    // 三路并发,单路失败只 toast,不阻塞其他卡片 (§25.2: 订阅卡已静态化,不再请求)
+    const [whoamiRes, summaryRes, memberCountRes] = await Promise.allSettled([
       getWhoami(),
       getDailySummaryToday(),
-      getSubscription(),
       getMemberCount(),
     ])
 
@@ -122,12 +109,6 @@ Page({
       this.applySummary(summaryRes.value)
     } else {
       toastErr(summaryRes.reason, '经营摘要加载失败')
-    }
-
-    if (subRes.status === 'fulfilled') {
-      this.applySubscription(subRes.value)
-    } else {
-      toastErr(subRes.reason, '订阅状态加载失败')
     }
 
     if (memberCountRes.status === 'fulfilled') {
@@ -164,29 +145,11 @@ Page({
     this.setData({ memberCountText: String(total) })
   },
 
-  applySubscription(r: SubscriptionResp): void {
-    const plan = (r && r.plan) || 'free'
-    const sub = r && r.subscription
-    let statusText = ''
-    let expireText = '永久'
-    if (sub) {
-      statusText = SUB_STATUS_LABEL[sub.Status] || sub.Status || ''
-      if (sub.PeriodEndsAt) {
-        expireText = formatDate(sub.PeriodEndsAt)
-      }
-    }
-    this.setData({
-      planRaw: plan,
-      planLabel: PLAN_LABEL[plan] || plan,
-      planStatus: statusText,
-      planExpire: expireText,
-    })
-  },
-
   // === 静态功能区 ===
 
-  onTapUpgrade(): void {
-    wx.showToast({ title: '敬请期待', icon: 'none' })
+  onTapRecharge(): void {
+    // MVP-3: 店员手动充值页 (CONTRACT §25.3)
+    wx.navigateTo({ url: '/pages/recharge/recharge' })
   },
 
   onTapSettings(): void {
@@ -233,13 +196,6 @@ Page({
 function yuan(cents: number | string): string {
   const v = Number(cents) / 100
   return v % 1 === 0 ? String(v) : v.toFixed(2)
-}
-
-/** ISO/RFC3339 → YYYY-MM-DD(后端 PeriodEndsAt 为 time.Time 序列化) */
-function formatDate(iso: string): string {
-  if (!iso) return ''
-  // 直接截前 10 位,RFC3339 形如 2026-08-01T15:04:05+08:00
-  return iso.length >= 10 ? iso.slice(0, 10) : iso
 }
 
 /** 单卡片失败: toast 中文,不阻塞其他卡片 */

@@ -413,8 +413,93 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 }
 
-// --- BE-A-09 标签写回 --------------------------------------------------------
+// --- 批量导入 (CONTRACT §25.6) ------------------------------------------------
 
+func TestImportBatch_AllSuccess(t *testing.T) {
+	svc := newSvc()
+	ctx := ctxFor(tenantA, store1)
+
+	res := svc.ImportBatch(ctx, []CreateInput{
+		{Barcode: "IMP001", Name: "可乐", Unit: "瓶", CostCents: 1, PriceCents: 2},
+		{Barcode: "IMP002", Name: "雪碧", Unit: "瓶", CostCents: 1, PriceCents: 2},
+		{Barcode: "IMP003", Name: "芬达", Unit: "瓶", CostCents: 1, PriceCents: 2},
+	})
+	if res.Imported != 3 || res.Failed != 0 || len(res.Errors) != 0 {
+		t.Fatalf("want imported=3 failed=0 errors=0, got %+v", res)
+	}
+	// All three persisted under the ctx tenant.
+	list, err := svc.List(ctx, ProductFilter{StoreID: store1})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("want 3 persisted, got %d", len(list))
+	}
+}
+
+func TestImportBatch_PartialFailure(t *testing.T) {
+	svc := newSvc()
+	ctx := ctxFor(tenantA, store1)
+	// Pre-existing product so row 3 collides on barcode.
+	if _, err := svc.Create(ctx, CreateInput{Barcode: "DUP", Name: "已有", Unit: "瓶", CostCents: 1, PriceCents: 2}); err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+
+	res := svc.ImportBatch(ctx, []CreateInput{
+		{Barcode: "IMP010", Name: "可乐", Unit: "瓶", CostCents: 1, PriceCents: 2}, // ok (row 1)
+		{Barcode: "IMP011", Name: "", Unit: "瓶", CostCents: 1, PriceCents: 2},   // empty name (row 2)
+		{Barcode: "DUP", Name: "重复条码", Unit: "瓶", CostCents: 1, PriceCents: 2},  // dup barcode (row 3)
+		{Barcode: "IMP012", Name: "雪碧", Unit: "瓶", CostCents: 1, PriceCents: 2}, // ok (row 4)
+	})
+	if res.Imported != 2 || res.Failed != 2 {
+		t.Fatalf("want imported=2 failed=2, got %+v", res)
+	}
+	if len(res.Errors) != 2 {
+		t.Fatalf("want 2 errors, got %v", res.Errors)
+	}
+	// 1-based row indices for the two failures.
+	if res.Errors[0].Row != 2 || res.Errors[1].Row != 3 {
+		t.Fatalf("bad error rows: %+v", res.Errors)
+	}
+	if res.Errors[0].Reason == "" || res.Errors[1].Reason == "" {
+		t.Fatalf("error reasons must be non-empty: %+v", res.Errors)
+	}
+	// Good rows still landed despite the failures (no abort).
+	list, err := svc.List(ctx, ProductFilter{StoreID: store1})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 3 { // seed + 2 imported
+		t.Fatalf("want 3 persisted (seed + 2), got %d", len(list))
+	}
+}
+
+func TestImportBatch_EmptyInput(t *testing.T) {
+	svc := newSvc()
+	ctx := ctxFor(tenantA, store1)
+	res := svc.ImportBatch(ctx, nil)
+	if res.Imported != 0 || res.Failed != 0 || len(res.Errors) != 0 {
+		t.Fatalf("empty input: want zero result, got %+v", res)
+	}
+}
+
+func TestImportBatch_CrossTenantIsolated(t *testing.T) {
+	svc := newSvc()
+	// Tenant A imports a barcode; tenant B importing the same barcode must NOT
+	// collide (uniqueness is scoped to tenant+store, ARCH-01 tenant from ctx).
+	if r := svc.ImportBatch(ctxFor(tenantA, store1), []CreateInput{
+		{Barcode: "SHARED", Name: "可乐", Unit: "瓶", CostCents: 1, PriceCents: 2},
+	}); r.Imported != 1 {
+		t.Fatalf("tenant A import: %+v", r)
+	}
+	if r := svc.ImportBatch(ctxFor(tenantB, store1), []CreateInput{
+		{Barcode: "SHARED", Name: "可乐", Unit: "瓶", CostCents: 1, PriceCents: 2},
+	}); r.Imported != 1 || r.Failed != 0 {
+		t.Fatalf("tenant B import must succeed independently, got %+v", r)
+	}
+}
+
+// --- BE-A-09 标签写回 --------------------------------------------------------
 func TestUpdateTags_ClosedLoop(t *testing.T) {
 	svc := newSvc()
 	ctx := ctxFor(tenantA, store1)

@@ -104,6 +104,54 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Product, error) 
 	return created, nil
 }
 
+// ImportError carries one failed row's 1-based index and the rejection reason
+// (CONTRACT §25.6 批量录入明细).
+type ImportError struct {
+	Row    int    // 1-based row index into the input slice
+	Reason string // human-readable rejection cause
+}
+
+// ImportResult summarises a batch import: how many rows persisted and the
+// per-row failures (a single bad row never aborts the batch).
+type ImportResult struct {
+	Imported int
+	Failed   int
+	Errors   []ImportError
+}
+
+// ImportBatch creates products one row at a time by reusing Create (validation
+// + defaults + tenant/store resolution all inherited). A single row's failure
+// (duplicate barcode or name+unit -> ErrParam, bad price, empty name) does NOT
+// interrupt the batch: it is recorded in Errors and the loop continues. An empty
+// slice yields a zero result (the handler enforces the 1..500 window before this
+// is called). Rows are reported 1-based to match the operator's CSV line numbers.
+func (s *Service) ImportBatch(ctx context.Context, items []CreateInput) ImportResult {
+	res := ImportResult{}
+	for i, in := range items {
+		if _, err := s.Create(ctx, in); err != nil {
+			res.Failed++
+			res.Errors = append(res.Errors, ImportError{Row: i + 1, Reason: importReason(err)})
+			continue
+		}
+		res.Imported++
+	}
+	return res
+}
+
+// importReason maps a Create failure to an operator-facing reason string. The
+// param sentinel (uniqueness/validation) carries a generic Chinese message so
+// the import detail stays readable without leaking internals.
+func importReason(err error) string {
+	switch {
+	case errors.Is(err, errcode.ErrParam):
+		return "参数错误或条码/名称+单位重复"
+	case errors.Is(err, multitenancy.ErrNoTenant):
+		return "缺少租户上下文"
+	default:
+		return "导入失败"
+	}
+}
+
 // UpdatePrice re-prices a product, enforcing price >= cost >= 0. It loads the
 // product under the ctx tenant (cross-tenant -> ErrNotFound) and writes the full
 // record back.

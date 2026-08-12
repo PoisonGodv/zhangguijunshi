@@ -3,6 +3,7 @@
     "pages/today/today",
     "pages/task-detail/task-detail",
     "pages/billing/billing",
+    "pages/recharge/recharge",
     "pages/me/me",
     "pages/login/login"
   ],

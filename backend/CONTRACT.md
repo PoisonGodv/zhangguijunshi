@@ -3768,3 +3768,15 @@ services 层：catalog.ts/inventory.ts/membership.ts（A2a）+ billing.ts/market
 - MVP 起栈（payment.enabled=false）：`/v1/boss/payment/*`、`/v1/wxshop/payment/notify`、`/v1/boss/subscription/*` → 404；业务接口（catalog/inventory/membership/billing/groupbuy/aiengine）正常。
 - merchant-mp / consumer-mp / admin-web `tsc --noEmit` 0 错；admin-web `npm run build` 通过。
 - 店员手动充值（merchant-mp 新页）+ 批量导入（admin）+ worker healthcheck 可起栈验证。
+
+### 25.9 落地状态（2026-08-12，配额恢复后 6-agent workflow `wf_2e45082a-11d` 全绿收口）
+§25.2–§25.6 已全部落地验证（§25.1/§25.4 已于 `1df5b79` 主线程先行落地）。本轮 6 agent 并行 + 主线程终验：
+
+- **§25.3 店员手动充值页**（merchant-mp `pages/recharge/` 4 文件新建）：会员搜索（`GET /boss/membership/members?q=`）→ 点选 → 档位（充200送20/500送80/1000送200，仅作 amount 预设）/自定义金额 → 二次确认 → `POST /boss/membership/members/:id/recharge {amount_cents}`。赠送由后端 `GiftForAmount` 内部算，**前端绝不传 gift**（防伪造）；`RechargeResult` 无 json tag→PascalCase（`BalanceCents/GiftCents/RechargedCents/GiftedCents`）。me 页加「会员充值」入口格 + app.json 注册。
+- **§25.2 前端支付下架**：①merchant-mp me 订阅卡静态化为「MVP 免费版 · 全部功能开放」，移除 `getSubscription()` 运行时调用（`Promise.allSettled` 四路降三路，`SubscriptionResp` 类型保留注释待 V1）；②admin-web finance/ledger 占位页 endpoints 清空、改「暂未启用」口径（保留入口+页面降级，未删路由）。
+- **§25.5 seed 样板店**（`migrations_seed/seed_demo.sql` 扩展）：SKU 8→17（七类、毛利率 20-45%）、批次含临期（`status='nearing'`）/低库存、3 券 + 1 进行中拼团（含 desc/原价）、订单 21→30（周末/平日起伏）；全程幂等单事务、列名逐一核对 migration（本机无 PG，静态自检，运行时未验）。
+- **§25.5 onboarding 手册**（`docs/onboarding.md` 新建）：面向店主的开店 SOP，覆盖开店准备/核心闭环/演示数据/MVP 无支付边界/FAQ；引用接口/页面/阈值全部 grep 核对真实存在。
+- **§25.6 商品批量录入**：①后端 `catalog.Service.ImportBatch`（逐条复用 `Create`，单条失败不中断，row 1-based 记 errors）+ `ImportProducts` handler（`POST /boss/catalog/products/import`，空 items/>500→ErrParam，`importMaxRows=500`）+ 路由 + 4 service 测试；②admin-web 商品页「批量导入」Modal（Upload.Dragger 选 CSV 或粘贴，前端 split 解析成 items，元→分 ×100 round，展示 imported/failed + 每行错误）。
+- **§25.4 收尾**：`docker-compose.prod.yml` 补 `backend-cron` healthcheck（`:8092/healthz`，worker `:8091` 已先行）——主线程补。
+- **终验**：go build/vet 全绿、`go test -race ./...` 48 包无 FAIL、gofmt clean；merchant-mp/admin-web/consumer-mp `tsc --noEmit` 全 0 错。
+- **已知取舍**：拼团表无唯一索引，seed 用 `WHERE NOT EXISTS(title)` 兜底幂等（外层 SEED 订单闸门为主保险）；个别生鲜毛利率略超 45%（生鲜高损耗实情，非缺陷）；`me.wxss` 残留 `.sub-status/.sub-upgrade` 死样式（无 WXML 引用，未清）。

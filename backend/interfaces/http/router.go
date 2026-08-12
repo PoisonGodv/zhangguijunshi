@@ -175,6 +175,7 @@ func wireBoss(r *gin.Engine, deps Deps) {
 	if deps.Catalog != nil {
 		h := handler.NewCatalogHandler(deps.Catalog)
 		boss.POST("/catalog/products", h.CreateProduct)
+		boss.POST("/catalog/products/import", h.ImportProducts) // CONTRACT §25.6: 批量录入
 		boss.GET("/catalog/products", h.ListProducts)
 		boss.GET("/catalog/products/barcode/:barcode", h.GetProductByBarcode)
 		boss.GET("/catalog/products/:id", h.GetProduct)

@@ -87,3 +87,21 @@ export function getByBarcode(barcode: string): Promise<Product> {
 export function updatePrice(id: number, body: UpdatePriceBody): Promise<Product> {
   return client.patch<unknown, Product>(`/boss/catalog/products/${id}/price`, body)
 }
+
+/** 批量导入单行错误 (CONTRACT §25.6; row 为 1-based 行号) */
+export interface ImportErrorItem {
+  row: number
+  reason: string
+}
+
+/** 批量导入响应 (handler gin.H{"imported","failed","errors"}, snake_case 键) */
+export interface ImportResultResp {
+  imported: number
+  failed: number
+  errors: ImportErrorItem[]
+}
+
+/** POST /v1/boss/catalog/products/import — 批量录入 (逐条 best-effort, 空/超500→400) */
+export function importProducts(items: CreateProductBody[]): Promise<ImportResultResp> {
+  return api.post<ImportResultResp>('/boss/catalog/products/import', { items })
+}

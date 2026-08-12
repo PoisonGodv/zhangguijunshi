@@ -1,0 +1,289 @@
+/* pages/recharge/recharge.wxss — 店员手动充值页 (暖色主题 #FF6B35, 沿用 app.wxss 卡片/按钮/搜索框) */
+
+.recharge-container {
+  padding-bottom: 40rpx;
+}
+
+/* === 搜索框 (对齐 billing) === */
+.search-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 20rpx;
+}
+.search-box {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  background: #FFFFFF;
+  border-radius: 44rpx;
+  padding: 0 24rpx;
+  height: 72rpx;
+  box-shadow: 0 2rpx 8rpx rgba(255, 107, 53, 0.06);
+}
+.search-icon {
+  font-size: 28rpx;
+  color: #8C8C8C;
+  margin-right: 12rpx;
+}
+.search-input {
+  flex: 1;
+  height: 72rpx;
+  font-size: 28rpx;
+  color: #1F1F1F;
+}
+.search-input-ph {
+  color: #BFBFBF;
+}
+.search-clear {
+  padding: 8rpx 12rpx;
+  font-size: 24rpx;
+  color: #BFBFBF;
+}
+
+/* === 会员列表 === */
+.member-section {
+  padding: 16rpx 0;
+}
+.member-section .section-title {
+  padding: 0 24rpx 12rpx;
+}
+.member-row {
+  display: flex;
+  align-items: center;
+  padding: 20rpx 24rpx;
+  border-bottom: 1rpx solid #F5F5F5;
+}
+.member-row:last-child {
+  border-bottom: none;
+}
+.member-row:active {
+  background: #FFF9F5;
+}
+.member-row-blocked {
+  opacity: 0.55;
+}
+.member-info {
+  flex: 1;
+  min-width: 0;
+}
+.member-name {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.member-level {
+  margin-left: 12rpx;
+  font-size: 20rpx;
+  font-weight: 400;
+  color: #FF6B35;
+  border: 1rpx solid #FFB48F;
+  border-radius: 16rpx;
+  padding: 0rpx 12rpx;
+}
+.member-blocked-tag {
+  margin-left: 12rpx;
+  font-size: 20rpx;
+  color: #FF4D4F;
+  border: 1rpx solid #FF4D4F;
+  border-radius: 16rpx;
+  padding: 0rpx 12rpx;
+}
+.member-meta {
+  margin-top: 6rpx;
+  font-size: 24rpx;
+  color: #8C8C8C;
+}
+.member-arrow {
+  flex-shrink: 0;
+  font-size: 36rpx;
+  color: #CCCCCC;
+  margin-left: 12rpx;
+}
+
+.list-tip {
+  text-align: center;
+  padding: 24rpx 0;
+  font-size: 24rpx;
+  color: #BFBFBF;
+}
+
+/* === 已选会员卡 === */
+.selected-section {
+  padding: 16rpx 24rpx;
+}
+.selected-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.selected-change {
+  font-size: 24rpx;
+  color: #FF6B35;
+  padding: 4rpx 12rpx;
+}
+.selected-main {
+  margin-top: 12rpx;
+}
+.selected-name {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+  display: flex;
+  align-items: center;
+}
+.selected-balance {
+  margin-top: 8rpx;
+  font-size: 26rpx;
+  color: #8C8C8C;
+}
+
+/* === 预设档位 === */
+.preset-row {
+  display: flex;
+  margin: 8rpx -8rpx 0;
+}
+.preset-btn {
+  flex: 1;
+  margin: 0 8rpx;
+  background: #FFF9F5;
+  border: 2rpx solid #F0E4DC;
+  border-radius: 16rpx;
+  padding: 20rpx 0;
+  text-align: center;
+}
+.preset-btn-active {
+  background: #FFF3EC;
+  border-color: #FF6B35;
+}
+.preset-amount {
+  font-size: 36rpx;
+  font-weight: 700;
+  color: #1F1F1F;
+}
+.preset-btn-active .preset-amount {
+  color: #FF6B35;
+}
+.preset-gift {
+  margin-top: 6rpx;
+  font-size: 22rpx;
+  color: #B26B00;
+}
+
+/* === 自定义金额 === */
+.custom-row {
+  display: flex;
+  align-items: center;
+  margin-top: 20rpx;
+  background: #FFF9F5;
+  border-radius: 16rpx;
+  padding: 0 24rpx;
+  height: 96rpx;
+}
+.custom-label {
+  font-size: 26rpx;
+  color: #8C8C8C;
+  flex-shrink: 0;
+}
+.custom-currency {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+  margin: 0 12rpx 0 24rpx;
+}
+.custom-input {
+  flex: 1;
+  height: 96rpx;
+  font-size: 36rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+}
+
+/* === 底部合计 + 确认 === */
+.recharge-footer {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #FFFFFF;
+  display: flex;
+  align-items: center;
+  padding: 16rpx 24rpx calc(16rpx + env(safe-area-inset-bottom));
+  box-shadow: 0 -4rpx 16rpx rgba(0, 0, 0, 0.05);
+  z-index: 100;
+}
+.total-box {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.total-label {
+  font-size: 24rpx;
+  color: #8C8C8C;
+}
+.total-amount {
+  font-size: 44rpx;
+  font-weight: 700;
+  color: #FF6B35;
+  line-height: 1.2;
+}
+.btn-submit {
+  flex-shrink: 0;
+  width: 240rpx;
+  margin: 0;
+}
+.footer-spacer {
+  height: 160rpx;
+}
+
+/* === 回执 (对齐 billing) === */
+.receipt-card {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  padding: 48rpx 32rpx;
+  margin-top: 40rpx;
+  margin-bottom: 32rpx;
+  box-shadow: 0 2rpx 12rpx rgba(255, 107, 53, 0.08);
+  text-align: center;
+}
+.receipt-icon {
+  font-size: 96rpx;
+  margin-bottom: 12rpx;
+}
+.receipt-title {
+  font-size: 32rpx;
+  color: #2ECC71;
+  font-weight: 600;
+  margin-bottom: 24rpx;
+}
+.receipt-amount {
+  font-size: 72rpx;
+  font-weight: 700;
+  color: #FF6B35;
+  margin-bottom: 32rpx;
+  line-height: 1.2;
+}
+.receipt-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 12rpx 0;
+  font-size: 26rpx;
+  border-top: 1rpx dashed #F0F0F0;
+}
+.receipt-label {
+  color: #8C8C8C;
+}
+.receipt-value {
+  color: #1F1F1F;
+  font-weight: 500;
+}
+.receipt-gift {
+  color: #2ECC71;
+  font-weight: 600;
+}
+.receipt-total {
+  color: #FF6B35;
+  font-weight: 600;
+}

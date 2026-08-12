@@ -233,6 +233,7 @@ export interface Subscription {
  * GET /v1/boss/subscription 响应 (handler/subscription.go GetSubscription):
  *   httpx.OK(c, gin.H{"plan": plan, "subscription": sub})
  * sub 可能为 null (无任何订阅记录,CurrentPlan 默认 free)。
+ * §25.2: MVP 砍在线支付/订阅,该路由已下架(404),前端不再调用;类型保留待 V1 恢复。
  */
 export interface SubscriptionResp {
   plan: string
@@ -242,11 +243,43 @@ export interface SubscriptionResp {
 /**
  * GET /v1/boss/membership/members?page=&size=&level=&q= 响应 (CONTRACT §17.11):
  *   httpx.OK(c, gin.H{"items": memberDTO[], "total": n})
- * me 页会员数卡片只读 total (page=1&size=1 最小拉取),items 用 unknown[] 不展开 memberDTO。
+ * me 页会员数卡片只读 total (page=1&size=1 最小拉取),items 用 unknown[] 不展开 memberDTO;
+ * 充值页 (§25.3) 用 items 渲染列表,展开为 MemberDTO。
  */
 export interface ListMembersResp {
-  items: unknown[]
+  items: MemberDTO[]
   total: number
+}
+
+/**
+ * boss 端会员 DTO (handler/membership.go memberDTO, 有 json tag → snake_case)。
+ * 仅暴露 id/等级/积分/余额/累计消费/创建时间/冻结态,刻意隐藏 phone_hash/openid (PII)。
+ * balance_cents 为真实储值实付余额 (无账户读 0)。
+ */
+export interface MemberDTO {
+  id: number
+  level: string // normal|vip|blackcard
+  level_name: string // 普通会员|银卡会员|金卡会员
+  name?: string
+  points: number
+  balance_cents: number
+  total_spent_cents: number
+  created_at: string
+  block: boolean
+}
+
+/**
+ * 充值结果 (POST /v1/boss/membership/members/:id/recharge, CONTRACT §25.3)。
+ * membership.RechargeResult **无 json tag** → Go encoding/json 默认 PascalCase。
+ * BalanceCents/GiftCents 为入账后总额; RechargedCents/GiftedCents 为本次增量。
+ * 赠送 (GiftedCents) 由后端 GiftForAmount 档位规则算,前端绝不传 gift。
+ */
+export interface RechargeResult {
+  MemberID: number
+  BalanceCents: number   // 入账后实付余额 (分)
+  GiftCents: number      // 入账后赠送余额 (分)
+  RechargedCents: number // 本次实付 (分)
+  GiftedCents: number    // 本次赠送 (分)
 }
 
 /**

@@ -186,6 +186,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Liveness probe against the cron binary's /healthz on :8092 (§25.4). A pure
+    # scheduler loop is otherwise invisible to compose; process-alive is the signal.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --tries=1 --timeout=3 http://127.0.0.1:8092/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks: [zg-net]
 

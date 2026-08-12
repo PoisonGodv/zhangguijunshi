@@ -32,28 +32,27 @@
     </view>
   </view>
 
-  <!-- 订阅状态 -->
+  <!-- 订阅状态 (§25.2: MVP 静态免费版,不拉 /v1/boss/subscription,无到期时间/续费按钮) -->
   <view class="section">
     <view class="section-title">订阅</view>
     <view class="sub-row">
       <view class="sub-main">
         <view class="sub-plan">
           <text class="sub-plan-name">{{planLabel}}</text>
-          <text wx:if="{{planStatus}}" class="sub-status">{{planStatus}}</text>
         </view>
-        <view class="sub-expire">到期时间:{{planExpire}}</view>
+        <view class="sub-expire">当前为 MVP 免费版,全部功能开放</view>
       </view>
-      <view
-        wx:if="{{planRaw === 'free'}}"
-        class="sub-upgrade"
-        bindtap="onTapUpgrade"
-      >升级 Pro</view>
     </view>
   </view>
 
   <!-- 功能区 -->
   <view class="section">
     <view class="menu-list">
+      <view class="menu-item" bindtap="onTapRecharge">
+        <view class="menu-icon">💰</view>
+        <view class="menu-text">会员充值</view>
+        <view class="menu-arrow">›</view>
+      </view>
       <view class="menu-item" bindtap="onTapSettings">
         <view class="menu-icon">⚙️</view>
         <view class="menu-text">设置</view>

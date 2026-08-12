@@ -1,0 +1,150 @@
+<!-- pages/recharge/recharge.wxml — 店员手动充值页 (MVP-3) -->
+<view class="container recharge-container">
+
+  <!-- === 成功回执 (覆盖整页) === -->
+  <block wx:if="{{receipt}}">
+    <view class="receipt-card">
+      <view class="receipt-icon">✅</view>
+      <view class="receipt-title">充值成功</view>
+      <view class="receipt-amount">¥{{receipt.amount_yuan}}</view>
+      <view class="receipt-row" wx:if="{{receipt.gift_yuan !== '0'}}">
+        <text class="receipt-label">赠送</text>
+        <text class="receipt-value receipt-gift">+¥{{receipt.gift_yuan}}</text>
+      </view>
+      <view class="receipt-row">
+        <text class="receipt-label">会员</text>
+        <text class="receipt-value">{{receipt.member_name}}</text>
+      </view>
+      <view class="receipt-row">
+        <text class="receipt-label">实付余额</text>
+        <text class="receipt-value">¥{{receipt.balance_yuan}}</text>
+      </view>
+      <view class="receipt-row">
+        <text class="receipt-label">赠送余额</text>
+        <text class="receipt-value">¥{{receipt.gift_balance_yuan}}</text>
+      </view>
+      <view class="receipt-row">
+        <text class="receipt-label">合计可用</text>
+        <text class="receipt-value receipt-total">¥{{receipt.total_yuan}}</text>
+      </view>
+    </view>
+    <view class="footer">
+      <button class="btn-primary" bindtap="onNewRecharge">再充一笔</button>
+    </view>
+  </block>
+
+  <!-- === 充值态 === -->
+  <block wx:else>
+
+    <!-- 会员搜索框 -->
+    <view class="search-row">
+      <view class="search-box">
+        <text class="search-icon">🔍</text>
+        <input
+          class="search-input"
+          placeholder="搜索会员 手机号/姓名"
+          placeholder-class="search-input-ph"
+          value="{{keyword}}"
+          bindinput="onKeywordInput"
+          confirm-type="search"
+        />
+        <text wx:if="{{keyword}}" class="search-clear" bindtap="onKeywordClear">✕</text>
+      </view>
+    </view>
+
+    <!-- 会员搜索结果列表 -->
+    <view class="section member-section" wx:if="{{!member}}">
+      <view class="section-title">选择要充值的会员</view>
+      <block wx:if="{{members.length}}">
+        <view
+          wx:for="{{members}}"
+          wx:key="id"
+          class="member-row {{item.block ? 'member-row-blocked' : ''}}"
+          data-id="{{item.id}}"
+          bindtap="onSelectMember"
+        >
+          <view class="member-info">
+            <view class="member-name">
+              {{item.name || '会员 ' + item.id}}
+              <text class="member-level">{{item.level_name}}</text>
+              <text wx:if="{{item.block}}" class="member-blocked-tag">已冻结</text>
+            </view>
+            <view class="member-meta">当前余额 ¥{{item.balance_yuan}}</view>
+          </view>
+          <view class="member-arrow">›</view>
+        </view>
+      </block>
+      <view wx:elif="{{listLoading}}" class="list-tip">加载中…</view>
+      <view wx:elif="{{searched}}" class="empty">
+        <view class="empty-icon">👤</view>
+        <view>未找到会员,换个关键词?</view>
+      </view>
+      <view wx:else class="empty">
+        <view class="empty-icon">👤</view>
+        <view>输入手机号或姓名搜索会员</view>
+      </view>
+    </view>
+
+    <!-- 已选会员卡 -->
+    <view class="section selected-section" wx:if="{{member}}">
+      <view class="selected-header">
+        <view class="section-title">充值会员</view>
+        <view class="selected-change" bindtap="onClearMember">更换</view>
+      </view>
+      <view class="selected-main">
+        <view class="selected-name">
+          {{member.name || '会员 ' + member.id}}
+          <text class="member-level">{{member.level_name}}</text>
+        </view>
+        <view class="selected-balance">当前余额 ¥{{member.balance_yuan}}</view>
+      </view>
+    </view>
+
+    <!-- 金额区 (选中会员后出现) -->
+    <block wx:if="{{member}}">
+      <view class="section">
+        <view class="section-title">充值金额 (赠送以实际到账为准)</view>
+        <view class="preset-row">
+          <view
+            wx:for="{{presets}}"
+            wx:key="cents"
+            class="preset-btn {{amountCents === item.cents ? 'preset-btn-active' : ''}}"
+            data-cents="{{item.cents}}"
+            bindtap="onPreset"
+          >
+            <view class="preset-amount">¥{{item.yuan}}</view>
+            <view class="preset-gift">{{item.giftLabel}}</view>
+          </view>
+        </view>
+        <view class="custom-row">
+          <text class="custom-label">自定义</text>
+          <text class="custom-currency">¥</text>
+          <input
+            class="custom-input"
+            type="digit"
+            placeholder="输入金额(元)"
+            placeholder-class="search-input-ph"
+            value="{{customYuan}}"
+            bindinput="onCustomInput"
+          />
+        </view>
+      </view>
+
+      <!-- 底部确认按钮 -->
+      <view class="recharge-footer">
+        <view class="total-box">
+          <view class="total-label">充值金额</view>
+          <view class="total-amount">¥{{amountYuan}}</view>
+        </view>
+        <button
+          class="btn-primary btn-submit"
+          loading="{{submitting}}"
+          disabled="{{!amountCents || amountCents <= 0 || submitting}}"
+          bindtap="onConfirm"
+        >确认充值</button>
+      </view>
+      <view class="footer-spacer"></view>
+    </block>
+
+  </block>
+</view>
