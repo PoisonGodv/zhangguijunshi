@@ -117,6 +117,11 @@ func Load(opts ...Option) (*Config, error) {
 	// ZG_AI_PROVIDERS_* env" promise (config.prod.yaml) was an unimplemented gap
 	// until this pass (CONTRACT §19 / plan B3). Scan the real env here.
 	applyAIProvidersEnv(&cfg)
+	// Same gap for the WX subscribe-template map (ZG_WX_SUBSCRIBE_TEMPLATES_*).
+	// Without it wxSubscribeConfigured was always false and reach kept the
+	// MemorySender even when templates were registered in the MP console; the
+	// documented ZG_WX_SUBSCRIBE_TEMPLATES_* env (.env.example) was a dead var.
+	applyWXSubscribeTemplatesEnv(&cfg)
 	return &cfg, nil
 }
 
@@ -295,6 +300,49 @@ func applyAIProvidersEnv(cfg *Config) {
 			r.Model = val
 		}
 		cfg.AI.Routes[strings.ToLower(tier)] = r
+	}
+}
+
+// wxSubscribeEnvPrefix prefixes the env vars that inject the reach subscribe
+// message template map (CONTRACT: reach 模板码 → 微信 template_id). Viper's
+// AutomaticEnv cannot materialise map fields, so we scan os.Environ ourselves
+// just like the AI providers above.
+const wxSubscribeEnvPrefix = "ZG_WX_SUBSCRIBE_TEMPLATES_" // + <TEMPLATE_CODE>
+
+// applyWXSubscribeTemplatesEnv backfills cfg.WX.SubscribeTemplates from the
+// ZG_WX_SUBSCRIBE_TEMPLATES_<TEMPLATE_CODE> environment variables. The code
+// (RECALL_30 / BIRTHDAY / ...) is lower-cased into the map key consumed by the
+// reach domain (recall_30 / birthday / ...; internal/reach Tpl* constants).
+// Values already present (from yaml) are preserved; env only fills or
+// overrides a single entry, matching the AI providers semantics.
+//
+// Examples:
+//
+//	ZG_WX_SUBSCRIBE_TEMPLATES_RECALL_30=tpl_abc   → SubscribeTemplates["recall_30"]
+//	ZG_WX_SUBSCRIBE_TEMPLATES_REPURCHASE=tpl_xyz  → SubscribeTemplates["repurchase"]
+func applyWXSubscribeTemplatesEnv(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	if cfg.WX.SubscribeTemplates == nil {
+		cfg.WX.SubscribeTemplates = map[string]string{}
+	}
+	for _, kv := range os.Environ() {
+		body, ok := envBody(kv, wxSubscribeEnvPrefix)
+		if !ok {
+			continue
+		}
+		eq := strings.IndexByte(body, '=')
+		if eq < 0 {
+			continue
+		}
+		code, val := body[:eq], body[eq+1:]
+		if code == "" {
+			continue
+		}
+		// 模板码可能含 '_' (RECALL_30)，整体 lower-case 作为 map 键即可，无需
+		// 像 provider 那样再按 '_' 拆 name/field。
+		cfg.WX.SubscribeTemplates[strings.ToLower(code)] = val
 	}
 }
 

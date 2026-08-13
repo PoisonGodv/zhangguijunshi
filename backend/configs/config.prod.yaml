@@ -70,6 +70,17 @@ wx:
   secret: ${ZG_WX_SECRET}
   code2session_url: ""               # prod: empty -> official WeChat endpoint
   timeout: "5s"
+  # Reach subscribe-message (订阅消息) wiring. This is a MAP field — viper's
+  # AutomaticEnv cannot fill maps, so config.go scans ZG_WX_SUBSCRIBE_TEMPLATES_*
+  # env directly (same as the AI providers below); leave the map EMPTY here and
+  # inject at runtime instead. Key = reach template code (new_welcome|birthday|
+  # recall_30|recall_60|recall_90|repurchase|balance_low|points_expire —
+  # internal/reach Tpl* constants), value = 微信 template_id. Env forms (either):
+  #   ZG_WX_SUBSCRIBE_TEMPLATES_RECALL_30=<template_id>   (per-code, env scan)
+  #   ZG_WX_TPL_RECALL_30=<template_id>                   (yaml ${VAR} expansion)
+  # AppID+Secret AND a non-empty map wire the real WxSender; empty map keeps the
+  # in-memory MemorySender (no network).
+  subscribe_templates: {}
 
 ai:
   default_provider: ${ZG_AI_DEFAULT_PROVIDER}   # prod: which provider is active

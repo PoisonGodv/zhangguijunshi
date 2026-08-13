@@ -297,6 +297,59 @@ ai:
 	}
 }
 
+// TestLoad_WXSubscribeTemplatesEnv verifies the ZG_WX_SUBSCRIBE_TEMPLATES_<CODE>
+// env→map injection that viper's AutomaticEnv cannot perform (same gap as the
+// AI providers above). The template code is lower-cased into the map key.
+func TestLoad_WXSubscribeTemplatesEnv(t *testing.T) {
+	t.Setenv("ZG_WX_SUBSCRIBE_TEMPLATES_RECALL_30", "tpl_abc")
+	t.Setenv("ZG_WX_SUBSCRIBE_TEMPLATES_BIRTHDAY", "tpl_bday")
+	// Mixed-case code should still map to a lower-cased key.
+	t.Setenv("ZG_WX_SUBSCRIBE_TEMPLATES_Repurchase", "tpl_rebuy")
+
+	cfg, err := Load(WithConfigDir(newDir(t)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.WX.SubscribeTemplates["recall_30"]; got != "tpl_abc" {
+		t.Errorf("subscribe_templates[recall_30]: got %q", got)
+	}
+	if got := cfg.WX.SubscribeTemplates["birthday"]; got != "tpl_bday" {
+		t.Errorf("subscribe_templates[birthday]: got %q", got)
+	}
+	if got := cfg.WX.SubscribeTemplates["repurchase"]; got != "tpl_rebuy" {
+		t.Errorf("subscribe_templates[repurchase]: got %q (mixed-case code not lower-cased)", got)
+	}
+}
+
+// TestLoad_WXSubscribeTemplatesEnvPreservesYaml confirms env only fills/overrides
+// individual entries and does not wipe template mappings already set by yaml.
+func TestLoad_WXSubscribeTemplatesEnvPreservesYaml(t *testing.T) {
+	dir := newDir(t)
+	writeYAML(t, dir, "dev", `
+wx:
+  subscribe_templates:
+    recall_30: "tpl_from_yaml"
+    birthday: "tpl_bday_yaml"
+`)
+	// Env fills points_expire and overrides recall_30; birthday must survive.
+	t.Setenv("ZG_WX_SUBSCRIBE_TEMPLATES_POINTS_EXPIRE", "tpl_points_env")
+	t.Setenv("ZG_WX_SUBSCRIBE_TEMPLATES_RECALL_30", "tpl_from_env")
+
+	cfg, err := Load(WithConfigDir(dir))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.WX.SubscribeTemplates["birthday"]; got != "tpl_bday_yaml" {
+		t.Errorf("birthday should be preserved from yaml: got %q", got)
+	}
+	if got := cfg.WX.SubscribeTemplates["recall_30"]; got != "tpl_from_env" {
+		t.Errorf("recall_30 should be overridden by env: got %q", got)
+	}
+	if got := cfg.WX.SubscribeTemplates["points_expire"]; got != "tpl_points_env" {
+		t.Errorf("points_expire should be filled from env: got %q", got)
+	}
+}
+
 // TestLoad_NewDefaults covers the payment/jobqueue/scheduler/platform-tenant
 // defaults added in plan Phase 0.
 func TestLoad_NewDefaults(t *testing.T) {
