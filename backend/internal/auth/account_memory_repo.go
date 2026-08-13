@@ -201,3 +201,31 @@ func (r *MemoryAccountRepo) UpdatePassword(_ context.Context, id int64, newHash 
 	acc.PasswordHash = newHash
 	return nil
 }
+
+// Create implements AccountRepo: 持久化一个哈希已由调用方算好的账号(冷启动
+// 引导路径, 对齐 PGAccountRepo.Create)。与 SeedAccountWithUsername 不同,
+// 这里绝不重新哈希、绝不接触明文; 空 PasswordHash 拒绝(errEmptyPasswordHash)。
+// 索引维护与 SeedAccountWithUsername 一致; status 空默认 'active'。
+func (r *MemoryAccountRepo) Create(_ context.Context, acc *Account) (*Account, error) {
+	if acc == nil || acc.PasswordHash == "" {
+		return nil, errEmptyPasswordHash
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextID++
+	stored := *acc
+	stored.ID = r.nextID
+	if stored.Status == "" {
+		stored.Status = "active"
+	}
+	r.byID[stored.ID] = &stored
+	if stored.Phone != "" {
+		r.byPhone[tenantPhoneKey{tenant: stored.TenantID, hash: PhoneHash(stored.Phone)}] = &stored
+	}
+	r.byName[tenantNameKey{tenant: stored.TenantID, name: stored.Name}] = &stored
+	if stored.Username != "" {
+		r.byUsername[tenantUsernameKey{tenant: stored.TenantID, username: stored.Username}] = &stored
+	}
+	cp := stored
+	return &cp, nil
+}

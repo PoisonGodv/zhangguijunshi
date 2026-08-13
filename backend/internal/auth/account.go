@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"time"
 
@@ -102,7 +103,20 @@ type AccountRepo interface {
 	// delete / unknown id) so the caller can distinguish a missing account from a
 	// real DB fault.
 	UpdatePassword(ctx context.Context, id int64, newHash string) error
+
+	// Create 持久化一个新员工账号(冷启动引导路径: 首个租户 + 首个 boss 账号,
+	// 见 cmd/migrate seed-account)。bcrypt 哈希由调用方算好(acc.PasswordHash
+	// 必须是 HashPassword 的产物), repo 只做持久化、绝不接触明文。PG 路径写
+	// phone_hash = PhoneHash(acc.Phone)(无 KMS, 不写 phone_enc); store_id /
+	// username / phone 为空时落 NULL(部分唯一索引排除 NULL)。空 PasswordHash
+	// 拒绝(errEmptyPasswordHash), 防止造出永远无法登录的账号。返回带分配 ID
+	// 的账号。
+	Create(ctx context.Context, acc *Account) (*Account, error)
 }
+
+// errEmptyPasswordHash 守住 Create 路径: 持久化空哈希会造出永远无法登录的
+// 账号(登录流拒绝空 hash)。与 errEmptyPassword 同为内部错误, 不映射 HTTP。
+var errEmptyPasswordHash = errors.New("auth: empty password hash")
 
 // phonePepper is the fixed app-level salt folded into phone_hash. The users
 // table stores SHA256(pepper+phone) in phone_hash (migration 000001 COMMENT:

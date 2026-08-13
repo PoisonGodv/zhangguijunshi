@@ -27,6 +27,8 @@ import type {
   ProductListResp,
   Order,
   CreateOrderReq,
+  RedeemReq,
+  RedeemResult,
 } from '../types/api'
 
 // === 全局 globalData 形状 (与 app.ts 一致) ===
@@ -74,6 +76,8 @@ const ERR_CODE_MSG: Record<number, string> = {
   60021: '动作被拦截',
   60022: '该动作暂不支持',
   60003: '储值余额超过单店上限',
+  60004: '储值余额不足',
+  40003: '会员码无效或已过期',
   42302: '会员已被冻结',
   40402: '会员不存在',
 }
@@ -376,6 +380,17 @@ export function rechargeMember(memberID: number, amountCents: number): Promise<R
   return request<RechargeResult>('POST', `/v1/boss/membership/members/${memberID}/recharge`, {
     amount_cents: amountCents,
   })
+}
+
+/**
+ * redeemMemberCode: 会员码核销 (顾客出示动态码,店员核销扣储值/积积分)。
+ * POST /v1/boss/membership/redeem  body {code, consume_cents?, earn_points?} → RedeemResult
+ * code 必填;consume_cents/earn_points 至少一个 >0。失败 errcode:
+ * 40003 会员码无效或已过期 / 60004 储值余额不足 / 42302 会员冻结 / 40001 参数错。
+ * 注: 核销只记储值+积分流水,不开销售单 (见 types/api.d.ts RedeemResult 注释)。
+ */
+export function redeemMemberCode(body: RedeemReq): Promise<RedeemResult> {
+  return request<RedeemResult>('POST', '/v1/boss/membership/redeem', body)
 }
 
 // === billing 开单页 (FE-MP-02) —— 商品/订单 API ===

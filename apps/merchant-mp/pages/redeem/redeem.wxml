@@ -1,0 +1,92 @@
+<!-- pages/redeem/redeem.wxml — 会员码核销页 (MVP-4) -->
+<view class="container redeem-container">
+
+  <!-- === 成功回执 (覆盖整页) === -->
+  <block wx:if="{{receipt}}">
+    <view class="receipt-card">
+      <view class="receipt-icon">✅</view>
+      <view class="receipt-title">核销成功</view>
+      <view class="receipt-amount" wx:if="{{receipt.consumed_yuan !== '0'}}">-¥{{receipt.consumed_yuan}}</view>
+      <view class="receipt-row">
+        <text class="receipt-label">会员ID</text>
+        <text class="receipt-value">{{receipt.member_id}}</text>
+      </view>
+      <view class="receipt-row">
+        <text class="receipt-label">剩余储值</text>
+        <text class="receipt-value">¥{{receipt.balance_yuan}}</text>
+      </view>
+      <view class="receipt-row">
+        <text class="receipt-label">当前积分</text>
+        <text class="receipt-value receipt-total">{{receipt.points}}</text>
+      </view>
+      <view class="receipt-note">核销计储值与积分,不开销售单</view>
+    </view>
+    <view class="footer">
+      <button class="btn-primary" bindtap="onNewRedeem">再核一笔</button>
+    </view>
+  </block>
+
+  <!-- === 核销态 === -->
+  <block wx:else>
+
+    <!-- 会员码: 扫码 / 手输 -->
+    <view class="section">
+      <view class="section-title">会员码 (顾客出示的动态码)</view>
+      <view class="code-row">
+        <input
+          class="code-input"
+          placeholder="扫码或输入会员码"
+          placeholder-class="search-input-ph"
+          value="{{code}}"
+          bindinput="onCodeInput"
+        />
+        <button class="btn-scan" loading="{{scanning}}" bindtap="onScan">扫码</button>
+      </view>
+    </view>
+
+    <!-- 消费金额 (扣储值) -->
+    <view class="section">
+      <view class="section-title">消费金额 (扣储值, 可留空)</view>
+      <view class="field-row">
+        <text class="field-currency">¥</text>
+        <input
+          class="field-input"
+          type="digit"
+          placeholder="0.00"
+          placeholder-class="search-input-ph"
+          value="{{consumeYuan}}"
+          bindinput="onConsumeInput"
+        />
+      </view>
+    </view>
+
+    <!-- 积分 (累积, 可选) -->
+    <view class="section">
+      <view class="section-title">积分 (累积, 可留空)</view>
+      <view class="field-row">
+        <input
+          class="field-input"
+          type="number"
+          placeholder="本次累积积分"
+          placeholder-class="search-input-ph"
+          value="{{earnPoints}}"
+          bindinput="onEarnInput"
+        />
+        <text class="field-unit">分</text>
+      </view>
+      <view class="field-hint">消费金额与积分至少填一项;核销计储值与积分,不开销售单</view>
+    </view>
+
+    <!-- 底部确认按钮 -->
+    <view class="redeem-footer">
+      <button
+        class="btn-primary btn-submit btn-block"
+        loading="{{submitting}}"
+        disabled="{{!code || (consumeCents <= 0 && !earnPoints) || submitting}}"
+        bindtap="onConfirm"
+      >确认核销</button>
+    </view>
+    <view class="footer-spacer"></view>
+
+  </block>
+</view>

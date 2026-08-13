@@ -5,19 +5,29 @@ package handler
 // tenant is the server-configured PlatformTenantID, never client-supplied).
 // GET /v1/admin/me returns identity + permissions.menus derived from the
 // verified JWT (rbac.BuildMeResult). Logout reuses the shared logoutRequest.
+//
+// Login brute-force hardening (MVP security): each Login call is gated by the
+// same shared sliding-window limiter as boss (pkg/loginlimit), keyed by client
+// IP and by username. The password is NEVER part of the key or any log. A
+// successful login clears the account window. The limiter is nil in the minimal
+// test fixture; the router injects the shared instance.
 
 import (
+	"strconv"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
+	"github.com/zhangguijunshi/backend/pkg/loginlimit"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
 // AdminAuthHandler exposes the platform-admin auth endpoints.
 type AdminAuthHandler struct {
-	svc *auth.AuthService
+	svc   *auth.AuthService
+	limit *loginlimit.Limiter // nil → no rate limiting (minimal test fixture)
 }
 
 // NewAdminAuthHandler constructs an AdminAuthHandler.
@@ -25,9 +35,22 @@ func NewAdminAuthHandler(svc *auth.AuthService) *AdminAuthHandler {
 	return &AdminAuthHandler{svc: svc}
 }
 
+// WithLoginLimiter injects the shared login brute-force limiter (same instance
+// as boss). nil leaves login unlimited (backward compatible).
+func (h *AdminAuthHandler) WithLoginLimiter(l *loginlimit.Limiter) *AdminAuthHandler {
+	h.limit = l
+	return h
+}
+
 type adminLoginRequest struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
+}
+
+// adminAccountKey builds the rate-limit key for an admin login attempt. It
+// carries ONLY the username — never the password.
+func adminAccountKey(username string) string {
+	return "admin:" + username
 }
 
 // Login authenticates a platform_ops account by username + password.
@@ -38,10 +61,23 @@ func (h *AdminAuthHandler) Login(c *gin.Context) {
 		httpx.Fail(c, errcode.ErrParam)
 		return
 	}
+	account := adminAccountKey(req.Username)
+	if h.limit != nil {
+		if allowed, retry := h.limit.Take(c.ClientIP(), account); !allowed {
+			if retry > 0 {
+				c.Header("Retry-After", strconv.Itoa(retry))
+			}
+			httpx.Fail(c, errcode.ErrLoginRateLimit)
+			return
+		}
+	}
 	res, err := h.svc.AdminLogin(c.Request.Context(), req.Username, req.Password)
 	if err != nil {
 		httpx.FailError(c, err)
 		return
+	}
+	if h.limit != nil {
+		h.limit.RecordSuccess(account)
 	}
 	httpx.OK(c, res)
 }

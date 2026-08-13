@@ -166,6 +166,52 @@ func TestMemoryRepo_UpdatePassword(t *testing.T) {
 	require.ErrorIs(t, repo.UpdatePassword(t.Context(), 999999, newHash), ErrAccountNotFound)
 }
 
+// TestMemoryRepo_Create proves Create persists a caller-hashed account (the
+// bootstrap path): the stored hash verifies via FindByPhone, the allocated id
+// comes back, and an empty status defaults to active.
+func TestMemoryRepo_Create(t *testing.T) {
+	repo := NewMemoryAccountRepo()
+	hash, err := HashPassword("Str0ng#Passw0rd")
+	require.NoError(t, err)
+
+	created, err := repo.Create(t.Context(), &Account{
+		TenantID: 7, Name: "店主", Phone: "13911112222",
+		Role: "owner", Status: "active", PasswordHash: hash,
+	})
+	require.NoError(t, err)
+	require.NotZero(t, created.ID)
+	require.Equal(t, int64(7), created.TenantID)
+
+	// 登录链路闭环: FindByPhone 取回 + VerifyPassword 验过。
+	got, err := repo.FindByPhone(t.Context(), 7, "13911112222")
+	require.NoError(t, err)
+	require.Equal(t, created.ID, got.ID)
+	require.Equal(t, "owner", got.Role)
+	require.NoError(t, VerifyPassword(got.PasswordHash, "Str0ng#Passw0rd"))
+
+	// status 空默认 active。
+	c2, err := repo.Create(t.Context(), &Account{
+		TenantID: 7, Name: "二店员", Phone: "13911113333",
+		Role: "clerk", PasswordHash: hash,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "active", c2.Status)
+}
+
+// TestMemoryRepo_Create_RejectsEmptyHash proves Create refuses to persist an
+// account without a bcrypt hash (such an account could never log in), before
+// any state changes.
+func TestMemoryRepo_Create_RejectsEmptyHash(t *testing.T) {
+	repo := NewMemoryAccountRepo()
+	_, err := repo.Create(t.Context(), &Account{TenantID: 1, Name: "x", Phone: "13900000000", Role: "owner"})
+	require.ErrorIs(t, err, errEmptyPasswordHash)
+	_, err = repo.Create(t.Context(), nil)
+	require.ErrorIs(t, err, errEmptyPasswordHash)
+	// 未落任何账号。
+	_, err = repo.FindByPhone(t.Context(), 1, "13900000000")
+	require.ErrorIs(t, err, ErrAccountNotFound)
+}
+
 func TestSentinels_AreErrcodeTyped(t *testing.T) {
 	// All three must satisfy errcode.Err so httpx.FailError maps them without a
 	// handler type switch, and must carry distinct, sensible codes.

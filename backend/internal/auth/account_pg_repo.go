@@ -55,6 +55,15 @@ LIMIT 1`
 	// invalidated in lock-step with the hash write. RowsAffected()==0 means the
 	// id no longer exists → the caller maps that to ErrAccountNotFound.
 	sqlAccountUpdatePassword = `UPDATE users SET password_hash = $2 WHERE id = $1`
+	// sqlAccountCreate 插入 users 行并 RETURNING id(冷启动引导: 首个 boss 账号)。
+	// store_id / username / phone_hash 可空——Go 侧传 nil 落 NULL(username 与
+	// phone_hash 的部分唯一索引都排除 NULL, 多行 NULL 不冲突)。version /
+	// uuid / created_at / updated_at 走 DB 默认(0 / gen_random_uuid() / now());
+	// phone_enc 不写(此路径无 KMS)。phone_hash 由 Go 侧 PhoneHash 算好传入,
+	// 与 FindByPhone 的读路径逐字节一致。
+	sqlAccountCreate = `INSERT INTO users (tenant_id, store_id, name, username, phone_hash, role, status, password_hash)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id`
 )
 
 // scanAccount decodes one users row into an Account. store_id, password_hash
@@ -179,4 +188,42 @@ func (r *PGAccountRepo) UpdatePassword(ctx context.Context, id int64, newHash st
 		return ErrAccountNotFound
 	}
 	return nil
+}
+
+// Create implements AccountRepo: 把调用方已算好 bcrypt 哈希的账号持久化到
+// users(冷启动引导路径, 见 cmd/migrate seed-account)。repo 只持久化, 绝不
+// 接触明文密码。store_id/username/phone 为空时对应列落 NULL; status 空默认
+// 'active'。空 PasswordHash 拒绝(errEmptyPasswordHash)。nil pool 与既有写
+// 路径一致降级为 ErrAccountNotFound(nil-safe §0)。
+func (r *PGAccountRepo) Create(ctx context.Context, acc *Account) (*Account, error) {
+	if r == nil || r.pool == nil {
+		return nil, ErrAccountNotFound
+	}
+	if acc == nil || acc.PasswordHash == "" {
+		return nil, errEmptyPasswordHash
+	}
+	var storeID any
+	if acc.StoreID > 0 {
+		storeID = acc.StoreID
+	}
+	var username any
+	if acc.Username != "" {
+		username = acc.Username
+	}
+	var phoneHash any
+	if acc.Phone != "" {
+		phoneHash = PhoneHash(acc.Phone)
+	}
+	status := acc.Status
+	if status == "" {
+		status = "active"
+	}
+	out := *acc
+	out.Status = status
+	if err := r.pool.QueryRow(ctx, sqlAccountCreate,
+		acc.TenantID, storeID, acc.Name, username, phoneHash, acc.Role, status, acc.PasswordHash,
+	).Scan(&out.ID); err != nil {
+		return nil, fmt.Errorf("auth: pg account create: %w", err)
+	}
+	return &out, nil
 }

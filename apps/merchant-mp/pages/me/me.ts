@@ -152,6 +152,11 @@ Page({
     wx.navigateTo({ url: '/pages/recharge/recharge' })
   },
 
+  onTapRedeem(): void {
+    // MVP-4: 会员码核销页 (扣储值/积积分)
+    wx.navigateTo({ url: '/pages/redeem/redeem' })
+  },
+
   onTapSettings(): void {
     wx.showToast({ title: '设置 · 敬请期待', icon: 'none' })
   },

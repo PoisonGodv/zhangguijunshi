@@ -275,3 +275,69 @@ func TestPGAccountRepo_ScanNullableTypes(t *testing.T) {
 	require.True(t, acc.LastLoginAt.IsZero())
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+// TestPGAccountRepo_Create proves Create INSERTs a caller-hashed account and
+// returns the DB-allocated id. Empty store_id/username/phone map to nil SQL
+// args (NULL columns); phone_hash is PhoneHash(phone) so the FindByPhone read
+// path agrees byte-for-byte.
+func TestPGAccountRepo_Create(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	hash, err := HashPassword("Str0ng#Passw0rd")
+	require.NoError(t, err)
+	mock.ExpectQuery(sqlAccountCreate).
+		WithArgs(int64(1), nil, "店主", nil, PhoneHash("13911112222"), "owner", "active", hash).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(2001)))
+	acc, err := repo.Create(context.Background(), &Account{
+		TenantID: 1, Name: "店主", Phone: "13911112222",
+		Role: "owner", Status: "active", PasswordHash: hash,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2001), acc.ID)
+	require.Equal(t, hash, acc.PasswordHash)
+	require.Equal(t, "owner", acc.Role)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGAccountRepo_Create_WithStore proves a non-zero store_id is passed
+// through (not nilled) and an empty status defaults to 'active'.
+func TestPGAccountRepo_Create_WithStore(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	hash, err := HashPassword("Str0ng#Passw0rd")
+	require.NoError(t, err)
+	mock.ExpectQuery(sqlAccountCreate).
+		WithArgs(int64(1), int64(3), "店长", nil, PhoneHash("13911113333"), "manager", "active", hash).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(int64(2002)))
+	acc, err := repo.Create(context.Background(), &Account{
+		TenantID: 1, StoreID: 3, Name: "店长", Phone: "13911113333",
+		Role: "manager", PasswordHash: hash, // Status 空 → 'active'
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2002), acc.ID)
+	require.Equal(t, "active", acc.Status)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPGAccountRepo_Create_RejectsEmptyHash proves Create refuses an account
+// without a bcrypt hash before touching the pool (no SQL expected).
+func TestPGAccountRepo_Create_RejectsEmptyHash(t *testing.T) {
+	mock := newMockPool(t)
+	repo := NewPGAccountRepo(mock)
+	_, err := repo.Create(context.Background(), &Account{TenantID: 1, Name: "x", Role: "owner"})
+	require.ErrorIs(t, err, errEmptyPasswordHash)
+	_, err = repo.Create(context.Background(), nil)
+	require.ErrorIs(t, err, errEmptyPasswordHash)
+	require.NoError(t, mock.ExpectationsWereMet()) // 零 SQL 发出
+}
+
+// TestPGAccountRepo_Create_NilPool proves the nil-pool degradation matches the
+// other write paths (ErrAccountNotFound, no panic).
+func TestPGAccountRepo_Create_NilPool(t *testing.T) {
+	repo := NewPGAccountRepo(nil)
+	_, err := repo.Create(context.Background(), &Account{TenantID: 1, Name: "x", Role: "owner", PasswordHash: "h"})
+	require.ErrorIs(t, err, ErrAccountNotFound)
+	var nilRepo *PGAccountRepo
+	_, err = nilRepo.Create(context.Background(), &Account{TenantID: 1, Name: "x", Role: "owner", PasswordHash: "h"})
+	require.ErrorIs(t, err, ErrAccountNotFound)
+}

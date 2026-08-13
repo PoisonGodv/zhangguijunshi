@@ -55,6 +55,128 @@
 }
 .btn-scan::after { border: none; }
 
+/* === 挂会员 (MVP-4) === */
+.attach-section {
+  padding: 8rpx 24rpx;
+  margin-bottom: 20rpx;
+}
+.attach-bar {
+  display: flex;
+  align-items: center;
+  height: 72rpx;
+}
+.attach-bar:active {
+  opacity: 0.7;
+}
+.attach-bar-icon {
+  font-size: 28rpx;
+  margin-right: 12rpx;
+}
+.attach-bar-text {
+  flex: 1;
+  font-size: 28rpx;
+  color: #1F1F1F;
+}
+.attach-bar-arrow {
+  font-size: 36rpx;
+  color: #CCCCCC;
+}
+.attach-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 12rpx;
+}
+.attach-panel-close {
+  font-size: 24rpx;
+  color: #8C8C8C;
+  padding: 4rpx 12rpx;
+}
+.attach-search {
+  margin-bottom: 8rpx;
+}
+.attach-attached {
+  display: flex;
+  align-items: center;
+  height: 72rpx;
+}
+.attach-attached-info {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.attach-attached-icon {
+  font-size: 28rpx;
+  margin-right: 12rpx;
+}
+.attach-attached-name {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+}
+.attach-detach {
+  flex-shrink: 0;
+  font-size: 24rpx;
+  color: #FF4D4F;
+  padding: 4rpx 12rpx;
+}
+.member-row {
+  display: flex;
+  align-items: center;
+  padding: 20rpx 0;
+  border-bottom: 1rpx solid #F5F5F5;
+}
+.member-row:last-child {
+  border-bottom: none;
+}
+.member-row:active {
+  background: #FFF9F5;
+}
+.member-row-blocked {
+  opacity: 0.55;
+}
+.member-info {
+  flex: 1;
+  min-width: 0;
+}
+.member-name {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1F1F1F;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.member-level {
+  margin-left: 12rpx;
+  font-size: 20rpx;
+  font-weight: 400;
+  color: #FF6B35;
+  border: 1rpx solid #FFB48F;
+  border-radius: 16rpx;
+  padding: 0rpx 12rpx;
+}
+.member-blocked-tag {
+  margin-left: 12rpx;
+  font-size: 20rpx;
+  color: #FF4D4F;
+  border: 1rpx solid #FF4D4F;
+  border-radius: 16rpx;
+  padding: 0rpx 12rpx;
+}
+.member-meta {
+  margin-top: 6rpx;
+  font-size: 24rpx;
+  color: #8C8C8C;
+}
+.member-arrow {
+  flex-shrink: 0;
+  font-size: 36rpx;
+  color: #CCCCCC;
+  margin-left: 12rpx;
+}
+
 /* === 商品列表 === */
 .product-section {
   padding: 16rpx 0;

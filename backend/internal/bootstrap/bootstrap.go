@@ -134,8 +134,8 @@ type Services struct {
 type TenantEnumerator = pregen.TenantEnumerator
 
 // BuildInfra opens the optional Postgres pool, the optional Redis client, the
-// ES256 JWT manager and the session store. It never fails on a missing
-// Postgres/Redis — those degrade to nil with a warning (CONTRACT §0).
+// ES256 JWT manager and the session store. Missing/unavailable Postgres degrades
+// to nil in dev, but prod fails closed before any memory repositories are built.
 func BuildInfra(ctx context.Context, cfg *config.Config, log *zap.Logger) (*Infra, error) {
 	infra := &Infra{}
 
@@ -144,18 +144,23 @@ func BuildInfra(ctx context.Context, cfg *config.Config, log *zap.Logger) (*Infr
 	if cfg.Postgres.Host != "" {
 		database, err := db.New(ctx, cfg.Postgres)
 		if err != nil {
-			log.Warn("db pool init failed; continuing without database", zap.Error(err))
+			if cfg.App.Env != "prod" {
+				log.Warn("db pool init failed; continuing without database", zap.Error(err))
+			}
 		} else {
 			pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			if perr := database.Ping(pctx); perr != nil {
-				log.Warn("db ping failed; continuing without database",
-					zap.String("dsn", database.DSN()), zap.Error(perr))
 				database.Close()
+				cancel()
+				if cfg.App.Env != "prod" {
+					log.Warn("db ping failed; continuing without database",
+						zap.String("dsn", database.DSN()), zap.Error(perr))
+				}
 			} else {
+				cancel()
 				log.Info("db connected", zap.String("dsn", database.DSN()))
 				infra.DB = database
 			}
-			cancel()
 		}
 	}
 
@@ -189,6 +194,16 @@ func BuildInfra(ctx context.Context, cfg *config.Config, log *zap.Logger) (*Infr
 	infra.JWT = jwtMgr
 	infra.Sess = buildSessionStore(infra.RDB)
 
+	if err := validateDatabaseRequirement(cfg, infra.DB); err != nil {
+		if infra.RDB != nil {
+			_ = infra.RDB.Close()
+		}
+		if infra.Sess != nil {
+			_ = infra.Sess.Close()
+		}
+		return nil, err
+	}
+
 	return infra, nil
 }
 
@@ -201,6 +216,9 @@ func BuildServices(ctx context.Context, cfg *config.Config, log *zap.Logger, inf
 		if err != nil {
 			return nil, err
 		}
+	}
+	if err := validateDatabaseRequirement(cfg, infra.DB); err != nil {
+		return nil, err
 	}
 	database := infra.DB
 	rdb := infra.RDB

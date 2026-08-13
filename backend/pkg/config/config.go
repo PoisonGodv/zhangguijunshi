@@ -65,6 +65,7 @@ func WithConfigDir(dir string) Option {
 // Defaults to "dev".
 func WithEnv(env string) Option {
 	return func(lc *loadConfig) {
+		env = strings.ToLower(strings.TrimSpace(env))
 		if env != "" {
 			lc.env = env
 		}

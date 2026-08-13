@@ -53,6 +53,11 @@
         <view class="menu-text">会员充值</view>
         <view class="menu-arrow">›</view>
       </view>
+      <view class="menu-item" bindtap="onTapRedeem">
+        <view class="menu-icon">🎫</view>
+        <view class="menu-text">会员码核销</view>
+        <view class="menu-arrow">›</view>
+      </view>
       <view class="menu-item" bindtap="onTapSettings">
         <view class="menu-icon">⚙️</view>
         <view class="menu-text">设置</view>

@@ -4,6 +4,7 @@
     "pages/task-detail/task-detail",
     "pages/billing/billing",
     "pages/recharge/recharge",
+    "pages/redeem/redeem",
     "pages/me/me",
     "pages/login/login"
   ],

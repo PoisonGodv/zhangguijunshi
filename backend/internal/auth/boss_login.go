@@ -39,14 +39,22 @@ func (s *AuthService) BossLogin(ctx context.Context, tenantID int64, phone, pass
 	if err != nil {
 		if errors.Is(err, ErrAccountNotFound) {
 			// Collapse not-found into login-failed so the response cannot
-			// distinguish "no such account" from "wrong password".
+			// distinguish "no such account" from "wrong password". Pad timing
+			// with one dummy bcrypt compare so the latency matches too (no
+			// user-enumeration timing oracle).
+			_ = VerifyPassword(dummyPasswordHash, password)
 			return nil, ErrLoginFailed
 		}
 		return nil, errcode.ErrInternal
 	}
-	// Empty hash (account never given a password) or verify failure both map to
+	// Empty hash (account never given a password) also runs a dummy compare so it
+	// neither logs in nor short-circuits the timing; any verify failure maps to
 	// the same ErrLoginFailed — constant response, no user enumeration.
-	if acc.PasswordHash == "" || VerifyPassword(acc.PasswordHash, password) != nil {
+	hash := acc.PasswordHash
+	if hash == "" {
+		hash = dummyPasswordHash
+	}
+	if VerifyPassword(hash, password) != nil {
 		return nil, ErrLoginFailed
 	}
 

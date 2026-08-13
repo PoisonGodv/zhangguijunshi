@@ -43,6 +43,7 @@ import (
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
 	"github.com/zhangguijunshi/backend/pkg/jwt"
+	"github.com/zhangguijunshi/backend/pkg/loginlimit"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 	"github.com/zhangguijunshi/backend/pkg/traceid"
 )
@@ -102,6 +103,12 @@ type Deps struct {
 	COS *cos.Client
 	// DevMock enables the X-Mock-Tenant header for boss/admin (dev only).
 	DevMock bool
+	// LoginLimiter caps boss/admin login attempts per IP and per account
+	// (MVP brute-force hardening, CONTRACT security). nil → New() constructs a
+	// shared process-internal pkg/loginlimit.Limiter with the default policy;
+	// pass a custom one (e.g. a test double) to override. Multi-replica prod
+	// MUST swap this for a Redis-backed shared limiter.
+	LoginLimiter *loginlimit.Limiter
 }
 
 // New builds the gin engine with the global middleware chain and routes.
@@ -117,6 +124,18 @@ func New(deps Deps) *gin.Engine {
 	}
 
 	r := gin.New()
+	// Gin otherwise trusts forwarding headers from every source by default. That
+	// lets a public client rotate X-Forwarded-For to evade the login IP limiter
+	// (or spoof a victim IP to consume its budget). In the production compose
+	// topology only the admin-web nginx container forwards to backend, and the
+	// bridge network is pinned to 172.30.0.0/24 (see infra/compose/docker-
+	// compose.prod.yml). Direct public connections to the published backend port
+	// are outside that CIDR, so ClientIP resolves from RemoteAddr and the spoofed
+	// X-Forwarded-For is ignored. Update this list explicitly if the edge
+	// topology changes (e.g. an external LB in front of nginx).
+	if err := r.SetTrustedProxies([]string{"172.30.0.0/24"}); err != nil {
+		panic("httpserver: invalid trusted proxy configuration")
+	}
 	r.Use(
 		middleware.Recover(),
 		middleware.RequestID(),
@@ -124,6 +143,14 @@ func New(deps Deps) *gin.Engine {
 	)
 	if deps.Cfg != nil && deps.Cfg.OTel.Enable {
 		r.Use(otelgin.Middleware(deps.Cfg.OTel.ServiceName))
+	}
+
+	// Login brute-force limiter shared by boss + admin login (MVP security
+	// hardening). One process-internal instance is enough for a single api
+	// replica; multi-replica deployments MUST switch to a Redis-backed shared
+	// limiter (see docs/runbooks/deploy.md).
+	if deps.LoginLimiter == nil {
+		deps.LoginLimiter = loginlimit.New()
 	}
 
 	// Infrastructure endpoints (no tenant, no auth).
@@ -154,16 +181,16 @@ func wireBoss(r *gin.Engine, deps Deps) {
 	boss := r.Group("/v1/boss")
 
 	// Public auth: registered BEFORE the authed middleware so it stays open.
+	var bh *handler.BossAuthHandler
 	if deps.AuthSvc != nil {
-		bh := handler.NewBossAuthHandler(deps.AuthSvc)
+		bh = handler.NewBossAuthHandler(deps.AuthSvc).WithLoginLimiter(deps.LoginLimiter)
 		boss.POST("/auth/login", bh.Login)
 	}
 
 	// Authed group: real JWT + RequireScene(boss) (prod) or MockTenant (dev).
 	boss.Use(bossAdminAuthMW(deps, jwt.SceneBoss))
 	boss.GET("/whoami", whoami)
-	if deps.AuthSvc != nil {
-		bh := handler.NewBossAuthHandler(deps.AuthSvc)
+	if bh != nil {
 		boss.POST("/auth/logout", bh.Logout)
 		// Change password (authed): account id + tenant from JWT ctx, never body.
 		boss.POST("/auth/password", bh.ChangePassword)
@@ -337,16 +364,16 @@ func wireAdmin(r *gin.Engine, deps Deps) {
 	admin := r.Group("/v1/admin")
 
 	// Public auth: registered BEFORE the authed middleware so it stays open.
+	var ah *handler.AdminAuthHandler
 	if deps.AuthSvc != nil {
-		ah := handler.NewAdminAuthHandler(deps.AuthSvc)
+		ah = handler.NewAdminAuthHandler(deps.AuthSvc).WithLoginLimiter(deps.LoginLimiter)
 		admin.POST("/auth/login", ah.Login)
 	}
 
 	// Authed group: real JWT + RequireScene(admin) (prod) or MockTenant (dev).
 	admin.Use(bossAdminAuthMW(deps, jwt.SceneAdmin))
 	admin.GET("/whoami", whoami)
-	if deps.AuthSvc != nil {
-		ah := handler.NewAdminAuthHandler(deps.AuthSvc)
+	if ah != nil {
 		admin.GET("/me", ah.Me)
 		admin.POST("/auth/logout", ah.Logout)
 		// Change password (authed): account id + tenant from JWT ctx, never body.

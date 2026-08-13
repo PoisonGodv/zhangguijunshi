@@ -267,3 +267,9 @@ volumes:
 networks:
   zg-net:
     driver: bridge
+    ipam:
+      config:
+        # Fixed subnet is also the backend's sole trusted-proxy CIDR. Only the
+        # admin-web nginx container may supply X-Forwarded-For; direct callers
+        # outside this bridge are resolved from RemoteAddr.
+        - subnet: 172.30.0.0/24

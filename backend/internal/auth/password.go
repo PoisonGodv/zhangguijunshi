@@ -23,6 +23,22 @@ const bcryptCost = 10
 // seeding job), so a plain error suffices.
 var errEmptyPassword = errors.New("auth: empty password")
 
+// dummyPasswordHash is a valid bcrypt hash compared against when a login lookup
+// finds no usable credential (account not found / role mismatch / empty stored
+// hash). Running one real bcrypt comparison on these paths keeps the response
+// time statistically indistinguishable from the "account exists, wrong password"
+// path, closing the user-enumeration timing side channel. It is a timing pad,
+// never a real credential; the comparison always fails.
+var dummyPasswordHash = func() string {
+	h, err := HashPassword("timing-equalization-dummy-not-a-real-credential")
+	if err != nil {
+		// bcrypt broken at init: fall back to a static valid hash so Verify still
+		// runs a full comparison rather than erroring out fast.
+		return "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+	}
+	return h
+}()
+
 // HashPassword returns a bcrypt hash of pwd at cost 10. Empty passwords are
 // rejected. Callers store the result in users.password_hash.
 func HashPassword(pwd string) (string, error) {

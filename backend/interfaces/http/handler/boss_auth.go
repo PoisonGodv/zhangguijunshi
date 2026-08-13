@@ -7,24 +7,43 @@ package handler
 // subsequent boss request takes tenant from the JWT, never the body (ARCH-01).
 // Logout reuses the shared logoutRequest shape and the same svc.Logout as the
 // consumer surface.
+//
+// Login brute-force hardening (MVP security): each Login call is gated by an
+// optional process-internal sliding-window limiter (pkg/loginlimit) keyed by
+// client IP and by tenant_id+phone. The password is NEVER part of the key or
+// any log. A successful login clears the account window so a legitimate user is
+// not locked out by their own old failures. The limiter is nil in the minimal
+// test fixture (no limiting); the router injects the shared instance.
 
 import (
+	"strconv"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/zhangguijunshi/backend/internal/auth"
 	"github.com/zhangguijunshi/backend/pkg/errcode"
 	"github.com/zhangguijunshi/backend/pkg/httpx"
+	"github.com/zhangguijunshi/backend/pkg/loginlimit"
 	"github.com/zhangguijunshi/backend/pkg/multitenancy"
 )
 
 // BossAuthHandler exposes the boss auth endpoints.
 type BossAuthHandler struct {
-	svc *auth.AuthService
+	svc   *auth.AuthService
+	limit *loginlimit.Limiter // nil → no rate limiting (minimal test fixture)
 }
 
 // NewBossAuthHandler constructs a BossAuthHandler.
 func NewBossAuthHandler(svc *auth.AuthService) *BossAuthHandler {
 	return &BossAuthHandler{svc: svc}
+}
+
+// WithLoginLimiter injects the shared login brute-force limiter. The router
+// calls this once per process; nil leaves login unlimited (backward compatible
+// — the minimal test fixture and any handler built directly in tests).
+func (h *BossAuthHandler) WithLoginLimiter(l *loginlimit.Limiter) *BossAuthHandler {
+	h.limit = l
+	return h
 }
 
 type bossLoginRequest struct {
@@ -41,6 +60,13 @@ type changePasswordRequest struct {
 	NewPassword string `json:"new_password" binding:"required"`
 }
 
+// bossAccountKey builds the rate-limit key for a boss login attempt. It MUST
+// include tenant_id and phone and MUST NOT include the password — the password
+// never appears in any key or log. The format is opaque to the limiter.
+func bossAccountKey(tenantID int64, phone string) string {
+	return "boss:" + strconv.FormatInt(tenantID, 10) + ":" + phone
+}
+
 // Login authenticates a staff member by phone + password.
 // POST /v1/boss/auth/login
 func (h *BossAuthHandler) Login(c *gin.Context) {
@@ -49,10 +75,27 @@ func (h *BossAuthHandler) Login(c *gin.Context) {
 		httpx.Fail(c, errcode.ErrParam)
 		return
 	}
+	// Rate-limit BEFORE the bcrypt cost: a rejected attempt costs ~0 CPU (no
+	// password verify), and a sustained burst cannot keep the account locked
+	// (Take does not record on rejection). On success the account window is
+	// cleared so the user's own old failures stop counting.
+	account := bossAccountKey(req.TenantID, req.Phone)
+	if h.limit != nil {
+		if allowed, retry := h.limit.Take(c.ClientIP(), account); !allowed {
+			if retry > 0 {
+				c.Header("Retry-After", strconv.Itoa(retry))
+			}
+			httpx.Fail(c, errcode.ErrLoginRateLimit)
+			return
+		}
+	}
 	res, err := h.svc.BossLogin(c.Request.Context(), req.TenantID, req.Phone, req.Password)
 	if err != nil {
 		httpx.FailError(c, err)
 		return
+	}
+	if h.limit != nil {
+		h.limit.RecordSuccess(account)
 	}
 	httpx.OK(c, res)
 }

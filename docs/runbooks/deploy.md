@@ -50,6 +50,12 @@ vi .env
 | `ZG_MULTITENANCY_STRICT=true` | 行级隔离闸门，恒 true |
 
 > **安全红线**：prod 配置必须 `dev_mock_header=false`（见 `config.dev.yaml` 注释，dev 才开 `X-Mock-Tenant` 头）。prod 租户身份**只能**从已校验的 JWT claims 注入，**绝不**开 mock 头，否则等同绕过多租户隔离。确认 `config.prod.yaml` 中 `multitenancy.dev_mock_header` 为 `false` 或缺省。
+>
+> **数据库红线**：`ZG_ENV=prod` 时 PostgreSQL 配置缺失、连接池初始化失败或启动 Ping 失败，api / worker / cron 均会直接以非 0 退出；生产环境绝不降级到 Memory repository，也不会让内置 dev 演示账号变为可登录。不要通过修改环境名或开启 mock 头绕过；应修复 `ZG_POSTGRES_*`、网络、TLS/证书或数据库状态后再重启。dev 环境仍允许无 DB 的内存模式。
+>
+> **登录限流红线**：boss/admin 密码登录默认同时限制每 IP 20 次/分钟、每账号 5 次/分钟（成功登录清账号窗口，IP 原始流量窗口保留）。MVP 单 api 副本使用进程内限流器；扩成多副本前必须替换为 Redis 共享限流，否则每个副本各自计数会放大总尝试额度。
+>
+> **ClientIP 信任红线**：后端 Gin 仅信任 compose 内网 `172.30.0.0/24`（`docker-compose.prod.yml` 已用 `ipam` 钉死该子网，`router.go` 的 `SetTrustedProxies` 与之一致）。只有该网段内的转发方（admin-web nginx）设置的 `X-Forwarded-For` 才会被采纳；公网直连 backend:8080 的请求一律以 TCP `RemoteAddr` 作为 ClientIP，攻击者无法通过伪造 `X-Forwarded-For`/`X-Real-IP` 绕过 IP 限流或借刀封禁他人。若在 nginx 前再加一层外网 LB（云 SLB / CDN），必须把 LB 出网网段一并加入 `SetTrustedProxies` 白名单，否则限流会键到 LB 的内网地址（全部流量共用一个 IP 桶），反之切勿把公网网段加入白名单。
 
 `.env` 已被 `.gitignore`，**切勿提交**。
 
@@ -69,7 +75,7 @@ vi .env
    ```bash
    # 容器内已部署的 migrate 二进制（推荐，env/镜像与 api 完全一致）
    docker exec zg-backend-prod /out/migrate version
-   #   -> version=19 dirty=false
+   #   -> version=24 dirty=false
    # 或直接查库
    docker exec zg-postgres-prod psql -U zg -d zhanggui -c "SELECT version, dirty FROM schema_migrations;"
    ```
@@ -93,7 +99,7 @@ docker compose -f infra/compose/docker-compose.prod.yml --profile migrate up
 
 观察要点：
 - migrate 容器退出码必须为 `0`（`docker compose ps -a` 看 migrate 服务 `Exited (0)`）。
-- 首次部署日志出现 `migrate up` 成功应用 19 个迁移（`000001_init_tenant_user_store` … `000019_daily_product_sales`）；升级部署只应用新增编号。
+- 首次部署日志出现 `migrate up` 成功应用 24 个迁移（`000001_init_tenant_user_store` … `000024_groupbuy_desc_original`）；升级部署只应用新增编号。
 - `migrate` 读 `ZG_MIGRATIONS_DIR`（prod compose 显式设为 `/app/migrations`），与 api 共用同一套分层配置（`ZG_ENV` + `ZG_POSTGRES_*`）定位数据库。
 - 若 migrate 报 `ErrNoChange` 是正常的（无待应用迁移，退出码仍为 0）。
 
@@ -121,6 +127,37 @@ docker compose -f infra/compose/docker-compose.prod.yml --profile migrate up
 - 用容器内已部署 `/out/migrate`（env 指向 `postgres:5432`）实测：`migrate version` → `version=19 dirty=false`（退出 0）；`migrate up` → 退出 0、无输出（ErrNoChange 吞掉，零变更）；复查 `schema_migrations` 仍 `19/false`。**重跑 up 幂等无害已实证。**
 - 抽查文件↔库一致性：public 34 张表；`daily_product_sales`(019)、`users.username`/`users.version`(018)、`wx_sessions`(014)、`sub_merchants`(012) 均存在。
 - 健康度扫描：无内联 `UNIQUE(...) WHERE` 非法写法（唯一 grep 命中是 000018 的注释，实际用 `CREATE UNIQUE INDEX ... WHERE`）；金额列一律 BIGINT 分，无浮点/NUMERIC 金额；`.up.sql` 内无 DROP/TRUNCATE/DELETE（grep 命中均为 `deleted_at` 列名误报）。JSONB 仅用于不透明快照/弹性参数（int64/float64 往返不对称是 Go 侧已知约束，非 SQL 问题）。
+
+> 注：§2.3 是 2026-07-31 当日的历史验证记录（当时最新为 000019）；此后迁移已增至 24 个，以 §2.0/§2.1 与 `ls migrations/` 实际为准。
+
+### 2.4 首次登录：建租户与 boss 账号（seed-account，一次性）
+
+迁移只建表，**不会**自动建任何租户/账号；全库也没有任何注册/建租户端点。首次部署后必须跑一次 `seed-account` 引导，建出「首个租户 + 首个 boss(owner) 账号」，否则无法登录、`migrations_seed/seed_demo.sql`（要求 tenants 非空）也跑不了。
+
+```bash
+# 1) 生成强密码（只进 env，绝不写进命令行参数/脚本/git）
+export ZG_BOOTSTRAP_BOSS_PASSWORD="$(openssl rand -base64 18)"
+# 2) boss 登录手机号（必填）+ 可选首个租户名（默认「演示店」）
+export ZG_BOOTSTRAP_BOSS_PHONE="139xxxxxxxx"
+export ZG_BOOTSTRAP_TENANT_NAME="我的便利店"   # 可省
+# 3) 跑引导（复用 migrate 同一镜像/二进制 + 同一套 ZG_POSTGRES_* env；
+#    -e VAR 只传变量名，不落值到命令行）
+docker run --rm --env-file .env --network <prod-net> \
+  -e ZG_BOOTSTRAP_BOSS_PASSWORD -e ZG_BOOTSTRAP_BOSS_PHONE -e ZG_BOOTSTRAP_TENANT_NAME \
+  --entrypoint /out/migrate zhanggui-junshi-backend:<tag> seed-account
+# 4) 立刻抹掉 shell 里的明文
+unset ZG_BOOTSTRAP_BOSS_PASSWORD
+```
+
+要点：
+
+- **密码只从 env `ZG_BOOTSTRAP_BOSS_PASSWORD` 读**：绝不接受 CLI 参数（`ps`/shell history 可见）、绝无默认值、绝不打印/日志。强度强制 ≥10 位且含字母+数字，命中常见弱密码块表（123456/password/boss12345 等）直接报错退出非 0。
+- **幂等**：tenants 非空则复用首个租户（打印其 id）；同 phone 账号已存在则默认**不覆盖密码**，打印「已存在, 跳过(id)」。仅显式加 `--reset-password` 才更新 hash（同时 users.version+1，旧 JWT 立即失效）。重跑安全。
+- 输出只有 `tenant_id / account_id / phone`，绝无密码。
+- 跑完即可走 `/v1/boss/auth/login`（手机号+密码）拿 JWT 登录 admin-web / merchant-mp；随后可选跑 `migrations_seed/seed_demo.sql` 灌演示数据（见 `docs/runbooks/seed-demo.md`）。
+- `.env` 已被 `.gitignore`（含 `.env` / `.env.*`），切勿提交。
+
+> **红线重申**：boss 登录的前提是「租户身份只从已校验 JWT claims 注入」。prod 必须 `dev_mock_header=false`（§1 安全红线），否则 seed-account 建出的账号体系形同虚设。
 
 ---
 
@@ -241,7 +278,8 @@ pg_dump --host=<pg-host> -U zg -d zhanggui -F c -f zhanggui-$(date +%F).dump
 | 现象 | 排查 |
 |---|---|
 | healthcheck 不通（容器反复 restart） | `docker compose logs backend`；先看 `/healthz` 是否 200（liveness 不依赖 DB）。若 `/healthz` 通但编排仍杀，多半是 `readyz` 被误用做 liveness——prod compose 的 liveness 应指向 `/healthz`，readiness 指向 `/readyz`。 |
-| `/readyz` 报 `db: down` | PG 连接失败：查 `ZG_POSTGRES_HOST/PORT/USER/PASSWORD`、网络可达、SSL_MODE 是否对。后端 `db pool init failed` 时会降级为无 DB 模式继续服务（`db: skipped`），prod 不允许 `skipped`。 |
+| backend / worker / cron 启动即退出，日志含 `production requires an available PostgreSQL database` | 这是 prod fail-fast 安全保护，不是可降级告警。检查 `ZG_POSTGRES_HOST/PORT/USER/PASSWORD/DATABASE/SSL_MODE`、网络/安全组、DNS、TLS 证书和 PG 可用性；修复后重启。禁止改成 `ZG_ENV=dev`、开启 `dev_mock_header` 或放宽代码来绕过。错误本身故意不打印 DSN/密码。 |
+| `/readyz` 报 `db: down` | 已启动进程的 PG 健康探测失败：查数据库运行状态、网络可达、连接数和 SSL_MODE。prod 正常启动后 `data.db` 必须为 `ok`；`db: skipped` 只允许 dev，若 prod 出现应立即停止流量并排查部署镜像/环境。 |
 | migrate 失败退出码非 0 | 看 migrate 日志；常见：PG 不可达、`vector` 扩展未装（`000001` 之前的 init.sql `CREATE EXTENSION vector` 需 superuser）、迁移脏状态（`migrate force <v>` 解卡）。 |
 | CORS 报错（admin-web 调 API） | admin-web 走 nginx 同源反代 `/v1/ → backend:8080`（见 `apps/admin-web/nginx.conf`），正常无 CORS。出现 CORS 说明请求没走 nginx 反代（直连了 backend:8080 跨域），改走 `:8088` 同源。 |
 | 502 from nginx | nginx 转发 `/v1/` 到 `backend:8080` 不可达：`docker compose ps` 看 backend 是否 healthy、`docker compose exec admin-web wget -qO- http://backend:8080/healthz` 验证服务间网络。 |

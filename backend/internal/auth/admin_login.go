@@ -35,17 +35,21 @@ func (s *AuthService) AdminLogin(ctx context.Context, username, password string)
 	acc, err := s.accountRepo.FindByUsername(ctx, tenant, username)
 	if err != nil {
 		if errors.Is(err, ErrAccountNotFound) {
+			_ = VerifyPassword(dummyPasswordHash, password) // timing pad
 			return nil, ErrLoginFailed
 		}
 		return nil, errcode.ErrInternal
 	}
 	// platform_ops only: a non-platform_ops account that happens to share the
-	// name cannot log in here. Combined with the password check below, the
-	// response is constant.
-	if acc.Role != "platform_ops" {
+	// name cannot log in here. Both the role mismatch and an empty stored hash
+	// run one dummy bcrypt compare so the latency matches the wrong-password
+	// path — combined with the constant ErrLoginFailed body there is no
+	// enumeration oracle (neither content nor timing).
+	if acc.Role != "platform_ops" || acc.PasswordHash == "" {
+		_ = VerifyPassword(dummyPasswordHash, password)
 		return nil, ErrLoginFailed
 	}
-	if acc.PasswordHash == "" || VerifyPassword(acc.PasswordHash, password) != nil {
+	if VerifyPassword(acc.PasswordHash, password) != nil {
 		return nil, ErrLoginFailed
 	}
 

@@ -6,7 +6,8 @@
 //   搜索框 input → 300ms debounce → 重新走 loadProducts(true)
 //   「扫码」→ wx.scanCode → getProductByBarcode → 命中直接入购物车
 //   商品行「+」/ 购物车步进器 → 维护 cart (Map product_id → CartLine)
-//   「开单」→ createPendingOrder({items:[...]}) → showModal 确认收款 → payOrder(id) → 回执
+//   「挂会员」→ 面板搜索会员 (searchMembers) → 选中把 member_id 带进开单 body (可取消,散客不传)
+//   「开单」→ createPendingOrder({items:[...], member_id?}) → showModal 确认收款 → payOrder(id) → 回执
 //   「再开一单」→ clearCart + 回执收起
 //
 // 后端字段说明 (M1-S1/M4-S1 已读源码确认):
@@ -22,10 +23,11 @@ import {
   getProductByBarcode,
   createPendingOrder,
   payOrder,
+  searchMembers,
   getAccessToken,
   ApiError,
 } from '../../utils/request'
-import type { Product, Order, CreateOrderItem } from '../../types/api'
+import type { Product, Order, CreateOrderItem, MemberDTO } from '../../types/api'
 
 // === 本页分页/搜索参数 ===
 const PAGE_SIZE = 20
@@ -56,6 +58,18 @@ interface ReceiptVM {
   paid_at: string
 }
 
+/** 已挂会员视图模型 */
+interface AttachedMember {
+  id: number
+  name: string
+  level_name: string
+}
+
+/** 会员搜索行视图模型 (MemberDTO + 余额元显示) */
+interface MemberRow extends MemberDTO {
+  balance_yuan: string
+}
+
 interface BillingData {
   keyword: string
   scanning: boolean
@@ -67,6 +81,13 @@ interface BillingData {
   totalYuan: string
   submitting: boolean
   receipt: ReceiptVM | null
+  // 挂会员 (MVP-4): 选中后 member_id 带进 createPendingOrder body
+  member: AttachedMember | null
+  memberPanelOpen: boolean
+  memberKeyword: string
+  memberResults: MemberRow[]
+  memberSearching: boolean
+  memberSearched: boolean
 }
 
 Page({
@@ -81,11 +102,18 @@ Page({
     totalYuan: '0',
     submitting: false,
     receipt: null,
+    member: null,
+    memberPanelOpen: false,
+    memberKeyword: '',
+    memberResults: [] as MemberRow[],
+    memberSearching: false,
+    memberSearched: false,
   } as BillingData,
 
   // === 内部态 (非 data, 避免触发 setData) ===
   _offset: 0,
   _searchTimer: 0 as unknown as ReturnType<typeof setTimeout>,
+  _memberTimer: 0 as unknown as ReturnType<typeof setTimeout>,
 
   onLoad() {
     // 登录守卫 (FE-MP-05): 无 token 或 refresh 也失败 → 去登录页
@@ -237,6 +265,88 @@ Page({
     })
   },
 
+  // === 挂会员 (MVP-4): 开/关会员选择面板 ===
+  onTapAttachMember() {
+    this.setData({ memberPanelOpen: true })
+  },
+
+  onCloseMemberPanel() {
+    this.setData({
+      memberPanelOpen: false,
+      memberKeyword: '',
+      memberResults: [],
+      memberSearched: false,
+    })
+    if (this._memberTimer) clearTimeout(this._memberTimer)
+  },
+
+  // === 会员搜索输入 (300ms debounce, 复用 searchMembers) ===
+  onMemberKeywordInput(e: { detail: { value: string } }) {
+    const memberKeyword = (e.detail && e.detail.value) || ''
+    this.setData({ memberKeyword })
+    if (this._memberTimer) clearTimeout(this._memberTimer)
+    this._memberTimer = setTimeout(() => {
+      this.searchMemberList()
+    }, SEARCH_DEBOUNCE_MS)
+  },
+
+  onMemberKeywordClear() {
+    this.setData({ memberKeyword: '', memberResults: [], memberSearched: false })
+    if (this._memberTimer) clearTimeout(this._memberTimer)
+  },
+
+  // === 执行会员搜索 ===
+  async searchMemberList(): Promise<void> {
+    const d = this.data as BillingData
+    const q = (d.memberKeyword || '').trim()
+    if (!q) {
+      this.setData({ memberResults: [], memberSearched: false })
+      return
+    }
+    this.setData({ memberSearching: true })
+    try {
+      const res = await searchMembers(q, 1, 20)
+      const items = (res && res.items) || []
+      const rows: MemberRow[] = items.map((m) => ({ ...m, balance_yuan: yuan(m.balance_cents) }))
+      this.setData({ memberResults: rows, memberSearched: true })
+    } catch (e) {
+      const msg = e instanceof ApiError ? e.message : '搜索会员失败'
+      wx.showToast({ title: msg, icon: 'none' })
+    } finally {
+      this.setData({ memberSearching: false })
+    }
+  },
+
+  // === 点选会员 → 挂上 (member_id 随开单 body 提交) ===
+  onSelectMember(e: { currentTarget: { dataset: Record<string, unknown> } }) {
+    const id = Number(e.currentTarget.dataset.id)
+    if (!id) return
+    const d = this.data as BillingData
+    const m = (d.memberResults || []).find((x) => x.id === id)
+    if (!m) return
+    if (m.block) {
+      wx.showToast({ title: '该会员已冻结', icon: 'none' })
+      return
+    }
+    this.setData(
+      {
+        member: { id: m.id, name: m.name || `会员 ${m.id}`, level_name: m.level_name },
+        memberPanelOpen: false,
+        memberKeyword: '',
+        memberResults: [],
+        memberSearched: false,
+      },
+      () => {
+        wx.showToast({ title: `已挂:${m.name || '会员 ' + m.id}`, icon: 'none' })
+      },
+    )
+  },
+
+  // === 取消挂会员 → 散客 ===
+  onClearMember() {
+    this.setData({ member: null })
+  },
+
   // === 开单 → 创建 pending → 弹「收款」 → SimulatePay → 回执 ===
   async onSubmit(): Promise<void> {
     const d = this.data as BillingData
@@ -251,6 +361,8 @@ Page({
         channel: 'in_store',
         payment_method: 'cash',
         items,
+        // 挂了会员则带 member_id (积分/累计消费归该会员);散客不传 (后端按 0 处理)
+        member_id: d.member ? d.member.id : undefined,
       })
       const totalYuan = yuan(order.TotalCents)
       const ok = await confirmPay(totalYuan)
@@ -265,6 +377,7 @@ Page({
         cart: [],
         totalCount: 0,
         totalYuan: '0',
+        member: null, // 一单结清, 会员随单清零
       })
     } catch (e) {
       const msg = e instanceof ApiError ? e.message : '开单失败'

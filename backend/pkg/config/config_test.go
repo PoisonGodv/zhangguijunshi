@@ -196,6 +196,22 @@ func TestLoad_WithEnvSelectsFile(t *testing.T) {
 	}
 }
 
+func TestLoad_WithEnvNormalizesCaseAndWhitespace(t *testing.T) {
+	dir := newDir(t)
+	writeYAML(t, dir, "prod", `http: { port: 9443 }`)
+
+	cfg, err := Load(WithConfigDir(dir), WithEnv(" PROD \n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HTTP.Port != 9443 {
+		t.Errorf("http.port: got %d, want 9443 (normalized prod file)", cfg.HTTP.Port)
+	}
+	if cfg.App.Env != "prod" {
+		t.Errorf("app.env: got %q, want prod", cfg.App.Env)
+	}
+}
+
 func TestLoad_MissingDirIsNotError(t *testing.T) {
 	// A non-existent directory yields ConfigFileNotFoundError which Load ignores.
 	cfg, err := Load(WithConfigDir(filepath.Join(t.TempDir(), "does-not-exist")))

@@ -283,6 +283,30 @@ export interface RechargeResult {
 }
 
 /**
+ * 会员码核销请求体 (POST /v1/boss/membership/redeem, handler.redeemRequest,
+ * 有 json tag → snake_case)。code 必填 (binding:required);
+ * consume_cents / earn_points 至少一个 >0,否则后端 40001 ErrParam。
+ * store_id / ref_order_id 本端不传 (store 由后端 ctx 解析,核销不开销售单故无 ref_order)。
+ */
+export interface RedeemReq {
+  code: string // 顾客出示的动态会员码
+  consume_cents?: number // >0 扣储值 (分)
+  earn_points?: number // >0 累积分
+}
+
+/**
+ * 核销结果 (membership.RedeemResult **无 json tag** → Go encoding/json 默认 PascalCase)。
+ * 核销只记储值流水 (consume) + 积分流水 (earn),**不产生 billing.Order 销售单**:
+ * C 端「我的积分/余额流水」会更新,「我的订单」不会出现核销单。
+ */
+export interface RedeemResult {
+  MemberID: number
+  Points: number // 核销后积分
+  BalanceCents: number // 核销后实付余额 (分)
+  ConsumedCents: number // 本次扣减储值 (分)
+}
+
+/**
  * GET /v1/boss/whoami 响应 (interfaces/http/router.go whoami):
  *   httpx.OK(c, gin.H{"tenant_id": tid, "source": source})
  * 注: 后端目前只返回 tenant_id + source,**没有** store_id / role / scene。
