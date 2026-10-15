@@ -28,7 +28,7 @@
 
 ## 怎么跑
 
-仓库根目录下（`/Users/liningwei/Selfproj/zhangguijunshi`）：
+仓库根目录下：
 
 ```bash
 # 方式 A：直接管道喂进去（推荐）

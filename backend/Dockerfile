@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # 掌柜军师 Go 后端生产级容器镜像。
 #
-# 构建命令（在仓库根 /Users/liningwei/Selfproj/zhangguijunshi 执行）：
+# 构建命令（在仓库根目录执行）：
 #   docker build -f backend/Dockerfile -t zhanggui-junshi-backend:latest backend/
 #
 # 构建上下文是 backend/，所以本文件内的路径都相对 backend/。

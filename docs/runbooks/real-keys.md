@@ -153,7 +153,7 @@ API安全：申请 API 证书（得到私钥 + 证书序列号）、设置 APIv3
 ## 5. 填完重启 + grep 日志确认（命令示例）
 
 ```bash
-cd /Users/liningwei/Selfproj/zhangguijunshi
+cd <仓库根目录>
 
 # 1) 把上面的值填进 .env（已 gitignore）。prod 栈用 ZG_ENV=prod（compose environment 已设）。
 # 2) 重建并重启 backend（env 变了必须 recreate，不能只 restart）：
